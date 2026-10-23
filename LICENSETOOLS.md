@@ -86,6 +86,32 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time). steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
 
+### What changed in 1.3.0
+
+`NO INTERNET CONNECTION` in the Steam downloads page is not your network. The loader hooks `CAppInfo::GetManifestRequestCode` and fetches the code from `http://gmrc.wudrm.com/manifest/<manifest_id>`; that host answers `502`, so the hook falls through, Valve's CM returns no code for an app you don't own, the CDN manifest request comes back `401`, and Steam reports it as no connection. Every mirror of that service is dead, so the code path is unfixable from the outside. 1.3.0 removes the need for it:
+
+- **Real depot manifests are staged into `steamapps/depotcache/<depot>_<gid>.manifest`** before Steam starts. Steam reads the local file and never asks the CM for a manifest request code, so the dead endpoint stops mattering.
+- **`appmanifest_<appid>.acf` is written with `StateFlags 2`** (update required) plus `InstalledDepots` carrying the manifest id and size per depot — Steam sees a queued install and pulls the chunks itself.
+- **Manifest sources**: a branch-per-appid mirror (`Fairyvmos/bruh-hub`, `Auiowu/ManifestAutoUpdate`, `tymolu233/ManifestAutoUpdate`) is tried in order; if the manifest id from appinfo is stale, the branch listing is read and the current `<depot>_*.manifest` is used instead, and the acf is rewritten with the corrected id.
+- **Every staged manifest is parsed** before it counts: file count and total size are read out of the protobuf and compared against appinfo, so a wrong-branch or truncated file is reported instead of silently queued.
+- **Download files** now stages manifests and writes the acf first, then restarts Steam and opens `steam://install/<appid>`.
+- **Repair** re-stages the manifests, so a library that lost its depotcache is fixed without a Terminal.
+- **Show Steam paths** prints `depotcache` and how many manifests are in it.
+- CLI: `manifests APPID [--os mac|win|linux]`.
+
+### ما الجديد في 1.3.0
+
+رسالة `NO INTERNET CONNECTION` في صفحة التنزيلات ما هي مشكلة شبكة عندك. الـ loader يعترض `CAppInfo::GetManifestRequestCode` ويجيب الكود من `http://gmrc.wudrm.com/manifest/<manifest_id>`، وهذا المضيف يرد `502`، فيمرّ الاعتراض بدون نتيجة، وخادم Valve يرد بصفر لأن اللعبة غير مملوكة، فيرجع طلب الـ manifest من الـ CDN بـ `401`، وSteam يترجمها إلى «لا يوجد اتصال». كل بدائل هذه الخدمة ميتة، فالمسار نفسه غير قابل للإصلاح من الخارج. الإصدار 1.3.0 يلغي الحاجة إليه:
+
+- **تنزيل ملفات manifest الحقيقية إلى `steamapps/depotcache/<depot>_<gid>.manifest`** قبل تشغيل Steam. Steam يقرأ الملف المحلي ولا يطلب manifest request code من الـ CM أصلًا، فالمضيف الميت ما يعود يفرق.
+- **كتابة `appmanifest_<appid>.acf` بحالة `StateFlags 2`** (تحديث مطلوب) مع `InstalledDepots` يحمل رقم الـ manifest والحجم لكل depot — فيرى Steam تنزيلًا في الانتظار ويجلب الـ chunks بنفسه.
+- **مصادر الـ manifest**: مرايا بنظام فرع-لكل-appid (`Fairyvmos/bruh-hub`، `Auiowu/ManifestAutoUpdate`، `tymolu233/ManifestAutoUpdate`) تُجرَّب بالترتيب؛ وإذا كان رقم الـ manifest في appinfo قديمًا يُقرأ فهرس الفرع ويُستخدم `<depot>_*.manifest` الحالي، ويُعاد كتابة الـ acf بالرقم المصحّح.
+- **كل manifest يُفحص** قبل احتسابه: عدد الملفات والحجم الكلي يُقرآن من الـ protobuf ويُقارنان بـ appinfo، فملف فرع خاطئ أو ناقص يظهر كخطأ بدل ما يُدرج بصمت.
+- **Download files** صار ينزّل الـ manifests ويكتب الـ acf أولًا، ثم يعيد تشغيل Steam ويفتح `steam://install/<appid>`.
+- **Repair** يعيد تنزيل الـ manifests، فمكتبة فقدت الـ depotcache تُصلَح بدون Terminal.
+- **Show Steam paths** يطبع `depotcache` وعدد الـ manifests داخله.
+- في الـ CLI: `manifests APPID [--os mac|win|linux]`.
+
 ### What changed in 1.2.0
 
 1.1.0 shipped the key table but a Mac with a strict TLS chain or a filtered network could end up with an empty table — the log said `0 key(s)` and Steam kept showing `CONTENT STILL ENCRYPTED`. 1.2.0 makes the table impossible to miss:

@@ -38,7 +38,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -273,7 +273,18 @@ def paths_report():
         "depot_keys_bytes": keys["bytes"],
         "depot_keys_age_hours": keys["age_hours"],
         "depot_keys_error": keys["error"],
+        "depotcache": str(root / "steamapps" / "depotcache") if root else None,
+        "depotcache_manifests": _depotcache_count(root),
     }
+
+def _depotcache_count(root):
+    if root is None:
+        return 0
+    d = root / "steamapps" / "depotcache"
+    try:
+        return sum(1 for p in d.glob("*.manifest") if p.stat().st_size > 1000)
+    except OSError:
+        return 0
 
 # ---------- opensteamtool.toml editor (line-parity with the C# writer) ----------
 
@@ -456,8 +467,12 @@ def probe_from_text(appid, text, branch="public"):
         else:
             gid = str(node or "") if node else ""
         size = str(depot.get("size") or "")
+        dl = ""
+        if isinstance(node, dict):
+            dl = str(node.get("download") or "")
         rows.append({"depot": str(depot_id), "os": osname, "manifest": gid,
-                     "size": size if size.isdigit() else "", "branch": branch})
+                     "size": size if size.isdigit() else "",
+                     "download": dl if dl.isdigit() else "", "branch": branch})
     if not rows:
         return {"ok": False, "error": "no numeric depots in appinfo"}
     common = app.get("common") if isinstance(app.get("common"), dict) else {}
@@ -654,9 +669,8 @@ def _ssl_contexts():
         pass
     return out
 
-def _http_bytes(url, timeout=180):
-    base = {"User-Agent": "licensetools/1.2",
-            "Accept": "application/vnd.github.raw, application/json, */*"}
+def _http_bytes(url, timeout=180, accept="application/vnd.github.raw, application/json, */*"):
+    base = {"User-Agent": "licensetools/1.3", "Accept": accept}
     last = ""
     for encoding in ("gzip", "identity"):
         headers = dict(base, **{"Accept-Encoding": encoding})
@@ -1415,6 +1429,265 @@ def write_appmanifest(appid, name, installdir, buildid, depots, size_on_disk=0):
     tmp.replace(path)
     return {"ok": True, "file": str(path)}
 
+MANIFEST_REPOS = (
+    "Fairyvmos/bruh-hub",
+    "Auiowu/ManifestAutoUpdate",
+    "tymolu233/ManifestAutoUpdate",
+    "luomojim/ManifestAutoUpdate",
+    "MineRPG/ManifestAutoUpdate",
+    "TOP-01/ManifestAutoUpdate",
+    "hansaes/ManifestAutoUpdate",
+    "bingyu50/ManifestAutoUpdate",
+)
+MANIFEST_MAGIC = b"\xd0\x17\xf6\x71"
+_MANIFEST_HINT = {"repo": "", "appid": ""}
+
+def depotcache_dir():
+    sa = steam_apps_dir()
+    if sa is None:
+        return None
+    d = sa / "depotcache"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return d
+
+def _manifest_repos(appid):
+    hint = _MANIFEST_HINT.get("repo")
+    if hint and _MANIFEST_HINT.get("appid") == str(int(appid)) and hint in MANIFEST_REPOS:
+        return (hint,) + tuple(r for r in MANIFEST_REPOS if r != hint)
+    return MANIFEST_REPOS
+
+def _list_branch_files(repo, appid):
+    url = (f"https://api.github.com/repos/{repo}/contents/?ref={int(appid)}")
+    blob, err = _http_bytes(url, timeout=60, accept="application/vnd.github+json")
+    if err or not blob:
+        return [], err or "empty"
+    try:
+        items = json.loads(blob.decode("utf-8", "replace"))
+    except Exception as exc:
+        return [], f"bad json {exc}"
+    if not isinstance(items, list):
+        return [], "unexpected listing"
+    return [str(i.get("name") or "") for i in items if isinstance(i, dict)], ""
+
+def _gid_from_name(name, depot):
+    prefix = f"{int(depot)}_"
+    if not name.startswith(prefix) or not name.endswith(".manifest"):
+        return ""
+    gid = name[len(prefix):-len(".manifest")]
+    return gid if gid.isdigit() else ""
+
+def _pb_varint(buf, i, end):
+    shift = 0
+    out = 0
+    while i < end:
+        byte = buf[i]
+        i += 1
+        out |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return out, i
+    raise ValueError("truncated varint")
+
+def manifest_info(path):
+    try:
+        blob = Path(path).read_bytes()
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    if blob[:4] != MANIFEST_MAGIC:
+        return {"ok": False, "error": "bad magic"}
+    files = 0
+    total = 0
+    i = 8
+    end = len(blob)
+    try:
+        while i < end:
+            key, i = _pb_varint(blob, i, end)
+            field, wire = key >> 3, key & 7
+            if field != 1 or wire != 2:
+                break
+            length, i = _pb_varint(blob, i, end)
+            if i + length > end:
+                break
+            node = blob[i:i + length]
+            i += length
+            files += 1
+            j = 0
+            while j < len(node):
+                k2, j = _pb_varint(node, j, len(node))
+                f2, w2 = k2 >> 3, k2 & 7
+                if w2 == 0:
+                    v2, j = _pb_varint(node, j, len(node))
+                    if f2 == 2:
+                        total += v2
+                elif w2 == 2:
+                    l2, j = _pb_varint(node, j, len(node))
+                    j += l2
+                elif w2 == 5:
+                    j += 4
+                elif w2 == 1:
+                    j += 8
+                else:
+                    break
+    except (ValueError, IndexError):
+        pass
+    return {"ok": files > 0, "files": files, "bytes": total}
+
+def fetch_manifest(appid, depot, gid, progress=None):
+    cache = depotcache_dir()
+    if cache is None:
+        return None, gid, "steam library not found"
+    dest = cache / f"{int(depot)}_{gid}.manifest"
+    try:
+        if dest.is_file() and dest.stat().st_size > 1000:
+            with dest.open("rb") as fh:
+                if fh.read(4) == MANIFEST_MAGIC:
+                    return dest, gid, ""
+    except OSError:
+        pass
+    errors = []
+    repos = _manifest_repos(appid)
+    for repo in repos:
+        url = (f"https://raw.githubusercontent.com/{repo}/{int(appid)}/"
+               f"{int(depot)}_{gid}.manifest")
+        blob, err = _http_bytes(url, timeout=120)
+        if err:
+            errors.append(f"{repo.split('/')[0]}: {err}")
+            continue
+        if len(blob) < 1000 or blob[:4] != MANIFEST_MAGIC:
+            errors.append(f"{repo.split('/')[0]}: bad payload {len(blob)}B")
+            continue
+        try:
+            tmp = dest.with_suffix(".part")
+            tmp.write_bytes(blob)
+            tmp.replace(dest)
+        except OSError as exc:
+            errors.append(f"{repo.split('/')[0]}: write {exc}")
+            continue
+        _MANIFEST_HINT.update({"repo": repo, "appid": str(int(appid))})
+        if progress:
+            progress(f"manifest {depot}: {len(blob) // 1024} KB from {repo}")
+        return dest, gid, ""
+    for repo in repos[:3]:
+        names, lerr = _list_branch_files(repo, appid)
+        if lerr:
+            errors.append(f"{repo.split('/')[0]} list: {lerr}")
+            continue
+        for name in names:
+            alt = _gid_from_name(name, depot)
+            if not alt or alt == gid:
+                continue
+            url = (f"https://raw.githubusercontent.com/{repo}/{int(appid)}/{name}")
+            blob, err = _http_bytes(url, timeout=120)
+            if err or len(blob) < 1000 or blob[:4] != MANIFEST_MAGIC:
+                continue
+            dest = cache / name
+            try:
+                tmp = dest.with_suffix(".part")
+                tmp.write_bytes(blob)
+                tmp.replace(dest)
+            except OSError:
+                continue
+            _MANIFEST_HINT.update({"repo": repo, "appid": str(int(appid))})
+            if progress:
+                progress(f"manifest {depot}: using {alt} from {repo}")
+            return dest, alt, ""
+    return None, gid, " | ".join(errors[-2:]) or "no mirror carried this manifest"
+
+def stage_manifests(appid, rows, progress=None):
+    staged, missing, errors = [], [], []
+    for r in rows:
+        depot = int(r["depot"])
+        gid = str(r.get("manifest") or "")
+        path, used_gid, err = fetch_manifest(appid, depot, gid or "0", progress)
+        if path is None:
+            missing.append(depot)
+            errors.append(f"{depot}: {err}")
+            continue
+        if used_gid and used_gid != gid:
+            r["manifest"] = used_gid
+        info = manifest_info(path)
+        if not info.get("ok"):
+            errors.append(f"{depot}: manifest unreadable ({info.get('error')})")
+        elif progress:
+            progress(f"manifest {depot}: {info['files']} files, "
+                     f"{info['bytes'] // (1024 * 1024)} MB")
+            size = str(r.get("size") or "")
+            if size.isdigit() and int(size) > 0:
+                drift = abs(info["bytes"] - int(size)) / float(int(size))
+                if drift > 0.02:
+                    progress(f"manifest {depot}: size {info['bytes']} vs appinfo {size}")
+        staged.append(depot)
+    return {"ok": bool(staged), "staged": staged, "missing": missing,
+            "errors": errors}
+
+def current_steamid():
+    root = SteamCtx().root()
+    if root is None:
+        return "0"
+    f = root / "config" / "loginusers.vdf"
+    try:
+        text = f.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "0"
+    best = "0"
+    for block in re.finditer(r'"(7656\d{13})"\s*\{([^}]*)\}', text):
+        sid, body = block.group(1), block.group(2)
+        if re.search(r'"MostRecent"\s*"1"', body):
+            return sid
+        best = sid
+    return best
+
+def _vdf_quote(value):
+    return str(value if value is not None else "").replace("\\", "\\\\").replace('"', '\\"')
+
+def write_pending_appmanifest(appid, name, installdir, buildid, rows, total, download):
+    sa = steam_apps_dir()
+    if sa is None:
+        return {"ok": False, "error": "steam library not found"}
+    now = int(time.time())
+    total = int(total or 0)
+    download = int(download or total or 0)
+    lines = ['"AppState"', "{"]
+    lines += [f'\t"appid"\t\t"{int(appid)}"',
+              '\t"Universe"\t\t"1"',
+              f'\t"name"\t\t"{_vdf_quote(name or appid)}"',
+              '\t"StateFlags"\t\t"2"',
+              f'\t"installdir"\t\t"{_vdf_quote(installdir)}"',
+              f'\t"LastUpdated"\t\t"{now}"',
+              '\t"LastPlayed"\t\t"0"',
+              '\t"SizeOnDisk"\t\t"0"',
+              '\t"StagingSize"\t\t"0"',
+              f'\t"buildid"\t\t"{buildid}"',
+              f'\t"LastOwner"\t\t"{current_steamid()}"',
+              '\t"UpdateResult"\t\t"0"',
+              f'\t"BytesToDownload"\t\t"{download}"',
+              '\t"BytesDownloaded"\t\t"0"',
+              f'\t"BytesToStage"\t\t"{total}"',
+              '\t"BytesStaged"\t\t"0"',
+              f'\t"TargetBuildID"\t\t"{buildid}"',
+              '\t"AutoUpdateBehavior"\t\t"0"',
+              '\t"AllowOtherDownloadsWhileRunning"\t\t"0"',
+              '\t"ScheduledAutoUpdate"\t\t"0"',
+              '\t"InstalledDepots"', "\t{"]
+    for d in rows:
+        lines += [f'\t\t"{int(d["depot"])}"', "\t\t{",
+                  f'\t\t\t"manifest"\t\t"{d["manifest"]}"',
+                  f'\t\t\t"size"\t\t"{int(d.get("size") or 0)}"', "\t\t}"]
+    lines += ["\t}", '\t"SharedDepots"', "\t{", "\t}",
+              '\t"UserConfig"', "\t{", "\t}",
+              '\t"MountedConfig"', "\t{", "\t}", "}"]
+    path = sa / f"appmanifest_{int(appid)}.acf"
+    try:
+        tmp = path.with_suffix(".acf.tmp")
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "file": str(path)}
+
 def install_to_library(appid, branch="public", want_os="mac", user="", password="",
                        progress=None):
     aid = int(appid)
@@ -1440,13 +1713,31 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
             progress("no depot key found for: " + ", ".join(str(d) for d in missing))
     if not (user and password):
         if progress:
+            progress("staging depot manifests so Steam never asks the CM for them")
+        staged = stage_manifests(aid, rows, progress)
+        if staged["missing"]:
+            if progress:
+                progress("manifest missing for: " +
+                         ", ".join(str(d) for d in staged["missing"]))
+        total = sum(int(r["size"]) for r in rows if str(r.get("size", "")).isdigit())
+        download = sum(int(r["download"]) for r in rows
+                       if str(r.get("download", "")).isdigit())
+        acf = write_pending_appmanifest(aid, probe.get("name"), installdir,
+                                        probe.get("buildid", ""), rows,
+                                        total, download)
+        if progress:
+            if acf.get("ok"):
+                progress(f"library entry: {acf['file']} (update queued)")
+            else:
+                progress("library entry failed: " + str(acf.get("error")))
+        if progress:
             progress("handing the install to Steam - it pulls the depots itself")
         restart_steam()
         fb = steam_install_url(aid)
         return {"ok": True, "appid": str(aid), "mode": "steam", "dir": str(target),
                 "depots": depots, "keys": len(keys), "missing_keys": missing,
-                "config": cfg, "steam": fb,
-                "note": "Steam downloads into steamapps/common and writes the acf"}
+                "manifests": staged, "acf": acf, "config": cfg, "steam": fb,
+                "note": "Steam reads the local manifest and downloads the chunks"}
     target.mkdir(parents=True, exist_ok=True)
     res = fetch_game(aid, branch, rows, want_os, True, user, password,
                      str(target), None, None, progress, flat=True)
@@ -1489,8 +1780,25 @@ def repair_install_state(appid):
             f.unlink()
         except OSError:
             pass
+    restaged = {"ok": False, "staged": [], "missing": []}
+    probe = probe_app(int(appid))
+    if probe.get("ok"):
+        rows = [r for r in select_rows(probe["rows"], "mac", False)
+                if r.get("manifest")]
+        if rows:
+            restaged = stage_manifests(int(appid), rows, progress=LOGS.add)
+            if restaged.get("ok") and not acf:
+                total = sum(int(r["size"]) for r in rows
+                            if str(r.get("size", "")).isdigit())
+                download = sum(int(r["download"]) for r in rows
+                               if str(r.get("download", "")).isdigit())
+                write_pending_appmanifest(int(appid), probe.get("name"), installdir,
+                                          probe.get("buildid", ""), rows,
+                                          total, download)
     return {"ok": True, "acf": bool(acf), "installdir": installdir,
-            "files": files, "stale_removed": stale}
+            "files": files, "stale_removed": stale,
+            "manifests": restaged.get("staged", []),
+            "manifests_missing": restaged.get("missing", [])}
 
 def steam_install_url(appid):
     if sys.platform != "darwin":
@@ -2252,6 +2560,21 @@ def cmd_grant(a):
     print(json.dumps(inst, indent=2, ensure_ascii=False))
     return 0 if inst.get("ok") else 1
 
+def cmd_manifests(a):
+    aid = _appid(a.appid)
+    probe = probe_app(aid, a.branch)
+    if not probe.get("ok"):
+        print(json.dumps(probe, indent=2, ensure_ascii=False))
+        return 1
+    rows = select_rows(probe["rows"], a.os, False)
+    rows = [r for r in rows if r.get("manifest")]
+    res = stage_manifests(aid, rows,
+                          progress=lambda m: print(m, file=sys.stderr))
+    res["appid"] = str(aid)
+    res["cache"] = str(depotcache_dir() or "")
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("ok") else 1
+
 def cmd_remove(a):
     print(json.dumps(remove_lua(_appid(a.appid)), indent=2))
 
@@ -2482,6 +2805,16 @@ class Api:
             missing = [d for d in depots if d not in keys]
             if missing:
                 LOGS.add("no key for depot(s): " + ", ".join(map(str, missing)))
+            if probe.get("ok"):
+                mrows = [r for r in select_rows(probe["rows"], want_os, False)
+                         if r.get("manifest")]
+                st = stage_manifests(int(aid), mrows, progress=LOGS.add)
+                steps.append({"step": "manifests", "ok": st.get("ok"),
+                              "staged": st.get("staged"),
+                              "missing": st.get("missing")})
+                if st.get("missing"):
+                    LOGS.add("manifest missing for depot(s): " +
+                             ", ".join(str(d) for d in st["missing"]))
             LOGS.add("steam restarting - game will show in your library")
             restart_steam()
             steps.append({"step": "restart", "ok": True})
@@ -2528,6 +2861,11 @@ class Api:
                                          progress=lambda m: LOGS.add(str(m)))
                 if res.get("ok"):
                     if res.get("mode") == "steam":
+                        mans = (res.get("manifests") or {})
+                        staged = mans.get("staged") or []
+                        if staged:
+                            LOGS.add("manifests ready for depot(s): " +
+                                     ", ".join(str(d) for d in staged))
                         LOGS.add("steam is downloading the depots itself - watch the downloads page")
                         if res.get("missing_keys"):
                             LOGS.add("no key for: " + ", ".join(str(d) for d in res["missing_keys"]))
@@ -2555,6 +2893,9 @@ class Api:
 
     def install_status(self):
         return FETCH_RESULT.get("install") or {"ok": None, "running": _FETCH_LOCK.locked()}
+
+    def manifests_status(self):
+        return FETCH_RESULT.get("manifests") or {"ok": None}
 
     def open_folder(self, which="steamapps"):
         res = open_steam_folder(which)
@@ -2612,6 +2953,56 @@ class Api:
         res = repair_install_state(int(aid))
         LOGS.add("repair " + aid + ": " + json.dumps(res)[:240])
         return res
+
+    def manifests(self, appid, os_name="mac"):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        want = str(os_name or "mac").strip() or "mac"
+
+        def worker():
+            try:
+                FETCH_RESULT["manifests"] = None
+                LOGS.add(f"manifests {aid} - staging depot files for {want}")
+                probe = probe_app(int(aid), "public")
+                if not probe.get("ok"):
+                    LOGS.add("manifest stage failed at probe: " + str(probe.get("error")))
+                    FETCH_RESULT["manifests"] = probe
+                    return
+                rows = [r for r in select_rows(probe["rows"], want, False)
+                        if r.get("manifest")]
+                if not rows:
+                    out = {"ok": False, "error": f"no depot manifests for os={want}"}
+                    LOGS.add(out["error"])
+                    FETCH_RESULT["manifests"] = out
+                    return
+                res = stage_manifests(int(aid), rows,
+                                      progress=lambda m: LOGS.add(str(m)))
+                res["appid"] = aid
+                res["cache"] = str(depotcache_dir() or "")
+                res["rows"] = len(rows)
+                if res.get("ok"):
+                    installdir = probe.get("installdir") or probe.get("name") or aid
+                    total = sum(int(r["size"]) for r in rows
+                                if str(r.get("size", "")).isdigit())
+                    download = sum(int(r["download"]) for r in rows
+                                   if str(r.get("download", "")).isdigit())
+                    acf = write_pending_appmanifest(int(aid), probe.get("name"), installdir,
+                                                    probe.get("buildid", ""), rows,
+                                                    total, download)
+                    res["acf"] = acf
+                    LOGS.add("manifests staged: " + ", ".join(str(d) for d in res["staged"]))
+                    LOGS.add("library entry: " + str(acf.get("file") or acf.get("error")))
+                else:
+                    LOGS.add("manifest stage failed: " +
+                             (", ".join(res.get("errors") or []) or "unknown"))
+                FETCH_RESULT["manifests"] = res
+            except Exception as exc:
+                LOGS.add("manifest stage crashed: " + str(exc))
+                FETCH_RESULT["manifests"] = {"ok": False, "error": str(exc)}
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True, "queued": True, "appid": aid, "os": want}
 
     def uninstall(self, appid):
         aid = str(appid or "").strip()
@@ -2807,6 +3198,7 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
   </div>
   <div class="toolbar">
     <button id="b-m-paths">Show Steam paths</button>
+    <button id="b-m-manifests">Stage manifests</button>
     <button id="b-m-keys">Refresh depot keys</button>
     <button id="b-m-unloader">Remove loader from Steam</button>
     <span class="muted">Removes the injected dylib, the plist entry, and the macsteam config - Steam goes back to a clean install</span>
@@ -2822,7 +3214,7 @@ let api=null,logIdx=0;
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const say=t=>{$("#status").textContent=t};
-function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-lua","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
+function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-lua","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths","#b-m-manifests"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
 async function call(fn,...args){if(!api)throw new Error("bridge not ready");return api[fn](...args)}
 document.querySelectorAll("button.tab").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("button.tab").forEach(x=>x.classList.toggle("pri",x===b));
@@ -3017,7 +3409,9 @@ $("#b-m-open").onclick=async()=>{
     ["Steam.app",p.steam_app||"not installed"],
     ["steam binary",p.steam_exe||"-"],
     ["macsteam config",(p.macsteam_config_exists?"ok  ":"missing  ")+p.macsteam_config],
-    ["injected dylib",(p.dylib_exists?"ok  ":"missing  ")+p.dylib]
+    ["injected dylib",(p.dylib_exists?"ok  ":"missing  ")+p.dylib],
+    ["depotcache",p.depotcache||"-"],
+    ["manifests in depotcache",String(p.depotcache_manifests==null?0:p.depotcache_manifests)]
   ];
   $("#pathsout").innerHTML=`<table><thead><tr><th>Item</th><th>Path</th></tr></thead><tbody>`+
     rows.map(([k,v])=>`<tr><td>${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join("")+
@@ -3029,6 +3423,29 @@ $("#b-m-paths").onclick=async()=>{
     renderPaths(p);
     say(p.steam_root_exists?"steam folder found":"steam folder not found - open Steam once");
   }catch(e){say("path check failed: "+e)}
+};
+$("#b-m-manifests").onclick=async()=>{
+  const id=$("#m-appid").value.trim();
+  if(!/^\d+$/.test(id))return say("appid must be numeric");
+  busy(true);say("staging depot manifests for "+id+" - watch the log...");
+  try{
+    const q=await call("manifests",id,$("#os").value||"mac");
+    if(!q.ok)return say("manifest stage failed: "+(q.error||""));
+    let r={ok:null};
+    for(let i=0;i<120;i++){
+      await new Promise(z=>setTimeout(z,1000));
+      r=await call("manifests_status");
+      if(r&&r.ok!==null&&r.ok!==undefined)break;
+    }
+    if(!r||r.ok==null)return say("manifest stage still running - check the log");
+    if(r.ok){
+      say("manifests staged: "+(r.staged||[]).join(", ")+" - press Download files");
+      try{renderPaths(await call("paths"))}catch(_){}
+    }else{
+      say("manifest stage failed: "+((r.errors||[]).join(" | ")||r.error||""));
+    }
+  }catch(e){say("manifest stage failed: "+e)}
+  finally{busy(false)}
 };
 $("#b-m-common").onclick=async()=>{
   try{
@@ -3184,6 +3601,12 @@ def build_argparser():
                        help="install a .lua and copy its depot keys into the loader config")
     p.add_argument("file")
     p.set_defaults(fn=cmd_import_lua)
+
+    p = sub.add_parser("manifests", help="stage depot manifests into steamapps/depotcache")
+    p.add_argument("appid")
+    p.add_argument("--branch", default="public")
+    p.add_argument("--os", default="mac")
+    p.set_defaults(fn=cmd_manifests)
 
     p = sub.add_parser("keydb", help="show or refresh the depot key table")
     p.add_argument("--refresh", action="store_true")
