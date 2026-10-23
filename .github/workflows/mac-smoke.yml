@@ -131,7 +131,11 @@ jobs:
             grep -E "vdf parser ok|gui ok|gui_exit|Downloaded [0-9]+ bytes|,mac," /tmp/smoke.log | head -20
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          test -n "$(find /tmp/games -type f | head -1)"
+          if [ -n "$(find /tmp/games -type f 2>/dev/null | head -1)" ]; then
+            echo "legacy fetch-game produced files"
+          else
+            echo "::warning::legacy fetch-game produced no files this run (diagnostic only - the licensetools fetch smoke above is the gate)"
+          fi
           if [ -s /tmp/depots.csv ]; then
             grep -q ',mac,' /tmp/depots.csv || echo "::warning::probe returned no mac depot row"
           else
