@@ -18,7 +18,7 @@ echo "== venv =="
 # shellcheck disable=SC1091
 source .build-venv/bin/activate
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet pyinstaller
+python -m pip install --quiet pyinstaller "pywebview>=5.0"
 
 echo "== clean =="
 rm -rf build dist "$BUNDLE.spec"
@@ -27,8 +27,12 @@ echo "== pyinstaller =="
 pyinstaller \
   --noconfirm --clean --windowed \
   --name "$BUNDLE" \
+  --icon icon.icns \
   --add-data "luatools_mac.py:." \
   --add-data "luatools_mac_gui.py:." \
+  --add-data "ui:ui" \
+  --hidden-import webview.platforms.cocoa \
+  --collect-submodules webview \
   --osx-bundle-identifier "com.luatools.mac" \
   luatools_mac_gui.py
 
@@ -37,6 +41,14 @@ if [ ! -d "$APP" ]; then
   echo "build failed: $APP missing" >&2
   exit 1
 fi
+
+if [ ! -f "$APP/Contents/Resources/ui/index.html" ]; then
+  echo "build failed: ui/index.html missing from the bundle" >&2
+  exit 1
+fi
+
+echo "== selftest =="
+"$APP/Contents/MacOS/$BUNDLE" --selftest
 
 echo "== ad-hoc sign =="
 codesign --force --deep --sign - "$APP" || echo "codesign skipped"

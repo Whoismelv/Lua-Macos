@@ -1,0 +1,981 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LuaTools</title>
+<style>
+  :root{
+    --ground:#0A0A0B; --surface:#121214; --raised:#17171A; --active:#202024;
+    --border:#232327; --rule:#1A1A1D; --control:#34343A;
+    --text:#F5F6F7; --muted:#A1A1A8; --faint:#7C7C84;
+    --accent:#6BA6FF; --positive:#4ED39A; --negative:#F0707F; --notice:#E8B45C;
+    --pill-pos-bg:#16261F; --pill-warn-bg:#2A2216; --pill-neg-bg:#2A1A1E;
+    --radius-card:16px; --radius-control:8px; --radius-chip:6px;
+    --gap:16px; --pad:28px;
+    --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Inter,system-ui,sans-serif;
+    --mono:ui-monospace,"SF Mono",Menlo,"Cascadia Mono",monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--ground); color:var(--text); overflow:hidden;
+    font-family:var(--font); font-size:13px; line-height:1.45;
+    -webkit-font-smoothing:antialiased; user-select:none;
+  }
+  .app{display:flex;height:100vh}
+
+  /* ---------- sidebar ---------- */
+  .sidebar{
+    width:232px; flex:0 0 232px; height:100%; display:flex; flex-direction:column;
+    background:var(--ground); border-right:1px solid var(--border);
+  }
+  .brand{display:flex;align-items:center;gap:10px;padding:20px 18px 18px}
+  .mark{width:22px;height:22px;color:var(--accent);flex:0 0 22px}
+  .brand-name{font-size:14px;font-weight:600;letter-spacing:-.01em;line-height:1.2}
+  .brand-scope{font-size:11px;color:var(--faint);margin-top:2px}
+
+  .nav-group{padding:6px 0}
+  .nav-label{font-size:12px;color:var(--faint);padding:0 18px;margin:10px 0 6px}
+  .nav{display:flex;align-items:center;gap:9px;height:32px;margin:1px 8px;padding:0 10px;
+    border-radius:var(--radius-control);color:var(--muted);cursor:pointer;
+    transition:background .14s ease,color .14s ease;border:none;background:none;
+    font:inherit;font-size:13px;text-align:left;width:calc(100% - 16px)}
+  .nav svg{width:16px;height:16px;flex:0 0 16px;stroke-width:1.5}
+  .nav:hover{background:var(--raised);color:var(--text)}
+  .nav.active{background:var(--active);color:var(--text);font-weight:500}
+  .spacer{flex:1}
+  .sidebar-bottom{padding-bottom:12px}
+  .sep{height:1px;background:var(--rule);margin:8px 16px}
+  .version{padding:10px 18px 0;font-size:11px;color:var(--faint)}
+
+  /* ---------- main ---------- */
+  .main{flex:1;display:flex;flex-direction:column;min-width:0;height:100%}
+  .content{flex:1;overflow:auto;padding:26px 32px 40px}
+  .content::-webkit-scrollbar{width:10px}
+  .content::-webkit-scrollbar-thumb{background:#2A2A2F;border-radius:10px;
+    border:3px solid transparent;background-clip:content-box}
+  .content::-webkit-scrollbar-thumb:hover{background:#3A3A40;background-clip:content-box}
+
+  .title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:22px}
+  .title-row h1{font-size:24px;font-weight:600;letter-spacing:-.02em;line-height:1.2}
+  .title-row p{font-size:13px;color:var(--muted);margin-top:4px}
+  .status{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);
+    padding-top:6px;white-space:nowrap}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--positive);flex:0 0 6px}
+  .status.warn .dot{background:var(--notice)}
+  .status.error .dot{background:var(--negative)}
+  .status.warn .dot{animation:pulse 1.2s ease-in-out infinite}
+  @keyframes pulse{50%{opacity:.35}}
+
+  .page{display:none}
+  .page.active{display:block}
+
+  /* ---------- panels ---------- */
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-card)}
+  .panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;
+    padding:18px 20px 14px}
+  .panel-title{font-size:14px;font-weight:600;letter-spacing:-.01em}
+  .panel-sub{font-size:12px;color:var(--muted);margin-top:3px}
+  .panel-body{padding:0 20px 20px}
+  .panel-foot{border-top:1px solid var(--rule);padding:12px 20px;display:flex;
+    align-items:center;justify-content:space-between;font-size:12px;color:var(--muted)}
+  .stack{display:flex;flex-direction:column;gap:var(--gap)}
+  .row2{display:grid;grid-template-columns:1.55fr 1fr;gap:var(--gap);align-items:start}
+  .row3{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--gap);align-items:start}
+
+  /* ---------- KPI strip ---------- */
+  .kpis{display:grid;grid-template-columns:repeat(3,1fr);background:var(--surface);
+    border:1px solid var(--border);border-radius:var(--radius-card);overflow:hidden}
+  .kpi{padding:16px 20px 18px}
+  .kpi + .kpi{border-left:1px solid var(--rule)}
+  .kpi-label{font-size:12px;color:var(--muted)}
+  .kpi-value{font-size:26px;font-weight:600;letter-spacing:-.02em;margin-top:6px;
+    font-variant-numeric:tabular-nums;line-height:1.1}
+  .kpi-note{font-size:11px;color:var(--faint);margin-top:5px}
+  .kpi-note.pos{color:var(--positive)}
+  .kpi-note.neg{color:var(--negative)}
+
+  /* ---------- library rows ---------- */
+  .lrows{display:flex;flex-direction:column}
+  .lrow{display:flex;align-items:center;gap:12px;height:44px;padding:0 20px;
+    border-top:1px solid var(--rule);font-size:13px;transition:background .12s}
+  .lrow:first-child{border-top:none}
+  .lrow:hover{background:var(--raised)}
+  .lrow .id{font-family:var(--mono);font-size:12px;color:var(--muted);width:64px;flex:0 0 64px;
+    font-variant-numeric:tabular-nums}
+  .lrow .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lrow .state{font-size:11px;color:var(--faint);width:96px;text-align:right;flex:0 0 96px}
+
+  /* ---------- readiness ---------- */
+  .kv{display:flex;align-items:baseline;gap:12px;padding:9px 0;font-size:13px}
+  .kv + .kv{border-top:1px solid var(--rule)}
+  .kv .k{color:var(--muted);width:88px;flex:0 0 88px;font-size:12px}
+  .kv .v{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    text-align:right;font-size:12px}
+  .kv .v.mono{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+
+  /* ---------- depot ladder ---------- */
+  .ladder{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--raised);
+    margin:4px 0 14px;gap:2px}
+  .ladder span{display:block;height:100%}
+  .ladder .mac{background:var(--accent)}
+  .ladder .shared{background:#4A4A52}
+  .ladder .win{background:#33333A}
+  .ladder .linux{background:#5F5F68}
+  .legend{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .legend div{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+  .legend i{width:6px;height:6px;border-radius:2px;display:block}
+  .legend b{font-weight:600;color:var(--text);font-variant-numeric:tabular-nums}
+
+  /* ---------- buttons ---------- */
+  .btn{height:34px;padding:0 14px;border-radius:var(--radius-control);
+    border:1px solid var(--control);background:transparent;color:var(--text);
+    font:inherit;font-size:12.5px;font-weight:500;cursor:pointer;display:inline-flex;
+    align-items:center;justify-content:center;gap:7px;white-space:nowrap;
+    transition:background .14s,border-color .14s,transform .08s}
+  .btn svg{width:14px;height:14px;stroke-width:1.6}
+  .btn:hover{background:var(--raised);border-color:#4A4A52}
+  .btn:active{transform:scale(.985)}
+  .btn.primary{background:var(--text);border-color:var(--text);color:#0A0A0B;font-weight:600}
+  .btn.primary:hover{background:#FFFFFF;border-color:#FFFFFF}
+  .btn.quiet{border-color:transparent;color:var(--muted)}
+  .btn.quiet:hover{background:var(--raised);color:var(--text)}
+  .btn.danger{color:var(--negative);border-color:#3A2429}
+  .btn.danger:hover{background:var(--pill-neg-bg);border-color:#553038}
+  .btn.sm{height:28px;padding:0 10px;font-size:11.5px;border-radius:6px}
+  .btn.icon{width:34px;padding:0}
+  .btn:disabled{opacity:.4;cursor:default;transform:none}
+  .btn:focus-visible,.nav:focus-visible,input:focus-visible{
+    outline:2px solid var(--accent);outline-offset:2px}
+
+  /* ---------- inputs ---------- */
+  .field{display:flex;flex-direction:column;gap:7px}
+  .field label{font-size:12px;color:var(--muted)}
+  input[type=text]{height:36px;padding:0 11px;border-radius:var(--radius-control);
+    border:1px solid var(--control);background:var(--ground);color:var(--text);
+    font:inherit;font-size:13px;outline:none;width:100%;user-select:text;
+    transition:border-color .14s,box-shadow .14s}
+  input[type=text]::placeholder{color:var(--faint)}
+  input[type=text]:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(107,166,255,.14)}
+  .input-row{display:flex;gap:8px}
+  .input-row input{flex:1;min-width:0}
+  .input-row .btn{height:36px}
+  .input-row .btn.icon{width:36px}
+  .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px 18px;margin-top:16px}
+  .hint{font-size:11.5px;color:var(--faint)}
+
+  /* ---------- search results ---------- */
+  .results{margin-top:14px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+  .results:empty{display:none}
+  .hit{display:flex;align-items:center;gap:12px;height:40px;padding:0 14px;font-size:13px;
+    cursor:pointer;border-top:1px solid var(--rule);transition:background .12s}
+  .hit:first-child{border-top:none}
+  .hit:hover{background:var(--raised)}
+  .hit .id{font-family:var(--mono);font-size:11.5px;color:var(--muted);width:58px;flex:0 0 58px;
+    font-variant-numeric:tabular-nums}
+  .hit .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  /* ---------- table ---------- */
+  .table-wrap{overflow:auto;border-radius:0 0 var(--radius-card) var(--radius-card)}
+  .table-wrap::-webkit-scrollbar{width:10px}
+  .table-wrap::-webkit-scrollbar-thumb{background:#2A2A2F;border-radius:10px;
+    border:3px solid transparent;background-clip:content-box}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  thead th{text-align:left;font-size:12px;font-weight:400;color:var(--muted);
+    padding:10px 16px;border-bottom:1px solid var(--border);background:var(--surface);
+    position:sticky;top:0;z-index:2;white-space:nowrap}
+  thead th.num{text-align:right}
+  tbody td{height:44px;padding:0 16px;border-top:1px solid var(--rule);white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis;max-width:360px}
+  tbody tr:hover{background:var(--raised)}
+  tbody tr.sel{background:var(--active)}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .mono{font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums}
+  .muted{color:var(--muted)}
+  .empty-row td{height:96px;text-align:center;color:var(--faint);font-size:12.5px}
+
+  .pill{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:var(--radius-chip);
+    font-size:11px;font-weight:500;white-space:nowrap;flex:none}
+  .pill.mac{background:var(--pill-pos-bg);color:var(--accent)}
+  .pill.shared{background:var(--raised);color:var(--muted)}
+  .pill.win{background:var(--raised);color:var(--faint)}
+  .pill.linux{background:var(--pill-warn-bg);color:var(--notice)}
+  .pill.pos{background:var(--pill-pos-bg);color:var(--positive)}
+  .pill.neg{background:var(--pill-neg-bg);color:var(--negative)}
+
+  /* ---------- actions ---------- */
+  .actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:16px}
+  .actions .right{margin-left:auto;display:flex;gap:8px}
+
+  /* ---------- drop zone ---------- */
+  .drop{display:flex;align-items:center;gap:18px;padding:22px 20px;cursor:pointer;
+    border:1px dashed #2E2E34;border-radius:var(--radius-card);background:var(--surface);
+    transition:border-color .14s,background .14s}
+  .drop:hover{border-color:#45454D;background:var(--raised)}
+  .drop-icon{width:36px;height:36px;flex:0 0 36px;display:grid;place-items:center;
+    color:var(--accent)}
+  .drop-icon svg{width:22px;height:22px;stroke-width:1.5}
+  .drop h3{font-size:13.5px;font-weight:600}
+  .drop p{font-size:12px;color:var(--muted);margin-top:2px}
+  .drop .btn{margin-left:auto}
+
+  /* ---------- fixes ---------- */
+  .fix-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:16px}
+  .fix-grid .btn{width:100%;justify-content:flex-start;height:36px;font-weight:400}
+  .fix-grid .btn svg{color:var(--muted)}
+
+  /* ---------- logs ---------- */
+  .logbox{height:calc(100vh - 300px);min-height:300px;overflow:auto;padding:14px 18px;
+    font-family:var(--mono);font-size:12px;line-height:1.75;color:var(--muted);
+    user-select:text;white-space:pre-wrap;word-break:break-word;
+    border-top:1px solid var(--rule)}
+  .logbox::-webkit-scrollbar{width:10px}
+  .logbox::-webkit-scrollbar-thumb{background:#2A2A2F;border-radius:10px;
+    border:3px solid transparent;background-clip:content-box}
+  .logbox .ok{color:var(--positive)}
+  .logbox .err{color:var(--negative)}
+  .logbox .cmd{color:var(--accent)}
+  .logbox .dim{color:var(--faint)}
+
+  /* ---------- settings ---------- */
+  .set-row{display:grid;grid-template-columns:300px 1fr;gap:28px;padding:22px 0;
+    border-top:1px solid var(--rule)}
+  .set-row:first-of-type{border-top:none;padding-top:6px}
+  .set-row h2{font-size:14px;font-weight:600}
+  .set-row .desc{font-size:12px;color:var(--muted);margin-top:4px}
+  .set-panel{background:var(--raised);border-radius:12px;padding:14px}
+  .set-panel .input-row{margin:0}
+
+  .toast{position:fixed;right:20px;bottom:20px;z-index:50;display:flex;flex-direction:column;
+    gap:8px;align-items:flex-end}
+  .toast div{background:var(--raised);border:1px solid var(--control);border-radius:10px;
+    padding:10px 14px;font-size:12px;max-width:380px}
+  .toast div.err{border-color:#553038;color:#FFC4CB}
+
+  @media (max-width:1000px){
+    .sidebar{width:64px;flex:0 0 64px}
+    .brand{padding:18px 0;justify-content:center}
+    .brand-text,.nav span,.nav-label,.version{display:none}
+    .nav{justify-content:center;width:48px;margin:2px auto;padding:0}
+    .sep{margin:8px 12px}
+    .content{padding:22px 20px 32px}
+    .row2,.row3{grid-template-columns:1fr}
+    .kpis{grid-template-columns:1fr}
+    .kpi + .kpi{border-left:none;border-top:1px solid var(--rule)}
+    .form-grid,.fix-grid{grid-template-columns:1fr}
+    .set-row{grid-template-columns:1fr;gap:12px}
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20 15.2A8.6 8.6 0 0 1 8.8 4a8.7 8.7 0 1 0 11.2 11.2Z"/>
+      </svg>
+      <div class="brand-text">
+        <div class="brand-name">LuaTools</div>
+        <div class="brand-scope">Steam · macOS</div>
+      </div>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-label">Workspace</div>
+      <button class="nav active" data-page="home" title="Overview">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg>
+        <span>Overview</span></button>
+      <button class="nav" data-page="add" title="Add a game">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
+        <span>Add a game</span></button>
+      <button class="nav" data-page="manage" title="Library">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/></svg>
+        <span>Library</span></button>
+      <button class="nav" data-page="depots" title="Depots">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11"/><path d="m7.5 10 4.5 4.5L16.5 10"/><path d="M4 17v3h16v-3"/></svg>
+        <span>Depots</span></button>
+      <button class="nav" data-page="fixes" title="Fixes">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h7M15 17h5"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="13" cy="17" r="2"/></svg>
+        <span>Fixes</span></button>
+      <button class="nav" data-page="logs" title="Logs">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7 9 3 3-3 3"/><path d="M12.5 15H17"/></svg>
+        <span>Logs</span></button>
+    </div>
+
+    <div class="spacer"></div>
+    <div class="sidebar-bottom">
+      <div class="sep"></div>
+      <button class="nav" id="restartSteam" title="Restart Steam">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v4.5h-4.5"/></svg>
+        <span>Restart Steam</span></button>
+      <button class="nav" data-page="settings" title="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+        <span>Settings</span></button>
+      <div class="version">v1.0.2</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="content">
+      <div class="title-row">
+        <div>
+          <h1 id="pageTitle">Overview</h1>
+          <p id="pageSub">What is on the board right now</p>
+        </div>
+        <div class="status" id="statusChip"><span class="dot"></span><span id="statusText">idle</span></div>
+      </div>
+
+      <!-- OVERVIEW -->
+      <section class="page active" id="page-home">
+        <div class="kpis">
+          <div class="kpi">
+            <div class="kpi-label">Luas on board</div>
+            <div class="kpi-value" id="homeCount">0</div>
+            <div class="kpi-note" id="homeCountNote">Steam shortcuts written</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Mac depots ready</div>
+            <div class="kpi-value" id="homeDepots">0</div>
+            <div class="kpi-note" id="homeDepotsNote">No scan yet</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Steam detected</div>
+            <div class="kpi-value" id="homeSteamState">—</div>
+            <div class="kpi-note" id="homeSteamNote">No root set</div>
+          </div>
+        </div>
+
+        <div class="row2" style="margin-top:16px">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">Library</div>
+                <div class="panel-sub">Luas recognised by Steam</div>
+              </div>
+            </div>
+            <div class="lrows" id="homeLibrary"></div>
+            <div class="panel-foot">
+              <span id="homeLibTotal">0 luas</span>
+              <button class="btn quiet sm" id="viewLibrary">View all</button>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">Readiness</div>
+                <div class="panel-sub">What the engine sees</div>
+              </div>
+            </div>
+            <div class="panel-body">
+              <div class="kv"><span class="k">Steam</span><span class="v mono" id="homeSteam">—</span></div>
+              <div class="kv"><span class="k">Signed in</span><span class="v" id="homeUser">—</span></div>
+              <div class="kv"><span class="k">Plugin</span><span class="v"><span class="pill" id="pluginPill">—</span></span></div>
+              <div class="kv"><span class="k">Engine</span><span class="v" id="homeMode">native macOS</span></div>
+              <div class="kv"><span class="k">Bridge</span><span class="v mono" id="homeBridge">127.0.0.1:6767</span></div>
+            </div>
+            <div class="panel-foot">
+              <span>Next step</span>
+              <button class="btn primary sm" id="goAdd">Add a game</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="drop" id="dropzone" style="margin-top:16px">
+          <div class="drop-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M4 19h16"/></svg>
+          </div>
+          <div>
+            <h3>Drop .lua, .manifest or .zip files</h3>
+            <p>They land in the Steam cache and show up in the library</p>
+          </div>
+          <button class="btn" id="browseBtn">Browse files</button>
+        </div>
+      </section>
+
+      <!-- ADD -->
+      <section class="page" id="page-add">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Find a game</div>
+              <div class="panel-sub">Search the Steam store, or paste an AppID</div>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="input-row">
+              <input type="text" id="searchInput" placeholder="Portal 2, 620, Elden Ring">
+              <button class="btn" id="searchBtn">Search</button>
+            </div>
+            <div class="results" id="searchResults"></div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:16px">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Install target</div>
+              <div class="panel-sub">Where the mac build lands and which dylib to swap in</div>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="form-grid">
+              <div class="field">
+                <label for="appidInput">AppID</label>
+                <input type="text" id="appidInput" placeholder="620">
+              </div>
+              <div class="field">
+                <label for="depotsInput">Depot list</label>
+                <div class="input-row">
+                  <input type="text" id="depotsInput" placeholder="auto">
+                  <button class="btn icon" data-pick="file" data-target="depotsInput" title="Choose a depot list">⋯</button>
+                </div>
+              </div>
+              <div class="field">
+                <label for="dirInput">Game folder or .app</label>
+                <div class="input-row">
+                  <input type="text" id="dirInput" placeholder="~/.luatools-mac/games/620">
+                  <button class="btn icon" data-pick="folder" data-target="dirInput" title="Choose a folder">⋯</button>
+                </div>
+              </div>
+              <div class="field">
+                <label for="dylibInput">steam_api.dylib</label>
+                <div class="input-row">
+                  <input type="text" id="dylibInput" placeholder="Choose the replacement dylib">
+                  <button class="btn icon" data-pick="file" data-target="dylibInput" title="Choose a dylib">⋯</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn" id="probeBtn">Detect depots</button>
+          <button class="btn" id="fetchBtn">Fetch content</button>
+          <button class="btn" id="applyBtn">Apply steam_api</button>
+          <button class="btn" id="shortcutBtn">Add to library</button>
+          <div class="right"><button class="btn primary" id="launchBtn">Launch</button></div>
+        </div>
+      </section>
+
+      <!-- LIBRARY -->
+      <section class="page" id="page-manage">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Installed in Steam</div>
+              <div class="panel-sub" id="libraryCount">0 luas</div>
+            </div>
+            <button class="btn sm" id="refreshLibrary">Refresh</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th style="width:100px">AppID</th><th>Name</th>
+                <th style="width:110px">State</th><th style="width:150px" class="num">BuildID</th>
+              </tr></thead>
+              <tbody id="libraryBody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn" id="openFolderBtn">Open folder</button>
+          <button class="btn" id="addShortcutBtn">Add to library</button>
+          <button class="btn danger" id="removeLuaBtn">Remove lua</button>
+          <div class="right"><button class="btn quiet" id="useAppidBtn">Use AppID in Add a game</button></div>
+        </div>
+      </section>
+
+      <!-- DEPOTS -->
+      <section class="page" id="page-depots">
+        <div class="actions" style="margin:0 0 16px">
+          <input type="text" id="depotAppid" placeholder="AppID" style="width:120px">
+          <button class="btn primary" id="depotProbeBtn">Detect depots</button>
+          <span class="hint" id="depotSummary">No scan yet</span>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Depot ladder</div>
+              <div class="panel-sub">Every depot SteamCMD reports, split by platform</div>
+            </div>
+            <span class="hint" id="depotBuild"></span>
+          </div>
+          <div class="panel-body">
+            <div class="ladder" id="ladder">
+              <span class="mac" style="width:0"></span>
+              <span class="shared" style="width:0"></span>
+              <span class="win" style="width:0"></span>
+              <span class="linux" style="width:0"></span>
+            </div>
+            <div class="legend" id="ladderLegend">
+              <div><i style="background:var(--accent)"></i>mac <b id="cMac">0</b></div>
+              <div><i style="background:#4A4A52"></i>shared <b id="cShared">0</b></div>
+              <div><i style="background:#33333A"></i>win <b id="cWin">0</b></div>
+              <div><i style="background:#5F5F68"></i>linux <b id="cLinux">0</b></div>
+            </div>
+          </div>
+          <div class="table-wrap" style="max-height:calc(100vh - 420px);border-top:1px solid var(--rule)">
+            <table>
+              <thead><tr>
+                <th style="width:90px">Depot</th><th style="width:100px">Platform</th>
+                <th>Manifest GID</th><th style="width:110px" class="num">Size</th>
+                <th style="width:140px">Depot key</th>
+              </tr></thead>
+              <tbody id="depotBody"><tr class="empty-row"><td colspan="5">Run a scan to list depots</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- FIXES -->
+      <section class="page" id="page-fixes">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Engine</div>
+              <div class="panel-sub">Maintenance actions, straight through to the CLI</div>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="fix-grid">
+              <button class="btn" data-tool="detect">Detect Steam</button>
+              <button class="btn" data-tool="toml">Write opensteamtool.toml</button>
+              <button class="btn" data-tool="migrate">Migrate depotcache</button>
+              <button class="btn" data-tool="restart">Restart Steam</button>
+              <button class="btn" data-tool="serve">Start injector</button>
+              <button class="btn" data-tool="plugin">Fetch web plugin</button>
+              <button class="btn" data-tool="vault">Vault dump</button>
+              <button class="btn" data-tool="denuvo">Denuvo listings</button>
+              <button class="btn" data-tool="install-dd">Install DepotDownloader</button>
+              <button class="btn" data-tool="settings">Dump settings</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:16px">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Steam root</div>
+              <div class="panel-sub">Used when Steam lives somewhere unusual</div>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="input-row">
+              <input type="text" id="steamRootInput" placeholder="/Users/you/Library/Application Support/Steam">
+              <button class="btn icon" data-pick="folder" data-target="steamRootInput" title="Choose the Steam folder">⋯</button>
+              <button class="btn primary" id="saveRootBtn">Save</button>
+            </div>
+            <div class="hint" style="margin-top:10px">The bridge listens on 127.0.0.1:6767 while the injector is armed.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- LOGS -->
+      <section class="page" id="page-logs">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Activity</div>
+              <div class="panel-sub">Everything the engine says, in order</div>
+            </div>
+            <button class="btn sm" id="clearLogs">Clear</button>
+          </div>
+          <div class="logbox" id="logBox"><span class="dim">Waiting for the engine.</span></div>
+        </div>
+      </section>
+
+      <!-- SETTINGS -->
+      <section class="page" id="page-settings">
+        <div class="panel" style="padding:22px 20px">
+          <div class="set-row">
+            <div>
+              <h2>Steam location</h2>
+              <div class="desc">Auto-detected on launch. Override it only if Steam sits outside the default folder.</div>
+            </div>
+            <div class="set-panel">
+              <div class="input-row">
+                <input type="text" id="settingsRoot" placeholder="/Users/you/Library/Application Support/Steam">
+                <button class="btn icon" data-pick="folder" data-target="settingsRoot" title="Choose the Steam folder">⋯</button>
+                <button class="btn primary" id="saveSettingsBtn">Save</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="set-row">
+            <div>
+              <h2>Build</h2>
+              <div class="desc">What this copy is running.</div>
+            </div>
+            <div class="set-panel">
+              <div class="kv"><span class="k">Version</span><span class="v" id="buildVersion">1.0.2</span></div>
+              <div class="kv"><span class="k">Platform</span><span class="v" id="buildPlatform">darwin</span></div>
+              <div class="kv"><span class="k">Engine</span><span class="v mono" id="buildEngine">bundled</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+
+const META = {
+  home:     ["Overview", "What is on the board right now"],
+  add:      ["Add a game", "Pull the mac depots, swap the dylib, wire it into Steam"],
+  manage:   ["Library", "Luas currently installed in Steam"],
+  depots:   ["Depots", "Mac and shared depots reported by SteamCMD"],
+  fixes:    ["Fixes", "Engine maintenance and Steam plumbing"],
+  logs:     ["Logs", "Everything the engine says, in order"],
+  settings: ["Settings", "Steam location and saved configuration"],
+};
+
+const S = { page: "home", library: [], selected: null, results: [], logIndex: 0, depots: [] };
+
+const DEMO_LIBRARY = [
+  { appid: "228980", name: "Steamworks Common Redistributables", state: "4", buildid: "24098430" },
+  { appid: "431960", name: "Wallpaper Engine", state: "4", buildid: "23967692" },
+  { appid: "993090", name: "Lossless Scaling", state: "4", buildid: "19655272" },
+  { appid: "10", name: "Counter-Strike", state: "4", buildid: "5424799" },
+  { appid: "1437400", name: "Salt and Sacrifice", state: "4", buildid: "12907658" },
+  { appid: "2456740", name: "inZOI", state: "4", buildid: "25336085" },
+  { appid: "291550", name: "Brawlhalla", state: "6", buildid: "25394207" },
+  { appid: "292030", name: "The Witcher 3: Wild Hunt", state: "6", buildid: "25646871" },
+  { appid: "3755860", name: "BLACK SOULS", state: "4", buildid: "23907724" },
+  { appid: "447040", name: "Watch_Dogs 2", state: "4", buildid: "11638094" },
+  { appid: "70", name: "Half-Life", state: "68", buildid: "5433873" },
+];
+const DEMO_DEPOTS = [
+  { depot: "660", os: "win", manifest: "2679694482538379167", size: "", key: "" },
+  { depot: "624", os: "shared", manifest: "3651103799462409440", size: "", key: "" },
+  { depot: "623", os: "mac", manifest: "2276453204441793614", size: "", key: "" },
+  { depot: "622", os: "win", manifest: "2202889899553513457", size: "", key: "" },
+  { depot: "621", os: "shared", manifest: "9044256803759256265", size: "", key: "" },
+  { depot: "625", os: "shared", manifest: "1128685895801277145", size: "", key: "" },
+  { depot: "626", os: "shared", manifest: "6439173920052159773", size: "", key: "" },
+  { depot: "627", os: "shared", manifest: "4705364648410025995", size: "", key: "" },
+  { depot: "628", os: "shared", manifest: "1134745004760172192", size: "", key: "" },
+  { depot: "661", os: "linux", manifest: "8940703274703023246", size: "", key: "" },
+];
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const mockApi = {
+  bootstrap: async () => { await wait(80); return {
+    library: DEMO_LIBRARY, count: DEMO_LIBRARY.length,
+    steam_root: "/Users/melv/Library/Application Support/Steam", plugin: true,
+    settings: {}, platform: "darwin", version: "1.0.2",
+    engine: "luatools_mac.py", user: "melv" }; },
+  search: async () => { await wait(200); return [
+    { appid: "620", name: "Portal 2" }, { appid: "400", name: "Portal" },
+    { appid: "546560", name: "Half-Life: Alyx" }]; },
+  probe: async () => { await wait(320); return { ok: true, rows: DEMO_DEPOTS, mac: 1,
+    count: DEMO_DEPOTS.length, buildid: "25240193" }; },
+  fetch: async () => { await wait(400); return { ok: true, results: [{ depot: "623", exit: 0 }] }; },
+  apply: async () => ({ ok: true }), shortcut: async () => ({ ok: true }),
+  launch: async () => ({ ok: true }), open_folder: async () => ({ ok: true }),
+  remove_lua: async () => ({ ok: true }), tool: async n => ({ ok: true, tool: n }),
+  save_steam_path: async p => ({ ok: true, path: p }),
+  pick_files: async () => [], pick_folder: async () => "",
+  add_files: async () => ({ ok: true, added: 0 }),
+  logs_since: async i => ({ index: i, lines: [] }),
+};
+
+let api = mockApi;
+const usingBridge = () => !!(window.pywebview && window.pywebview.api);
+
+function setStatus(text, kind) {
+  $("#statusText").textContent = text;
+  $("#statusChip").className = "status" + (kind === "warn" ? " warn" : kind === "error" ? " error" : "");
+}
+function toast(msg, err) {
+  const el = document.createElement("div");
+  el.textContent = msg;
+  if (err) el.className = "err";
+  $("#toast").appendChild(el);
+  setTimeout(() => el.remove(), 4200);
+}
+async function run(fn, label) {
+  setStatus(label || "working", "warn");
+  try { return await fn(); }
+  catch (e) { setStatus("error", "error"); toast(String((e && e.message) || e), true); return null; }
+  finally { if (!$("#statusChip").classList.contains("error")) setStatus("idle"); }
+}
+
+function show(page) {
+  S.page = page;
+  $$(".nav[data-page]").forEach(n => n.classList.toggle("active", n.dataset.page === page));
+  $$(".page").forEach(p => p.classList.toggle("active", p.id === "page-" + page));
+  const [t, s] = META[page] || [page, ""];
+  $("#pageTitle").textContent = t;
+  $("#pageSub").textContent = s;
+  $(".content").scrollTop = 0;
+}
+$$(".nav[data-page]").forEach(n => n.addEventListener("click", () => show(n.dataset.page)));
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function renderHome(data) {
+  const lib = data.library || [];
+  $("#homeCount").textContent = data.count ?? lib.length;
+  $("#homeSteam").textContent = data.steam_root || "Not detected";
+  $("#homeUser").textContent = data.user || "Local account";
+  $("#homeMode").textContent = (data.platform || "darwin") + " · native";
+  $("#homeSteamState").textContent = data.steam_root ? "Yes" : "No";
+  $("#homeSteamState").style.color = data.steam_root ? "var(--text)" : "var(--notice)";
+  $("#homeSteamNote").textContent = data.steam_root ? "Root resolved" : "Set it in Settings";
+  $("#buildVersion").textContent = data.version || "1.0.2";
+  $("#buildPlatform").textContent = data.platform || "darwin";
+  $("#buildEngine").textContent = data.engine || "bundled";
+  $("#steamRootInput").value = data.steam_root || "";
+  $("#settingsRoot").value = data.steam_root || "";
+
+  const plugin = !!data.plugin;
+  const pill = $("#pluginPill");
+  pill.textContent = plugin ? "Installed" : "Missing";
+  pill.className = "pill " + (plugin ? "pos" : "neg");
+
+  S.library = lib;
+  const rows = lib.slice(0, 5);
+  $("#homeLibTotal").textContent = lib.length + (lib.length === 1 ? " lua" : " luas");
+  $("#homeLibrary").innerHTML = rows.length
+    ? rows.map(a => `<div class="lrow"><span class="id">${a.appid}</span><span class="name">${escapeHtml(a.name)}</span><span class="state">state ${a.state}</span></div>`).join("")
+    : '<div class="lrow"><span class="name muted">No luas installed yet</span></div>';
+  renderLibrary();
+}
+
+function renderLibrary() {
+  $("#libraryCount").textContent = S.library.length + (S.library.length === 1 ? " lua" : " luas");
+  const body = $("#libraryBody");
+  if (!S.library.length) {
+    body.innerHTML = '<tr class="empty-row"><td colspan="4">No luas installed yet. Add a game to write the first shortcut.</td></tr>';
+    return;
+  }
+  body.innerHTML = S.library.map(a => `
+    <tr data-appid="${a.appid}" class="${S.selected === a.appid ? "sel" : ""}">
+      <td class="mono muted">${a.appid}</td>
+      <td>${escapeHtml(a.name)}</td>
+      <td class="muted">${a.state}</td>
+      <td class="num mono muted">${a.buildid}</td>
+    </tr>`).join("");
+  $$("#libraryBody tr").forEach(tr => tr.addEventListener("click", () => {
+    S.selected = tr.dataset.appid;
+    $$("#libraryBody tr").forEach(x => x.classList.toggle("sel", x === tr));
+  }));
+}
+
+async function refreshLibrary() {
+  const data = await run(() => api.bootstrap(), "refreshing");
+  if (!data) return;
+  renderHome(data);
+}
+
+/* ---- add ---- */
+const appid = () => $("#appidInput").value.trim();
+
+async function doSearch() {
+  const q = $("#searchInput").value.trim();
+  if (!q) return;
+  if (/^\d+$/.test(q)) { $("#appidInput").value = q; setStatus("appid " + q); return; }
+  const hits = await run(() => api.search(q), "searching");
+  if (!hits) return;
+  S.results = hits;
+  const box = $("#searchResults");
+  box.innerHTML = hits.length
+    ? hits.map((h, i) => `<div class="hit" data-i="${i}"><span class="id">${h.appid}</span><span class="name">${escapeHtml(h.name)}</span></div>`).join("")
+    : '<div class="hit"><span class="name muted">No matches</span></div>';
+  $$("#searchResults .hit[data-i]").forEach(r => r.addEventListener("click", () => {
+    const hit = S.results[+r.dataset.i];
+    $("#appidInput").value = hit.appid;
+    setStatus(hit.appid + " selected");
+  }));
+  setStatus(hits.length + " results");
+}
+
+async function doProbe() {
+  if (!appid()) return toast("AppID is empty", true);
+  const res = await run(() => api.probe(appid()), "scanning depots");
+  if (!res) return;
+  if (!res.ok) return toast("probe failed: " + (res.error || "unknown"), true);
+  S.depots = res.rows || [];
+  renderDepots(res);
+  if (res.csv) $("#depotsInput").value = res.csv;
+  $("#homeDepots").textContent = res.mac;
+  $("#homeDepotsNote").textContent = `${res.count} depots · build ${res.buildid}`;
+  setStatus(res.mac + " mac depots");
+}
+
+function renderDepots(res) {
+  const rows = (res && res.rows) || S.depots;
+  const body = $("#depotBody");
+  if (!rows.length) {
+    body.innerHTML = '<tr class="empty-row"><td colspan="5">No depots reported for this AppID.</td></tr>';
+  } else {
+    body.innerHTML = rows.map(r => `
+      <tr>
+        <td class="mono">${r.depot}</td>
+        <td><span class="pill ${r.os}">${r.os}</span></td>
+        <td class="mono muted">${r.manifest || ""}</td>
+        <td class="num muted">${r.size || "—"}</td>
+        <td class="mono muted">${r.key || "—"}</td>
+      </tr>`).join("");
+  }
+  const counts = { mac: 0, shared: 0, win: 0, linux: 0 };
+  rows.forEach(r => { if (counts[r.os] !== undefined) counts[r.os]++; });
+  const total = rows.length || 1;
+  ["mac", "shared", "win", "linux"].forEach(k => {
+    $("#ladder ." + k).style.width = (counts[k] / total * 100) + "%";
+    $("#c" + k[0].toUpperCase() + k.slice(1)).textContent = counts[k];
+  });
+  if (res) {
+    $("#depotSummary").textContent = `${res.count} depots · ${res.mac} mac`;
+    $("#depotBuild").textContent = "build " + res.buildid;
+  }
+}
+
+async function doFetch() {
+  if (!appid()) return toast("AppID is empty", true);
+  const res = await run(() => api.fetch(appid(), $("#depotsInput").value.trim() || "auto"), "downloading");
+  if (res && res.ok !== false) { toast("Content fetched"); setStatus("download complete"); refreshLibrary(); }
+  else if (res) toast("fetch failed: " + (res.error || "see logs"), true);
+}
+async function doApply() {
+  if (!appid()) return toast("AppID is empty", true);
+  if (!$("#dylibInput").value.trim()) return toast("Pick a steam_api.dylib", true);
+  const res = await run(() => api.apply(appid(), $("#dirInput").value.trim(), $("#dylibInput").value.trim()), "applying");
+  if (res && res.ok !== false) toast("steam_api applied");
+}
+async function doShortcut() {
+  if (!appid()) return toast("AppID is empty", true);
+  const res = await run(() => api.shortcut(appid(), $("#dirInput").value.trim()), "adding to library");
+  if (res && res.ok !== false) { toast("Added to Steam library"); refreshLibrary(); }
+}
+async function doLaunch() {
+  await run(() => api.launch($("#dirInput").value.trim() || appid()), "launching");
+}
+
+/* ---- library ---- */
+async function openFolder() {
+  if (!S.selected) return toast("Select a game first", true);
+  await run(() => api.open_folder(S.selected), "opening");
+}
+async function addShortcut() {
+  if (!S.selected) return toast("Select a game first", true);
+  const row = S.library.find(a => a.appid === S.selected);
+  await run(() => api.shortcut(S.selected, "", row ? row.name : ""), "adding");
+  toast("Shortcut written");
+}
+async function removeLua() {
+  if (!S.selected) return toast("Select a game first", true);
+  if (!confirm("Remove lua and manifests for " + S.selected + "?")) return;
+  await run(() => api.remove_lua(S.selected), "removing");
+  refreshLibrary();
+}
+function useAppid() {
+  if (!S.selected) return toast("Select a game first", true);
+  $("#appidInput").value = S.selected;
+  show("add");
+}
+
+/* ---- tools ---- */
+async function runTool(name) {
+  const res = await run(() => api.tool(name), name.replace("-", " "));
+  if (res && res.ok === false) toast(name + ": " + (res.error || "failed"), true);
+}
+$$("[data-tool]").forEach(b => b.addEventListener("click", () => runTool(b.dataset.tool)));
+
+$$("[data-pick]").forEach(b => b.addEventListener("click", async () => {
+  const target = $("#" + b.dataset.target);
+  const val = b.dataset.pick === "folder" ? await api.pick_folder() : (await api.pick_files())[0];
+  if (val) target.value = val;
+}));
+
+/* ---- logs ---- */
+function logLine(line) {
+  const box = $("#logBox");
+  if (box.querySelector(".dim")) box.innerHTML = "";
+  const span = document.createElement("span");
+  span.textContent = line + "\n";
+  if (/^ERROR|^Traceback|failed/i.test(line)) span.className = "err";
+  else if (/^\[|^\$/.test(line)) span.className = "cmd";
+  else if (/\bok\b|installed|downloaded|saved/i.test(line)) span.className = "ok";
+  box.appendChild(span);
+  box.scrollTop = box.scrollHeight;
+}
+async function pollLogs() {
+  if (!usingBridge()) return;
+  try {
+    const r = await api.logs_since(S.logIndex);
+    if (r && r.lines && r.lines.length) { r.lines.forEach(logLine); S.logIndex = r.index; }
+  } catch (e) { /* bridge not ready */ }
+  setTimeout(pollLogs, 650);
+}
+
+async function browseFiles() {
+  const files = await api.pick_files();
+  if (!files || !files.length) return;
+  const res = await run(() => api.add_files(files), "adding files");
+  if (res) toast(`Added ${res.added || 0} file(s)`);
+  refreshLibrary();
+}
+
+async function boot() {
+  const data = await api.bootstrap();
+  renderHome(data);
+  if (!usingBridge()) logLine("preview mode · mock data");
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  $("#searchBtn").addEventListener("click", doSearch);
+  $("#searchInput").addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
+  $("#probeBtn").addEventListener("click", doProbe);
+  $("#fetchBtn").addEventListener("click", doFetch);
+  $("#applyBtn").addEventListener("click", doApply);
+  $("#shortcutBtn").addEventListener("click", doShortcut);
+  $("#launchBtn").addEventListener("click", doLaunch);
+  $("#refreshLibrary").addEventListener("click", refreshLibrary);
+  $("#openFolderBtn").addEventListener("click", openFolder);
+  $("#addShortcutBtn").addEventListener("click", addShortcut);
+  $("#removeLuaBtn").addEventListener("click", removeLua);
+  $("#useAppidBtn").addEventListener("click", useAppid);
+  $("#viewLibrary").addEventListener("click", () => show("manage"));
+  $("#goAdd").addEventListener("click", () => show("add"));
+  $("#depotProbeBtn").addEventListener("click", async () => {
+    const id = ($("#depotAppid").value || appid()).trim();
+    $("#depotAppid").value = id;
+    if (!id) return toast("Type an AppID", true);
+    const res = await run(() => api.probe(id), "scanning depots");
+    if (res && res.ok) renderDepots(res);
+  });
+  $("#saveRootBtn").addEventListener("click", async () => {
+    const r = await run(() => api.save_steam_path($("#steamRootInput").value.trim()), "saving");
+    if (r && r.ok !== false) toast("Steam path saved");
+  });
+  $("#saveSettingsBtn").addEventListener("click", async () => {
+    const r = await run(() => api.save_steam_path($("#settingsRoot").value.trim()), "saving");
+    if (r && r.ok !== false) toast("Steam path saved");
+  });
+  $("#clearLogs").addEventListener("click", () => { $("#logBox").innerHTML = ""; });
+  $("#browseBtn").addEventListener("click", e => { e.stopPropagation(); browseFiles(); });
+  $("#dropzone").addEventListener("click", browseFiles);
+  $("#restartSteam").addEventListener("click", () => runTool("restart"));
+
+  const qp = new URLSearchParams(location.search);
+  if (qp.get("page")) show(qp.get("page"));
+  boot();
+});
+
+window.addEventListener("pywebviewready", async () => {
+  api = window.pywebview.api;
+  setStatus("connected");
+  await boot();
+  pollLogs();
+});
+</script>
+</body>
+</html>

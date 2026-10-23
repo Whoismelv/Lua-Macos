@@ -1,14 +1,16 @@
 # LuaTools Mac
 
 Native macOS front-end for the LuaTools engine (reversed from `LuaTools.dll` 1.3.2 and ported to Python stdlib).
-No CrossOver, no Wine, no pip packages.
+No CrossOver, no Wine, no game emulation — the mac build runs on macOS.
 
 | file | role |
 |---|---|
 | `luatools_mac.py` | engine — 31 CLI commands (lua install, manifests, vault, toml, injector, probe, fetch-game, apply-api, shortcuts) |
-| `luatools_mac_gui.py` | desktop UI (tkinter) — Library / Install / Tools + console |
+| `luatools_mac_gui.py` | desktop shell — pywebview window, `Api` bridge into the engine |
+| `ui/index.html` | the interface (single file, no CDN, no build step) |
 | `build_macos.sh` | builds `LuaToolsMac.app` + `LuaToolsMac.dmg` |
 | `run_mac.command` | run straight from source, no build |
+| `icon.icns` | app icon |
 
 ## run without building
 
@@ -17,7 +19,7 @@ chmod +x run_mac.command
 ./run_mac.command
 ```
 
-or `python3 luatools_mac_gui.py`.
+The first run creates `.venv/` and installs `pywebview` (the only dependency; it drives the system WKWebView).
 
 ## build the .app + .dmg
 
@@ -35,7 +37,8 @@ Unsigned build blocked by Gatekeeper:
 xattr -dr com.apple.quarantine "/Applications/LuaTools Mac.app"
 ```
 
-No Mac at hand? `.github/workflows/build-dmg.yml` builds the DMG on a macOS runner and uploads it as an artifact.
+No Mac at hand? `.github/workflows/build-dmg.yml` builds the DMG on a macOS runner and uploads it as an artifact;
+`release.yml` attaches it to a tag.
 
 ## one-time tools
 
@@ -59,8 +62,8 @@ CLI equivalents:
 ```bash
 python3 luatools_mac.py probe 620 --out depots.csv
 python3 luatools_mac.py fetch-game 620 depots.csv --os mac
-python3 luatools_mac.py apply-api 620 --dir "…/620/623" --lib ~/Downloads/libsteam_api.dylib
-python3 luatools_mac.py shortcut 620 --exe "/…/Portal 2.app" --name "Portal 2"
+python3 luatools_mac.py apply-api 620 --dir "~/620/623" --lib ~/Downloads/libsteam_api.dylib
+python3 luatools_mac.py shortcut 620 --exe "/path/Portal 2.app" --name "Portal 2"
 python3 luatools_mac.py launch 620
 ```
 
@@ -68,9 +71,16 @@ python3 luatools_mac.py launch 620
 
 ## UI
 
+- **Overview** — luas on board, mac depots ready, Steam detected; the five most recent library entries, readiness rows, and the drop zone.
+- **Add a game** — store search by name, **Detect depots**, **Fetch content**, **Apply steam_api**, **Add to library**, **Launch**.
 - **Library** — every `appmanifest_*.acf` across all Steam libraries: AppID / name / state / build id, open folder, add shortcut, remove lua.
-- **Install** — search the Steam store by name, **Detect depots**, **Fetch content**, **Apply steam_api**, **Add to library**, **Launch**.
-- **Tools** — detect Steam, rewrite `opensteamtool.toml`, migrate depotcache, restart Steam, arm CDP injector + bridge (`127.0.0.1:6767`), fetch web plugin, vault, Denuvo listings, install DepotDownloader.
+- **Depots** — the depot ladder (mac / shared / win / linux counts) plus the manifest table from SteamCMD.
+- **Fixes** — detect Steam, rewrite `opensteamtool.toml`, migrate depotcache, restart Steam, arm CDP injector + bridge (`127.0.0.1:6767`), fetch web plugin, vault, Denuvo listings, install DepotDownloader.
+- **Logs** — engine output streamed from the Python log buffer.
+- **Settings** — Steam root override, build info.
+
+Every control maps to one engine function; the shell duplicates no logic. `luatools_mac_gui.py --selftest`
+prints engine state without opening a window (used by CI).
 
 ## verified on real data
 
