@@ -37,7 +37,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -394,8 +394,12 @@ def probe_from_text(appid, text, branch="public"):
                      "size": size if size.isdigit() else "", "branch": branch})
     if not rows:
         return {"ok": False, "error": "no numeric depots in appinfo"}
+    common = app.get("common") if isinstance(app.get("common"), dict) else {}
     return {"ok": True, "appid": str(appid), "branch": branch, "buildid": buildid,
-            "count": len(rows), "rows": rows}
+            "count": len(rows), "rows": rows,
+            "name": str(common.get("name") or ""),
+            "installdir": str(common.get("installdir") or ""),
+            "size": str(common.get("size") or "")}
 
 def select_rows(rows, want_os="mac", shared=True):
     if want_os == "all":
@@ -962,7 +966,7 @@ def ensure_tools():
 
 def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
                user="", password="", out_root=None, extra=None, appinfo_file=None,
-               progress=None):
+               progress=None, flat=False):
     if rows is None:
         probe = probe_app(appid, branch, appinfo_file)
         if not probe.get("ok"):
@@ -991,8 +995,9 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
     for r in want:
         if progress:
             progress(f"depot {r['depot']} - manifest {r['manifest']} - downloading...")
+        ddir = outroot if flat else outroot / r["depot"]
         args = [str(tool), "-app", str(appid), "-depot", r["depot"],
-                "-manifest", r["manifest"], "-dir", str(outroot / r["depot"])]
+                "-manifest", r["manifest"], "-dir", str(ddir)]
         if user and password:
             args += ["-username", user, "-password", password]
         else:
@@ -1005,7 +1010,7 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
             tail = (pr.stderr or pr.stdout or "")[-600:]
             code, hint = classify_dd(tail)
             item = {"depot": r["depot"], "manifest": r["manifest"],
-                    "exit": pr.returncode, "out": str(outroot / r["depot"]), "tail": tail}
+                    "exit": pr.returncode, "out": str(ddir), "tail": tail}
             if code:
                 item["error_code"], item["hint"] = code, hint
             results.append(item)
@@ -1022,6 +1027,130 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
         res["error_code"] = "download_failed"
         res["hint"] = "DepotDownloader exited non-zero - check the depot lines in the log"
     return res
+
+# ---------- install downloaded content into the steam library ----------
+
+def steam_apps_dir():
+    root = SteamCtx().root()
+    if root is None:
+        return None
+    sa = root / "steamapps"
+    sa.mkdir(parents=True, exist_ok=True)
+    return sa
+
+def read_appmanifest(appid):
+    sa = steam_apps_dir()
+    if sa is None:
+        return None
+    f = sa / f"appmanifest_{int(appid)}.acf"
+    return parse_acf(f) if f.exists() else None
+
+def _acf_block_unused():  # kept out of the build path
+    return None
+
+def write_appmanifest(appid, name, installdir, buildid, depots, size_on_disk=0):
+    sa = steam_apps_dir()
+    if sa is None:
+        return {"ok": False, "error": "steam library not found"}
+    now = int(time.time())
+    lines = ['"AppState"', "{"]
+    lines += [f'\t"appid"\t\t"{int(appid)}"',
+              f'\t"Universe"\t\t"1"',
+              f'\t"name"\t\t"{name or appid}"',
+              f'\t"StateFlags"\t\t"4"',
+              f'\t"installdir"\t\t"{installdir}"',
+              f'\t"LastUpdated"\t\t"{now}"',
+              f'\t"LastPlayed"\t\t"0"',
+              f'\t"SizeOnDisk"\t\t"{int(size_on_disk)}"',
+              f'\t"StagingPath"\t\t"{sa / "downloading" / str(int(appid))}"',
+              f'\t"buildid"\t\t"{buildid}"']
+    lines.append('\t"InstalledDepots"')
+    lines.append("\t{")
+    for d in depots:
+        lines += [f'\t\t"{d["depot"]}"', "\t\t{",
+                  f'\t\t\t"manifest"\t\t"{d["manifest"]}"',
+                  f'\t\t\t"size"\t\t"{int(d.get("size") or 0)}"', "\t\t}"]
+    lines.append("\t}")
+    lines.append('\t"MountedDepots"')
+    lines.append("\t{")
+    for d in depots:
+        lines.append(f'\t\t"{d["depot"]}"\t\t"{d["manifest"]}"')
+    lines.append("\t}")
+    lines.append('\t"SharedDepots"')
+    lines.append("\t{")
+    lines.append("\t}")
+    lines.append("}")
+    path = sa / f"appmanifest_{int(appid)}.acf"
+    tmp = path.with_suffix(".acf.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return {"ok": True, "file": str(path)}
+
+def install_to_library(appid, branch="public", want_os="mac", user="", password="",
+                       progress=None):
+    aid = int(appid)
+    probe = probe_app(aid, branch)
+    if not probe.get("ok"):
+        return {"ok": False, "stage": "probe", **probe}
+    rows = select_rows(probe["rows"], want_os, True)
+    rows = [r for r in rows if r["manifest"]]
+    if not rows:
+        return {"ok": False, "error": f"no depot manifests for os={want_os}"}
+    sa = steam_apps_dir()
+    if sa is None:
+        return {"ok": False, "error": "steam library not found - install Steam first"}
+    installdir = probe.get("installdir") or probe.get("name") or str(aid)
+    target = sa / "common" / installdir
+    target.mkdir(parents=True, exist_ok=True)
+    res = fetch_game(aid, branch, rows, want_os, True, user, password,
+                     str(target), None, None, progress, flat=True)
+    if not res.get("ok"):
+        res["stage"] = "download"
+        res["target"] = str(target)
+        return res
+    size = 0
+    for p in target.rglob("*"):
+        if p.is_file():
+            try:
+                size += p.stat().st_size
+            except OSError:
+                pass
+    acf = write_appmanifest(aid, probe.get("name"), installdir,
+                            probe.get("buildid", ""), rows, size)
+    return {"ok": bool(acf.get("ok")), "appid": str(aid), "dir": str(target),
+            "installdir": installdir, "files_bytes": size,
+            "depots": [r["depot"] for r in rows],
+            "manifest": acf.get("file"), "error": acf.get("error")}
+
+def repair_install_state(appid):
+    sa = steam_apps_dir()
+    if sa is None:
+        return {"ok": False, "error": "steam library not found"}
+    acf = read_appmanifest(appid)
+    installdir = (acf or {}).get("installdir", "")
+    common = sa / "common" / installdir if installdir else None
+    files = 0
+    if common and common.is_dir():
+        files = sum(1 for p in common.rglob("*") if p.is_file())
+    stale = bool(acf) and files == 0
+    if stale:
+        f = sa / f"appmanifest_{int(appid)}.acf"
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    return {"ok": True, "acf": bool(acf), "installdir": installdir,
+            "files": files, "stale_removed": stale}
+
+def steam_install_url(appid):
+    if sys.platform != "darwin":
+        return {"ok": False, "error": "macOS only"}
+    url = f"steam://install/{int(appid)}"
+    try:
+        subprocess.run(["open", url], capture_output=True, timeout=30)
+        return {"ok": True, "url": url}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "url": url}
 
 # ---------- license loaders (stplug-in engine / macSteam) ----------
 
@@ -1579,6 +1708,7 @@ class Logs:
 
 LOGS = Logs()
 _FETCH_LOCK = threading.Lock()
+FETCH_RESULT = {}
 
 class Api:
     def bootstrap(self):
@@ -1689,6 +1819,10 @@ class Api:
             LOGS.add("steam restarting - game will show in your library")
             restart_steam()
             steps.append({"step": "restart", "ok": True})
+            rep = repair_install_state(int(aid))
+            if rep.get("stale_removed"):
+                LOGS.add("cleared a stale install record with no files on disk")
+            steps.append({"step": "state", **rep})
             ctx = SteamCtx()
             if ctx.plugin_dir() is not None and ctx.plugin_dir().is_dir():
                 extra = self.grant(aid, branch, want_os, True)
@@ -1696,7 +1830,7 @@ class Api:
                               "dest": extra.get("dest"), "depots": extra.get("depots"),
                               "error": extra.get("error")})
             return {"ok": True, "appid": aid, "steps": steps,
-                    "hint": "game should appear in your library now"}
+                    "hint": "in your library now - press Download files to put the game on disk"}
         res = self.grant(aid, branch, want_os, True)
         steps.append({"step": "grant", "ok": res.get("ok"),
                       "dest": res.get("dest"), "depots": res.get("depots"),
@@ -1709,6 +1843,47 @@ class Api:
         steps.append({"step": "restart", "ok": True})
         return {"ok": True, "appid": aid, "steps": steps,
                 "hint": "game should appear in your library now"}
+
+    def install(self, appid, user="", password=""):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        if not _FETCH_LOCK.acquire(blocking=False):
+            return {"ok": False, "error": "a download is already running"}
+        u, p = (user or "").strip(), (password or "").strip()
+
+        def worker():
+            try:
+                LOGS.add(f"install {aid} - downloading game content into the steam library...")
+                rep = repair_install_state(int(aid))
+                if rep.get("stale_removed"):
+                    LOGS.add("cleared a stale install record with no files")
+                res = install_to_library(int(aid), "public", "mac", u, p,
+                                         progress=lambda m: LOGS.add(str(m)))
+                if res.get("ok"):
+                    LOGS.add(f"install {aid} done - {res.get('files_bytes', 0)} bytes "
+                             f"in {res.get('dir')}")
+                    LOGS.add("restarting steam so the play button uses the new files")
+                    restart_steam()
+                else:
+                    LOGS.add("install failed: " + str(res.get("error")))
+                    if res.get("hint"):
+                        LOGS.add("hint: " + str(res.get("hint")))
+                    fb = steam_install_url(int(aid))
+                    if fb.get("ok"):
+                        LOGS.add("asked steam to download it instead")
+                FETCH_RESULT["install"] = res
+            except Exception as exc:
+                LOGS.add("install crashed: " + str(exc))
+                FETCH_RESULT["install"] = {"ok": False, "error": str(exc)}
+            finally:
+                _FETCH_LOCK.release()
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True, "queued": True, "appid": aid}
+
+    def install_status(self):
+        return FETCH_RESULT.get("install") or {"ok": None, "running": _FETCH_LOCK.locked()}
 
     def remove(self, appid):
         try:
@@ -1844,13 +2019,14 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
     <label class="chk"><input type="checkbox" id="pin" checked> pin manifests</label>
     <button id="b-probe">Probe</button>
     <button id="b-grant" class="pri">Fetch &rarr; Library</button>
+    <button id="b-install" class="pri">Download files</button>
   </div>
   <div class="toolbar">
     <span class="muted">depot content:</span>
     <input id="f-user" placeholder="steam user" style="width:160px">
     <input id="f-pass" placeholder="password" type="password" style="width:160px">
     <button id="b-fetch">Fetch Content</button>
-    <span class="muted">downloads game files into ~/.licensetools/games/</span>
+    <span class="muted">Download files puts the game into steamapps/common and fixes the install record</span>
   </div>
   <div id="hits" class="muted"></div>
   <div id="probeout"></div>
@@ -1879,7 +2055,7 @@ let api=null,logIdx=0;
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const say=t=>{$("#status").textContent=t};
-function busy(on){["#b-probe","#b-grant","#b-search","#b-restart","#b-fetch","#b-ldref","#b-ldmac","#b-ldst"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
+function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-ldref","#b-ldmac","#b-ldst"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
 async function call(fn,...args){if(!api)throw new Error("bridge not ready");return api[fn](...args)}
 document.querySelectorAll("button.tab").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("button.tab").forEach(x=>x.classList.toggle("pri",x===b));
@@ -1937,6 +2113,25 @@ async function ldInstall(family){
   }catch(e){say("loader install failed: "+e)}
   await ldRefresh();
   busy(false);
+}
+async function doInstall(){
+  let id=$("#appid").value.trim();
+  if(!/^\d+$/.test(id)){
+    const term=id||$("#q").value.trim();
+    if(!term)return say("type a game name or appid first");
+    say("searching "+term+"...");
+    const hits=await call("search",term);
+    if(!hits||!hits.length)return say("no match for "+term);
+    id=hits[0].appid;$("#appid").value=id;say("picked "+hits[0].name+" ("+id+")");
+  }
+  busy(true);
+  try{
+    const r=await call("install",id,$("#f-user").value,$("#f-pass").value);
+    if(!r.ok)return say("download failed to start: "+(r.error||""));
+    say("downloading "+id+" into steamapps/common - watch the log");
+    await new Promise(res=>setTimeout(res,1200));
+  }catch(e){say("download failed: "+e)}
+  finally{busy(false)}
 }
 async function doFetch(){
   const id=$("#appid").value.trim();
@@ -2020,6 +2215,7 @@ $("#b-search").onclick=doSearch;
 $("#q").onkeydown=e=>{if(e.key==="Enter")doSearch()};
 $("#b-probe").onclick=doProbe;
 $("#b-grant").onclick=doGrant;
+$("#b-install").onclick=doInstall;
 $("#b-restart").onclick=async()=>{
   busy(true);say("restarting steam...");
   try{await call("restart");say("steam restarted")}catch(e){say("restart failed: "+e)}
