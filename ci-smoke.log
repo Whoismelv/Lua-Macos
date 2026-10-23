@@ -1,5 +1,6 @@
+RUN=39878356552 SHA=53c74a6b67fcf9affeaf62313025118577a32806 DATE=2026-10-23T00:28:58Z
 == uname ==
-Darwin sat12-bq161-92fd049c-6ba7-44d2-acd7-1ba6e21694a2-3AA3C09D04A4.local 23.6.0 Darwin Kernel Version 23.6.0: Tue Jul 21 21:56:54 PDT 2026; root:xnu-10063.141.1.713.39~1/RELEASE_ARM64_VMAPPLE arm64
+Darwin sjc20-bb714-b4bae25d-5458-409e-bcf2-0070e01959c0-86F0D6FB9676.local 23.6.0 Darwin Kernel Version 23.6.0: Tue Jul 21 21:56:54 PDT 2026; root:xnu-10063.141.1.713.39~1/RELEASE_ARM64_VMAPPLE arm64
 Python 3.12.10 (v3.12.10:0cc81280367, Apr  8 2025, 08:46:59) [Clang 13.0.0 (clang-1300.0.29.30)]
 == help ==
 usage: luatools-mac [-h]
@@ -46,15 +47,101 @@ steamcmd
 🍺  steamcmd was successfully installed!
 brew_exit=0
 /opt/homebrew/bin/steamcmd
-lrwxr-xr-x  1 runner  admin  78 Oct 23 00:26 /opt/homebrew/bin/steamcmd -> /opt/homebrew/Caskroom/steamcmd/1785799152/.homebrew-command-wrappers/steamcmd
+lrwxr-xr-x  1 runner  admin  78 Oct 23 00:29 /opt/homebrew/bin/steamcmd -> /opt/homebrew/Caskroom/steamcmd/1785799152/.homebrew-command-wrappers/steamcmd
 == probe 620 ==
 {
-  "ok": false,
-  "error": "appinfo has no depots section (app may be delisted)",
-  "tail": "es\"\n\t\t{\n\t\t\t\"1\"\n\t\t\t{\n\t\t\t\t\"root\"\t\t\"gameinstall\"\n\t\t\t\t\"path\"\t\t\"portal2/SAVE/{64BitSteamID}\"\n\t\t\t\t\"pattern\"\t\t\"*.sav\"\n\t\t\t\t\"siblings\"\t\t\"tga\"\n\t\t\t}\n\t\t}\n\t}\n}\nUnloading Steam API...OK\n\nsteamcmd.sh[4115]: Starting  /opt/homebrew/Caskroom/steamcmd/1785799152/MacOS/steamcmd\nsteamcmd.sh[4115]: Restarting steamcmd by request...\nsteamcmd.sh[4115]: Starting  /opt/homebrew/Caskroom/steamcmd/1785799152/MacOS/steamcmd\n"
+  "ok": true,
+  "appid": "620",
+  "buildid": "25240193",
+  "count": 10,
+  "mac": 1,
+  "rows": [
+    {
+      "depot": "660",
+      "os": "win",
+      "manifest": "2679694482538379167",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "624",
+      "os": "shared",
+      "manifest": "3651103799462409440",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "623",
+      "os": "mac",
+      "manifest": "2276453204441793614",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "622",
+      "os": "win",
+      "manifest": "2202889899553513457",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "621",
+      "os": "shared",
+      "manifest": "9044256803759256265",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "625",
+      "os": "shared",
+      "manifest": "1128685895801277145",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "626",
+      "os": "shared",
+      "manifest": "6439173920052159773",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "627",
+      "os": "shared",
+      "manifest": "4705364648410025995",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "628",
+      "os": "shared",
+      "manifest": "1134745004760172192",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "661",
+      "os": "linux",
+      "manifest": "8940703274703023246",
+      "size": "",
+      "key": null
+    }
+  ],
+  "csv": "/tmp/depots.csv"
 }
 probe_exit=0
 == csv ==
+# depot,os,manifest,size,depotkey
+660,win,2679694482538379167,,
+624,shared,3651103799462409440,,
+623,mac,2276453204441793614,,
+622,win,2202889899553513457,,
+621,shared,9044256803759256265,,
+625,shared,1128685895801277145,,
+626,shared,6439173920052159773,,
+627,shared,4705364648410025995,,
+628,shared,1134745004760172192,,
+661,linux,8940703274703023246,,
 == fetch 480 ==
 {
   "probe": {
@@ -71,7 +158,7 @@ probe_exit=0
       "depot": "481",
       "exit": 0,
       "out": "/tmp/games/481",
-      "tail": "appticket.dll\nPre-allocating /tmp/games/481/SteamworksExample.exe\nPre-allocating /tmp/games/481/steam_api.dll\n 00.15% /tmp/games/481/DejaVuSans.txt\n 00.18% /tmp/games/481/D3D9VRDistort.cso\n 00.26% /tmp/games/481/controller.vdf\n 00.29% /tmp/games/481/installscript.vdf\n 38.11% /tmp/games/481/DejaVuSans.ttf\n 49.91% /tmp/games/481/steam_api.dll\n 70.01% /tmp/games/481/SteamworksExample.exe\n100.00% /tmp/games/481/sdkencryptedappticket.dll\nDepot 481 - Downloaded 797632 bytes (1906055 bytes uncompressed)\nTotal downloaded: 797632 bytes (1906055 bytes uncompressed) from 1 depots\nDisconnected from Steam\n"
+      "tail": "appticket.dll\nPre-allocating /tmp/games/481/steam_api.dll\nPre-allocating /tmp/games/481/SteamworksExample.exe\n 00.08% /tmp/games/481/controller.vdf\n 00.11% /tmp/games/481/D3D9VRDistort.cso\n 00.26% /tmp/games/481/DejaVuSans.txt\n 00.29% /tmp/games/481/installscript.vdf\n 38.11% /tmp/games/481/DejaVuSans.ttf\n 49.91% /tmp/games/481/steam_api.dll\n 70.01% /tmp/games/481/SteamworksExample.exe\n100.00% /tmp/games/481/sdkencryptedappticket.dll\nDepot 481 - Downloaded 797632 bytes (1906055 bytes uncompressed)\nTotal downloaded: 797632 bytes (1906055 bytes uncompressed) from 1 depots\nDisconnected from Steam\n"
     }
   ]
 }
