@@ -956,7 +956,8 @@ def ensure_tools():
     return out
 
 def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
-               user="", password="", out_root=None, extra=None, appinfo_file=None):
+               user="", password="", out_root=None, extra=None, appinfo_file=None,
+               progress=None):
     if rows is None:
         probe = probe_app(appid, branch, appinfo_file)
         if not probe.get("ok"):
@@ -979,6 +980,8 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
         env["STEAM_USER"], env["STEAM_PASS"] = user, password
     results = []
     for r in want:
+        if progress:
+            progress(f"depot {r['depot']} - manifest {r['manifest']} - downloading...")
         args = [str(tool), "-app", str(appid), "-depot", r["depot"],
                 "-manifest", r["manifest"], "-dir", str(outroot / r["depot"])]
         if extra:
@@ -1009,7 +1012,10 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
 
 # ---------- license loaders (stplug-in engine / macSteam) ----------
 
-MACSTEAM_REPO = "Selectively11/macSteam"
+MACSTEAM_REPOS = (
+    "crghofficial/macsteam",
+    "ElfariaKensinton/macsteam-backup",
+)
 STEAMTOOLS_SITE = "https://steamtools.net/"
 
 def loader_report():
@@ -1044,47 +1050,82 @@ def loader_report():
             "no loader detected - run: loader install --from macsteam (mac arm64) "
             "or --from steamtools"}
 
-def loader_install_macsteam():
-    api = f"https://api.github.com/repos/{MACSTEAM_REPO}/releases/latest"
-    try:
-        data = json.loads(http_get(api, headers={"Accept": "application/vnd.github+json"},
-                                   timeout=30))
-    except Exception as exc:
-        return {"ok": False, "error": f"release fetch failed: {exc}",
-                "manual": f"https://github.com/{MACSTEAM_REPO}/releases"}
-    assets = [a for a in data.get("assets", [])
-              if a.get("name", "").lower().endswith(".zip")]
-    if not assets:
-        return {"ok": False, "error": "latest release has no zip asset",
-                "version": data.get("tag_name"),
-                "manual": f"https://github.com/{MACSTEAM_REPO}/releases"}
-    asset = assets[0]
-    dest = TOOLS_DIR / "loader" / "macsteam"
-    dest.mkdir(parents=True, exist_ok=True)
-    zp = dest / asset["name"]
-    try:
-        zp.write_bytes(http_get(asset["browser_download_url"], timeout=600))
-        with zipfile.ZipFile(zp) as z:
+def _stage_macsteam_app(archive, dest):
+    if archive.suffix.lower() == ".zip":
+        with zipfile.ZipFile(archive) as z:
             z.extractall(dest)
-        zp.unlink(missing_ok=True)
-    except Exception as exc:
-        return {"ok": False, "error": f"download/extract failed: {exc}"}
-    apps = sorted(p for p in dest.rglob("*.app") if p.is_dir())
-    dylibs = sorted(dest.rglob("*.dylib"))
-    installed = None
-    if apps and sys.platform == "darwin":
-        target = Path("/Applications") / apps[0].name
+        apps = sorted(p for p in dest.rglob("*.app") if p.is_dir())
+        return apps[0] if apps else None
+    if archive.suffix.lower() == ".dmg" and sys.platform == "darwin":
+        mount = dest / "_mnt"
+        mount.mkdir(parents=True, exist_ok=True)
         try:
-            if target.exists():
-                target.rename(target.with_name(target.name + f".bak-{int(time.time())}"))
-            shutil.copytree(apps[0], target)
-            installed = str(target)
+            subprocess.run(["hdiutil", "attach", "-nobrowse", "-readonly",
+                            "-mountpoint", str(mount), str(archive)],
+                           check=True, capture_output=True, timeout=180)
+            apps = sorted(p for p in mount.rglob("*.app") if p.is_dir())
+            if not apps:
+                return None
+            out = dest / apps[0].name
+            if out.exists():
+                shutil.rmtree(out)
+            shutil.copytree(apps[0], out)
+            return out
+        finally:
+            subprocess.run(["hdiutil", "detach", str(mount), "-quiet"],
+                           capture_output=True)
+    return None
+
+def loader_install_macsteam():
+    tried = []
+    for repo in MACSTEAM_REPOS:
+        api = f"https://api.github.com/repos/{repo}/releases/latest"
+        try:
+            data = json.loads(http_get(api,
+                                       headers={"Accept": "application/vnd.github+json"},
+                                       timeout=30))
         except Exception as exc:
-            installed = f"copy to /Applications failed: {exc}"
-    return {"ok": True, "version": data.get("tag_name"), "staged": str(dest),
-            "config_app": installed, "dylib": [str(p) for p in dylibs],
-            "next": "open macSteam Config.app, press Install, approve the permission "
-                    "prompt, restart steam, then run: licensetools grant <appid>"}
+            tried.append(f"{repo}: release fetch failed ({exc})")
+            continue
+        assets = [a for a in data.get("assets", [])
+                  if a.get("name", "").lower().endswith((".zip", ".dmg"))]
+        if not assets:
+            tried.append(f"{repo}: no zip/dmg asset in latest release")
+            continue
+        asset = assets[0]
+        dest = TOOLS_DIR / "loader" / "macsteam"
+        dest.mkdir(parents=True, exist_ok=True)
+        archive = dest / asset["name"]
+        try:
+            archive.write_bytes(http_get(asset["browser_download_url"], timeout=600))
+            src = _stage_macsteam_app(archive, dest)
+            archive.unlink(missing_ok=True)
+        except Exception as exc:
+            tried.append(f"{repo}: {exc}")
+            continue
+        if src is None:
+            tried.append(f"{repo}: no .app found inside {asset['name']}")
+            continue
+        dylibs = sorted(str(p) for p in dest.rglob("*.dylib"))
+        installed = None
+        if sys.platform == "darwin":
+            target = Path("/Applications") / src.name
+            try:
+                if target.exists():
+                    target.rename(target.with_name(
+                        target.name + f".bak-{int(time.time())}"))
+                shutil.copytree(src, target)
+                installed = str(target)
+            except Exception as exc:
+                installed = f"copy to /Applications failed: {exc}"
+        return {"ok": True, "repo": repo, "version": data.get("tag_name"),
+                "asset": asset["name"], "staged": str(dest),
+                "config_app": installed, "dylib": dylibs,
+                "next": "open macSteam Config.app, press Install, approve the "
+                        "permission prompt, restart steam, then Grant from this app"}
+    return {"ok": False, "error": "no macsteam source reachable",
+            "tried": tried,
+            "manual": f"https://github.com/{MACSTEAM_REPOS[0]}/releases"}
 
 def loader_install_steamtools():
     ctx = SteamCtx()
@@ -1241,6 +1282,7 @@ class Logs:
             return self.lines[index:], len(self.lines)
 
 LOGS = Logs()
+_FETCH_LOCK = threading.Lock()
 
 class Api:
     def bootstrap(self):
@@ -1339,6 +1381,57 @@ class Api:
         LOGS.add("steam restarted")
         return res
 
+    def loader(self):
+        rep = loader_report()
+        fams = rep.get("families", [])
+        LOGS.add("loader check: " + (", ".join(f["family"] for f in fams)
+                                     if fams else "none detected"))
+        return rep
+
+    def loader_install(self, family):
+        family = (family or "macsteam").strip()
+        LOGS.add(f"loader install --from {family} (auto download)...")
+        if family == "steamtools":
+            res = loader_install_steamtools()
+        else:
+            res = loader_install_macsteam()
+        if res.get("ok"):
+            LOGS.add(f"loader ready - {res.get('repo') or 'steamtools'} "
+                     f"{res.get('version', '')} -> {res.get('config_app') or res.get('staged', '')}")
+        else:
+            LOGS.add("loader install failed: " + str(res.get("error", "")))
+            for line in res.get("tried", []):
+                LOGS.add("  " + line)
+        return res
+
+    def fetch(self, appid, user, password):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        if not _FETCH_LOCK.acquire(blocking=False):
+            return {"ok": False, "error": "a fetch is already running"}
+        u, p = (user or "").strip(), (password or "").strip()
+
+        def worker():
+            try:
+                LOGS.add(f"fetch {aid} - probing depots + downloading content...")
+                res = fetch_game(int(aid), "public", None, "mac", True,
+                                 u, p, None, None, None,
+                                 progress=lambda m: LOGS.add(str(m)))
+                if res.get("ok"):
+                    LOGS.add(f"fetch {aid} done - {len(res.get('results', []))} depot(s) "
+                             f"at {res.get('root', '')}")
+                else:
+                    LOGS.add(f"fetch {aid} failed: {res.get('error') or res.get('error_code') or ''}"
+                             + (f" - {res.get('hint')}" if res.get("hint") else ""))
+            except Exception as exc:
+                LOGS.add(f"fetch {aid} crashed: {exc}")
+            finally:
+                _FETCH_LOCK.release()
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True, "started": True, "appid": aid}
+
     def logs_since(self, index):
         lines, size = LOGS.since(index)
         return {"lines": lines, "index": size}
@@ -1383,6 +1476,7 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
   <button class="tab pri" data-t="grant">Grant</button>
   <button class="tab" data-t="library">Library</button>
   <button class="tab" data-t="installed">Installed</button>
+  <button class="tab" data-t="loader">Loader</button>
   <span class="sp"></span>
   <button id="b-restart">Restart Steam</button>
 </nav>
@@ -1403,6 +1497,13 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
     <button id="b-probe">Probe</button>
     <button id="b-grant" class="pri">Grant</button>
   </div>
+  <div class="toolbar">
+    <span class="muted">depot content:</span>
+    <input id="f-user" placeholder="steam user" style="width:160px">
+    <input id="f-pass" placeholder="password" type="password" style="width:160px">
+    <button id="b-fetch">Fetch Content</button>
+    <span class="muted">downloads game files into ~/.licensetools/games/</span>
+  </div>
   <div id="hits" class="muted"></div>
   <div id="probeout"></div>
 </section>
@@ -1414,6 +1515,14 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
   <table><thead><tr><th>AppID</th><th>File</th><th>Modified</th><th></th></tr></thead>
   <tbody id="inst"></tbody></table>
 </section>
+<section id="t-loader">
+  <div class="toolbar">
+    <button id="b-ldref">Refresh Status</button>
+    <button id="b-ldmac" class="pri">Install macSteam Loader</button>
+    <button id="b-ldst">Prepare SteamTools</button>
+  </div>
+  <div id="ldout"></div>
+</section>
 </main>
 <div id="status">booting...</div>
 <pre id="log"></pre>
@@ -1422,7 +1531,7 @@ let api=null,logIdx=0;
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const say=t=>{$("#status").textContent=t};
-function busy(on){["#b-probe","#b-grant","#b-search","#b-restart"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
+function busy(on){["#b-probe","#b-grant","#b-search","#b-restart","#b-fetch","#b-ldref","#b-ldmac","#b-ldst"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
 async function call(fn,...args){if(!api)throw new Error("bridge not ready");return api[fn](...args)}
 document.querySelectorAll("button.tab").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("button.tab").forEach(x=>x.classList.toggle("pri",x===b));
@@ -1449,6 +1558,47 @@ function renderInstalled(items){
 async function refreshInstalled(){
   try{renderInstalled((await call("installed")).items)}catch(e){say("installed list failed: "+e)}
 }
+function famDetail(f){
+  if(f.family==="stplug-in")return `toml ${esc(f.toml)} - ${f.lua_files} lua files`;
+  if(f.family==="macSteam")return `config ${esc(f.config||"-")} - dylib ${esc((f.dylibs||[]).join(", ")||"not injected yet")}`;
+  return esc(JSON.stringify(f));
+}
+function renderLoader(r){
+  const fams=r.families||[];
+  $("#ldout").innerHTML=
+    `<table><thead><tr><th>Loader</th><th>Detail</th></tr></thead><tbody>`+
+    (fams.length?fams.map(f=>`<tr><td>${esc(f.family)}</td><td class="mono">${famDetail(f)}</td></tr>`).join("")
+     :`<tr><td colspan="2" class="empty">${esc(r.hint||"no loader detected - press Install macSteam")}</td></tr>`)+
+    `</tbody></table>`;
+}
+async function ldRefresh(){
+  try{
+    const r=await call("loader");
+    renderLoader(r);
+    $("#h-loader").textContent="loader: "+((r.families||[]).map(f=>f.family).join(", ")||"none");
+  }catch(e){say("loader check failed: "+e)}
+}
+async function ldInstall(family){
+  busy(true);say("installing "+family+" loader - downloading...");
+  try{
+    const r=await call("loader_install",family);
+    if(!r.ok)return say("loader install failed: "+(r.error||""));
+    say((r.config_app?(r.config_app+" installed"):("loader staged at "+(r.staged||"")))+(r.version?" ("+r.version+")":""));
+    if(r.next)say(r.next);
+  }catch(e){say("loader install failed: "+e)}
+  await ldRefresh();
+  busy(false);
+}
+async function doFetch(){
+  const id=$("#appid").value.trim();
+  if(!/^\d+$/.test(id))return say("appid must be numeric");
+  busy(true);say("fetch "+id+" queued - progress shows in the log...");
+  try{
+    const r=await call("fetch",id,$("#f-user").value,$("#f-pass").value);
+    if(!r.ok)say("fetch failed: "+(r.error||""));
+  }catch(e){say("fetch failed: "+e)}
+  busy(false);
+}
 async function boot(){
   try{
     const d=await call("bootstrap");
@@ -1457,6 +1607,7 @@ async function boot(){
     say(`library ${d.count} games - ${d.platform} - v${d.version}`);
     renderLib(d.library);
     renderInstalled(d.installed);
+    await ldRefresh();
   }catch(e){say("bootstrap failed: "+e)}
 }
 async function doSearch(){
@@ -1513,6 +1664,10 @@ $("#b-restart").onclick=async()=>{
   try{await call("restart");say("steam restarted")}catch(e){say("restart failed: "+e)}
   busy(false);
 };
+$("#b-ldref").onclick=ldRefresh;
+$("#b-ldmac").onclick=()=>ldInstall("macsteam");
+$("#b-ldst").onclick=()=>ldInstall("steamtools");
+$("#b-fetch").onclick=doFetch;
 async function pollLogs(){
   if(!api)return;
   try{

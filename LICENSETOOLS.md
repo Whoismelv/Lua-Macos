@@ -8,14 +8,14 @@ A Steam license kit for macOS: probe public appinfo, generate `stplug-in` lua (`
 
 ## بالعربي
 
-### الشغلة بتشتغل هيك
+### الشغلة بتشتغل هيك — كل شيء من داخل البرنامج، بدون terminal
 
-1. `loader status` — بتشوف اذا في loader مثبت عندك (محرك الـ lua اللي بيفضح `addappid`).
-2. `loader install --from macsteam` — بتنزّل macSteam (Apple Silicon) وتحطه جاهز.
-3. `grant APPID` — بتجيب الديبوتات mac + shared من appinfo، وبتكتب `config/stplug-in/APPID.lua`.
-4. `restart` — ستيم بيرجع وبيحمّل الـ lua، واللعبة بتظهر بمكتبتك.
+1. افتح **LicenseTools** — تبويب **Loader** → اضغط **Install macSteam Loader** (بينزّل تلقائي ويحطه بـ Applications).
+2. افتح **macSteam Config** → اضغط **Install** → وافق على الإذن → اقفل ستيم.
+3. تبويب **Grant** → اكتب الـ appid أو اضغط Search واختار → **Grant** → **Restart Steam** → اللعبة بالمكتبكة.
+4. بدك ملفات اللعبة نفسها؟ حط اسم حسابك وكلمة السر وتبويب Grant → **Fetch Content** — بينزل على ~/.licensetools/games/.
 
-> ملاحظة: مجلد `stplug-in` لحاله ما بيعمل شي على ستيم نظيف — لازم يكون في loader شغّال (macSteam او SteamTools).
+> مجلد `stplug-in` لحاله ما بيعمل شي على ستيم نظيف — لازم يكون في loader شغّال (macSteam او SteamTools). كل الأزرار فوق من داخل البرنامج.
 
 ### أوامر
 
@@ -35,14 +35,14 @@ A Steam license kit for macOS: probe public appinfo, generate `stplug-in` lua (`
 
 ## English
 
-### Flow
+### Flow — everything is a button in the app, no terminal needed
 
-1. `loader status` — see whether a lua license loader is present (the engine that exposes `addappid`).
-2. `loader install --from macsteam` — stage macSteam (Apple Silicon) for injection.
-3. `grant APPID` — probe mac + shared depots from appinfo, write `config/stplug-in/APPID.lua`.
-4. `restart` — Steam reloads stplug-in and the game shows as owned in your library.
+1. Open **LicenseTools** → **Loader** tab → **Install macSteam Loader** (auto-downloads the current fork, stages it into Applications).
+2. Open **macSteam Config** → press **Install** → approve the permission prompt → quit Steam.
+3. **Grant** tab → type the appid or hit Search → **Grant** → **Restart Steam** → game shows as owned.
+4. Want the actual game files too? Fill your Steam user/pass on the Grant tab → **Fetch Content** — downloads into `~/.licensetools/games/`.
 
-The `stplug-in` folder alone does nothing on a stock client — a loader (macSteam or SteamTools) is required.
+The `stplug-in` folder alone does nothing on a stock client — a loader (macSteam or SteamTools) is required. Every step above is a button; the CLI commands below are the same engine for power users.
 
 ### Commands
 
