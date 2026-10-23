@@ -32,8 +32,11 @@ jobs:
       - name: install DepotDownloader
         run: |
           python3 luatools_mac.py install-dd | tee /tmp/dd.json
-          test -x "$HOME/.luatools-mac/tools/DepotDownloader"
-          "$HOME/.luatools-mac/tools/DepotDownloader" || true
+          grep -q '"ok": true' /tmp/dd.json
+          BIN="$(find "$HOME/.luatools-mac/tools" -type f -name 'DepotDownloader*' | head -1)"
+          echo "binary: $BIN"
+          test -n "$BIN"
+          test -x "$BIN"
       - name: probe a real app with a mac build
         run: |
           brew install --cask steamcmd

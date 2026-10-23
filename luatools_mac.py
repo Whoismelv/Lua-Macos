@@ -1652,21 +1652,28 @@ def install_depotdownloader(token=""):
     asset, err = gh_latest_asset("SteamRE/DepotDownloader", lambda n: n == want, token)
     if asset is None:
         return {"ok": False, "error": err, "wanted": want}
-    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-    zp = TOOLS_DIR / want
+    dest = TOOLS_DIR / "depotdownloader"
+    dest.mkdir(parents=True, exist_ok=True)
+    zp = dest / want
     try:
         data, _ = http_get(asset["browser_download_url"], timeout=600,
                            headers={"User-Agent": "luatools-mac"})
         zp.write_bytes(data)
         with zipfile.ZipFile(zp) as z:
-            z.extractall(TOOLS_DIR)
+            z.extractall(dest)
         zp.unlink()
-        exe = next((p for p in TOOLS_DIR.iterdir()
-                    if p.is_file() and p.name.lower().startswith("depotdownloader")), None)
-        if exe is None:
-            return {"ok": False, "error": "binary not found in archive", "dir": str(TOOLS_DIR)}
+        cands = [p for p in dest.rglob("*")
+                 if p.is_file() and p.name.lower().startswith("depotdownloader")]
+        if not cands:
+            return {"ok": False, "error": "binary not found in archive", "dir": str(dest)}
+        exe = sorted(cands, key=lambda p: len(p.parts))[0]
         if os.name != "nt":
-            os.chmod(exe, 0o755)
+            for p in dest.rglob("*"):
+                if p.is_file() and not p.name.lower().endswith((".zip",)):
+                    try:
+                        os.chmod(p, 0o755)
+                    except OSError:
+                        pass
         return {"ok": True, "tool": str(exe), "asset": want, "bytes": len(data)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1679,7 +1686,7 @@ def _dd_tool():
         if t:
             return t
     if TOOLS_DIR.exists():
-        for p in TOOLS_DIR.iterdir():
+        for p in sorted(TOOLS_DIR.rglob("*")):
             if p.is_file() and p.name.lower().startswith("depotdownloader"):
                 return p
     return None
