@@ -1,0 +1,164 @@
+== uname ==
+Darwin sjc22-be112-15dfbfa1-8b09-4c0a-9650-0c89df7a4cad-3E8833331F3A.local 23.6.0 Darwin Kernel Version 23.6.0: Tue Jul 21 21:56:54 PDT 2026; root:xnu-10063.141.1.713.39~1/RELEASE_ARM64_VMAPPLE arm64
+Python 3.12.10 (v3.12.10:0cc81280367, Apr  8 2025, 08:46:59) [Clang 13.0.0 (clang-1300.0.29.30)]
+== help ==
+usage: luatools-mac [-h]
+                    {detect,status,migrate,toml,restart,serve,info,install-lua,install-zip,install-manifest,uninstall-lua,vault,dual,library,fetch-manifest,fetch-zip,generate-dlc,check-apis,denuvo,fix-index,plugin,downloader,autocrack,fetch-game,open,probe,install-dd,shortcut,apply-api,restore-api,launch,settings}
+                    ...
+
+LuaTools 1.3.2 engine — native macOS port
+
+positional arguments:
+  {detect,status,migrate,toml,restart,serve,info,install-lua,install-zip,install-manifest,uninstall-lua,vault,dual,library,fetch-manifest,fetch-zip,generate-dlc,check-apis,denuvo,fix-index,plugin,downloader,autocrack,fetch-game,open,probe,install-dd,shortcut,apply-api,restore-api,launch,settings}
+
+options:
+  -h, --help            show this help message and exit
+== detect ==
+{
+  "platform": "darwin",
+  "root": "/Users/runner/Library/Application Support/Steam",
+  "valid": false,
+  "st_plugin": "/Users/runner/Library/Application Support/Steam/config/stplug-in",
+  "depotcache": "/Users/runner/Library/Application Support/Steam/depotcache",
+  "legacy_depotcache": "/Users/runner/Library/Application Support/Steam/config/depotcache",
+  "steam_exe": "/Applications/Steam.app/Contents/MacOS/steam",
+  "steam_running": false
+}
+== library ==
+{
+  "ok": false,
+  "error": "steam root not configured"
+}
+== install-dd ==
+{
+  "ok": true,
+  "tool": "/Users/runner/.luatools-mac/tools/depotdownloader/DepotDownloader",
+  "asset": "DepotDownloader-macos-arm64.zip",
+  "bytes": 32245964
+}
+== brew steamcmd ==
+[34m==>[0m [1mWould install 1 cask:[0m
+steamcmd
+[32m==>[0m [1mFetching downloads for: [32msteamcmd[39m[0m
+✔︎ Cask steamcmd (1785799152)
+[32m==>[0m [1mInstalling Cask [32msteamcmd[39m[0m
+[34m==>[0m [1mLinking Command Wrapper 'steamcmd' to '/opt/homebrew/bin/steamcmd'[0m
+🍺  steamcmd was successfully installed!
+brew_exit=0
+/opt/homebrew/bin/steamcmd
+lrwxr-xr-x  1 runner  admin  78 Oct 23 00:22 /opt/homebrew/bin/steamcmd -> /opt/homebrew/Caskroom/steamcmd/1785799152/.homebrew-command-wrappers/steamcmd
+== probe 620 ==
+{
+  "ok": true,
+  "appid": "620",
+  "buildid": "25240193",
+  "count": 10,
+  "mac": 1,
+  "rows": [
+    {
+      "depot": "660",
+      "os": "win",
+      "manifest": "2679694482538379167",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "624",
+      "os": "shared",
+      "manifest": "3651103799462409440",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "623",
+      "os": "mac",
+      "manifest": "2276453204441793614",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "622",
+      "os": "win",
+      "manifest": "2202889899553513457",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "621",
+      "os": "shared",
+      "manifest": "9044256803759256265",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "625",
+      "os": "shared",
+      "manifest": "1128685895801277145",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "626",
+      "os": "shared",
+      "manifest": "6439173920052159773",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "627",
+      "os": "shared",
+      "manifest": "4705364648410025995",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "628",
+      "os": "shared",
+      "manifest": "1134745004760172192",
+      "size": "",
+      "key": null
+    },
+    {
+      "depot": "661",
+      "os": "linux",
+      "manifest": "8940703274703023246",
+      "size": "",
+      "key": null
+    }
+  ],
+  "csv": "/tmp/depots.csv"
+}
+probe_exit=0
+== csv ==
+# depot,os,manifest,size,depotkey
+660,win,2679694482538379167,,
+624,shared,3651103799462409440,,
+623,mac,2276453204441793614,,
+622,win,2202889899553513457,,
+621,shared,9044256803759256265,,
+625,shared,1128685895801277145,,
+626,shared,6439173920052159773,,
+627,shared,4705364648410025995,,
+628,shared,1134745004760172192,,
+661,linux,8940703274703023246,,
+== fetch 480 ==
+{
+  "probe": {
+    "mac": 0,
+    "total": 1,
+    "buildid": "3538192"
+  }
+}
+{
+  "ok": true,
+  "root": "/tmp/games",
+  "results": [
+    {
+      "depot": "481",
+      "error": "[Errno 13] Permission denied: '/Users/runner/.luatools-mac/tools/DepotDownloader'"
+    }
+  ]
+}
+fetch_exit=0
+== files ==
+== done ==
