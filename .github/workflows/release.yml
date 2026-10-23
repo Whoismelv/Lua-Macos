@@ -16,6 +16,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: free disk
+        run: |
+          df -h /
+          rm -rf "$HOME/.cache/pip" "$HOME/Library/Caches/pip" "$HOME/.npm"
+          df -h /
       - name: build app + dmg
         run: bash build_macos.sh
       - name: prune disk

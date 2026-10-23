@@ -74,15 +74,32 @@ echo "== selftest =="
 echo "== ad-hoc sign =="
 codesign --force --deep --sign - "$APP" || echo "codesign skipped"
 
+echo "== prune build dirs =="
+rm -rf build .build-venv "$HOME/.cache/pip"
+df -h / | tail -1
+
 echo "== dmg =="
 rm -rf dmg-stage && mkdir dmg-stage
 cp -R "$APP" dmg-stage/
 ln -s /Applications dmg-stage/Applications
-hdiutil create \
+mkdir -p dist
+if ! hdiutil create \
   -volname "$APP_NAME" \
   -srcfolder dmg-stage \
   -ov -format UDZO \
-  "dist/LuaToolsMac.dmg"
+  "dist/LuaToolsMac.dmg"; then
+  echo "srcfolder image failed - retrying with a fixed-size image"
+  TMPIMG="/tmp/luatools-tmp.dmg"
+  MNT="$(mktemp -d /tmp/luatools-mnt.XXXXXX)"
+  rm -f "$TMPIMG"
+  hdiutil create -size 3g -fs HFS+ -volname "$APP_NAME" -ov "$TMPIMG"
+  hdiutil attach "$TMPIMG" -mountpoint "$MNT" -nobrowse
+  cp -R dmg-stage/. "$MNT"/
+  hdiutil detach "$MNT" -quiet
+  rm -rf "$MNT"
+  hdiutil convert "$TMPIMG" -format UDZO -o "dist/LuaToolsMac.dmg"
+  rm -f "$TMPIMG"
+fi
 rm -rf dmg-stage
 
 echo

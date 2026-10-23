@@ -129,11 +129,24 @@ echo "== dmg =="
 rm -rf dmg-stage-lic && mkdir dmg-stage-lic
 cp -R "$APP" dmg-stage-lic/
 ln -s /Applications dmg-stage-lic/Applications
-hdiutil create \
+mkdir -p dist
+if ! hdiutil create \
   -volname "$APP_NAME" \
   -srcfolder dmg-stage-lic \
   -ov -format UDZO \
-  "dist/LicenseTools.dmg"
+  "dist/LicenseTools.dmg"; then
+  echo "srcfolder image failed - retrying with a fixed-size image"
+  TMPIMG="/tmp/licensetools-tmp.dmg"
+  MNT="$(mktemp -d /tmp/licensetools-mnt.XXXXXX)"
+  rm -f "$TMPIMG"
+  hdiutil create -size 3g -fs HFS+ -volname "$APP_NAME" -ov "$TMPIMG"
+  hdiutil attach "$TMPIMG" -mountpoint "$MNT" -nobrowse
+  cp -R dmg-stage-lic/. "$MNT"/
+  hdiutil detach "$MNT" -quiet
+  rm -rf "$MNT"
+  hdiutil convert "$TMPIMG" -format UDZO -o "dist/LicenseTools.dmg"
+  rm -f "$TMPIMG"
+fi
 rm -rf dmg-stage-lic
 
 echo

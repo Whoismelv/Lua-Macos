@@ -915,20 +915,21 @@ def install_depotdownloader(token=""):
     if tool:
         return {"ok": True, "tool": str(tool), "source": "found"}
     want = dd_asset_name()
-    asset, err = gh_latest_asset("SteamRE/DepotDownloader", want, token)
-    if asset is None:
-        return {"ok": False, "error": err, "wanted": want}
     dest = TOOLS_DIR / "dd"
     dest.mkdir(parents=True, exist_ok=True)
     zp = dest / want
+    asset, err = gh_latest_asset("SteamRE/DepotDownloader", want, token)
+    url = asset["browser_download_url"] if asset else (
+        f"https://github.com/SteamRE/DepotDownloader/releases/latest/download/{want}")
     try:
-        data = http_get(asset["browser_download_url"], timeout=600)
+        data = http_get(url, timeout=600)
         zp.write_bytes(data)
         with zipfile.ZipFile(zp) as z:
             z.extractall(dest)
         zp.unlink(missing_ok=True)
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": str(exc), "asset": want, "url": url,
+                "api_error": err}
     cands = [p for p in dest.rglob("*") if p.is_file() and
              p.name.lower().startswith("depotdownloader") and
              p.suffix.lower() not in (".pdb", ".xml", ".zip")]
@@ -972,11 +973,15 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
     if not want:
         return {"ok": False, "error": f"no depots with manifests for os={want_os} branch={branch}"}
     tool = _find_tool("DepotDownloader")
+    install_err = None
     if tool is None:
         got = install_depotdownloader(load_settings().get("auth_token", ""))
         tool = got.get("tool") if got.get("ok") else None
+        if tool is None:
+            install_err = got.get("error") or got.get("api_error")
     if tool is None:
-        return {"ok": False, "error": "DepotDownloader missing - run: ensure"}
+        return {"ok": False, "error": "DepotDownloader missing - run: ensure",
+                "detail": install_err}
     outroot = Path(out_root) if out_root else GAMES_DIR / str(appid)
     outroot.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
@@ -1089,21 +1094,35 @@ def macsteam_status():
             "config_dir": str(cfg) if cfg.is_dir() else None}
 
 def _fetch_repo_signatures(repo, dest):
+    dest.mkdir(parents=True, exist_ok=True)
+    names = []
     try:
         url = f"https://api.github.com/repos/{repo}/contents/signatures/macos.arm64"
         items = json.loads(http_get(url, headers={"Accept": "application/vnd.github+json"},
                                     timeout=30))
+        for it in items if isinstance(items, list) else []:
+            if it.get("type") == "file" and it.get("name", "").endswith(".json"):
+                names.append((it["name"], it["download_url"]))
     except Exception:
-        return []
+        names = []
+    if not names:
+        try:
+            flat = json.loads(http_get(
+                f"https://data.jsdelivr.com/v1/packages/gh/{repo}@main?structure=flat",
+                timeout=30))
+            for f in flat.get("files", []):
+                p = f.get("name", "")
+                if p.startswith("/signatures/macos.arm64/") and p.endswith(".json"):
+                    n = p.rsplit("/", 1)[-1]
+                    names.append((n, f"https://cdn.jsdelivr.net/gh/{repo}@main{p}"))
+        except Exception:
+            names = []
     out = []
-    dest.mkdir(parents=True, exist_ok=True)
-    for it in items if isinstance(items, list) else []:
-        if it.get("type") != "file" or not it.get("name", "").endswith(".json"):
-            continue
-        p = dest / it["name"]
+    for name, link in names:
+        p = dest / name
         try:
             if not p.exists():
-                p.write_bytes(http_get(it["download_url"], timeout=60))
+                p.write_bytes(http_get(link, timeout=60))
             out.append(str(p))
         except Exception:
             continue
