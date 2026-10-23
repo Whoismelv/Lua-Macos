@@ -52,6 +52,45 @@ jobs:
           python3 -m py_compile licensetools_mac.py
           python3 licensetools_mac.py --selftest
           python3 licensetools_mac.py loader status
+      - name: macsteam injector smoke
+        run: |
+          python3 - <<'PY'
+          import importlib.util, plistlib, subprocess, sys, tempfile
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location("lt", "licensetools_mac.py")
+          lt = importlib.util.module_from_spec(spec); spec.loader.exec_module(lt)
+          app = Path("/Applications/Steam.app")
+          if app.exists():
+              print("real Steam present - skipping synthetic bundle")
+              sys.exit(0)
+          (app / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+          exe = app / "Contents" / "MacOS" / "steam_osx"
+          exe.write_text("#!/bin/sh\nexit 0\n"); exe.chmod(0o755)
+          (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps({
+              "CFBundleExecutable": "steam_osx",
+              "CFBundleIdentifier": "com.valvesoftware.steam",
+              "CFBundleName": "Steam",
+          }))
+          tmp = Path(tempfile.mkdtemp())
+          dylib = tmp / "macsteam.dylib"
+          subprocess.run(["clang", "-dynamiclib", "-o", str(dylib), "-x", "c", "-"],
+                         input=b"int macsteam_probe(void){return 1;}\n", check=True)
+          res = lt.macsteam_inject(dylib, [])
+          print("inject:", res)
+          assert res.get("ok"), res
+          st = lt.macsteam_status()
+          print("status:", st)
+          assert st["injected"], st
+          cfg = lt.macsteam_config_add(480)
+          print("config:", cfg)
+          assert cfg.get("ok"), cfg
+          print((Path.home() / "Library/Application Support/macsteam/config.yaml").read_text())
+          print("macsteam injector ok")
+          import shutil
+          shutil.rmtree(app, ignore_errors=True)
+          shutil.rmtree(Path.home() / "Library/Application Support/macsteam", ignore_errors=True)
+          print("synthetic bundle cleaned")
+          PY
       - name: diagnostics
         run: |
           set -o pipefail

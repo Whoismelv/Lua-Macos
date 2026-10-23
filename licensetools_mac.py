@@ -37,7 +37,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.6"
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -1018,6 +1018,18 @@ MACSTEAM_REPOS = (
 )
 STEAMTOOLS_SITE = "https://steamtools.net/"
 
+def bundled_macsteam():
+    roots = []
+    base = getattr(sys, "_MEIPASS", "")
+    if base:
+        roots.append(Path(base) / "vendor" / "macsteam")
+    roots.append(Path(__file__).resolve().parent / "vendor" / "macsteam")
+    for r in roots:
+        d = r / "macsteam.dylib"
+        if d.is_file():
+            return r
+    return None
+
 def loader_report():
     ctx = SteamCtx()
     root = ctx.root()
@@ -1032,23 +1044,212 @@ def loader_report():
             "lua_files": len(luas),
             "sample": [f.name for f in luas[:5]],
         })
-    mac_cfg = Path.home() / "Library" / "Application Support" / "macSteam"
-    dylibs = []
-    for rel in ("Contents/MacOS/macsteam.dylib", "Contents/Frameworks/macsteam.dylib"):
-        p = Path("/Applications/Steam.app") / rel
-        if p.exists():
-            dylibs.append(str(p))
-    if mac_cfg.is_dir() or dylibs:
+    ms = macsteam_status()
+    if ms["injected"] or ms["config_dir"]:
         families.append({
             "family": "macSteam",
-            "config": str(mac_cfg) if mac_cfg.is_dir() else None,
-            "dylibs": dylibs,
+            "injected": ms["injected"],
+            "dylib": ms["dylib"],
+            "config": ms["config_dir"],
         })
     return {"ok": True, "steam_root": str(root) if root else None,
             "platform": sys.platform, "families": families,
             "hint": None if families else
             "no loader detected - run: loader install --from macsteam (mac arm64) "
             "or --from steamtools"}
+
+def _plistbuddy(args, plist):
+    try:
+        return subprocess.run(["/usr/libexec/PlistBuddy"] + args + [str(plist)],
+                              capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+
+def macsteam_status():
+    steam_app = Path("/Applications/Steam.app")
+    dylib = steam_app / "Contents" / "MacOS" / "macsteam.dylib"
+    insert = None
+    if sys.platform == "darwin":
+        pr = _plistbuddy(["-c", "Print :LSEnvironment:DYLD_INSERT_LIBRARIES"],
+                         steam_app / "Contents" / "Info.plist")
+        if pr is not None and pr.returncode == 0:
+            insert = (pr.stdout or "").strip() or None
+    cfg = Path.home() / "Library" / "Application Support" / "macsteam"
+    return {"injected": bool(dylib.exists() and insert and str(dylib) in insert),
+            "dylib": str(dylib) if dylib.exists() else None,
+            "insert": insert,
+            "config_dir": str(cfg) if cfg.is_dir() else None}
+
+def _fetch_repo_signatures(repo, dest):
+    try:
+        url = f"https://api.github.com/repos/{repo}/contents/signatures/macos.arm64"
+        items = json.loads(http_get(url, headers={"Accept": "application/vnd.github+json"},
+                                    timeout=30))
+    except Exception:
+        return []
+    out = []
+    dest.mkdir(parents=True, exist_ok=True)
+    for it in items if isinstance(items, list) else []:
+        if it.get("type") != "file" or not it.get("name", "").endswith(".json"):
+            continue
+        p = dest / it["name"]
+        try:
+            if not p.exists():
+                p.write_bytes(http_get(it["download_url"], timeout=60))
+            out.append(str(p))
+        except Exception:
+            continue
+    return out
+
+def macsteam_inject(dylib_src, sig_roots):
+    if sys.platform != "darwin":
+        return {"ok": False, "error": "macsteam injection runs on macOS only"}
+    steam_app = Path("/Applications/Steam.app")
+    exe = steam_app / "Contents" / "MacOS" / "steam_osx"
+    plist = steam_app / "Contents" / "Info.plist"
+    if not steam_app.is_dir():
+        return {"ok": False, "error": "Steam.app not found in /Applications - install Steam first"}
+    if not exe.exists():
+        return {"ok": False, "error": "Steam.app layout unexpected (steam_osx missing)"}
+    subprocess.run(["pkill", "-f", "steam_osx"], capture_output=True)
+    target = steam_app / "Contents" / "MacOS" / "macsteam.dylib"
+    try:
+        if target.exists():
+            target.unlink()
+        shutil.copy2(dylib_src, target)
+    except Exception as exc:
+        return {"ok": False, "error": f"copy payload failed: {exc}",
+                "hint": "Steam.app may need admin rights - move it to /Applications or chown it"}
+    cfg = Path.home() / "Library" / "Application Support" / "macsteam"
+    cfg.mkdir(parents=True, exist_ok=True)
+    sig_dest = cfg / "signatures"
+    copied = 0
+    if sig_roots:
+        if sig_dest.exists():
+            shutil.rmtree(sig_dest)
+        sig_dest.mkdir(parents=True, exist_ok=True)
+        for root in sig_roots:
+            root = Path(root)
+            if not root.is_dir():
+                continue
+            for src in root.rglob("*.json"):
+                dst = sig_dest / src.name
+                try:
+                    shutil.copy2(src, dst)
+                    copied += 1
+                except Exception:
+                    pass
+    val = str(target)
+    pr = _plistbuddy(["-c", f"Set :LSEnvironment:DYLD_INSERT_LIBRARIES {val}"], plist)
+    if pr is None or pr.returncode != 0:
+        pr = _plistbuddy(["-c",
+                          f"Add :LSEnvironment:DYLD_INSERT_LIBRARIES string {val}"], plist)
+        if pr is None or pr.returncode != 0:
+            return {"ok": False, "error": "Info.plist patch failed",
+                    "detail": (pr.stderr if pr else "")[:300]}
+    for u in (target, exe, steam_app):
+        subprocess.run(["codesign", "-f", "-s", "-", str(u)], capture_output=True)
+    body = "BootStrapperInhibitUpdateOnLaunch=enable\n"
+    steam_root = Path.home() / "Library" / "Application Support" / "Steam"
+    for p in (steam_root / "steam.cfg",
+              steam_root / "Steam.AppBundle" / "Steam" / "Contents" / "MacOS" / "steam.cfg"):
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body, encoding="utf-8")
+        except Exception:
+            pass
+    try:
+        (cfg / "dylib.version").write_text("licensetools", encoding="utf-8")
+    except Exception:
+        pass
+    subprocess.run([
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+        "LaunchServices.framework/Support/lsregister", "-f", str(steam_app)],
+        capture_output=True)
+    return {"ok": True, "dylib": str(target), "signatures": copied,
+            "config_dir": str(cfg)}
+
+def _ms_parse(text):
+    apps, packages, depot = [], [], {}
+    section = cur = None
+    for raw in text.splitlines():
+        line = raw.replace("\r", "")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        t = line.strip()
+        if indent == 0:
+            section = cur = None
+            if t.startswith("Apps:"):
+                section = "apps"
+            elif t.startswith("PackageIds:"):
+                section = "packages"
+            elif t.startswith("DepotKeys:"):
+                section = "depot"
+            continue
+        if section == "apps" and indent == 2 and t.startswith("-"):
+            tok = t[1:].strip().split("#")[0].strip().split()[0] if t[1:].strip() else ""
+            if tok.isdigit() and int(tok) not in apps:
+                apps.append(int(tok))
+        elif section == "packages" and indent == 2 and t.startswith("-"):
+            tok = t[1:].strip().split("#")[0].strip().split()[0] if t[1:].strip() else ""
+            if tok.isdigit() and int(tok) not in packages:
+                packages.append(int(tok))
+        elif section == "depot" and indent == 2 and t.endswith(":"):
+            tok = t[:-1].strip()
+            if tok.isdigit():
+                cur = int(tok)
+                depot.setdefault(cur, {})
+        elif section == "depot" and indent == 4 and cur is not None and ":" in t:
+            k, v = t.split(":", 1)
+            if k.strip().isdigit():
+                depot[cur][int(k.strip())] = v.strip().strip("'\"")
+    return apps, packages, depot
+
+def _ms_serialize(apps, packages, depot):
+    out = ["HideWhatsNew: no", ""]
+    if apps:
+        out.append("Apps:")
+        out += [f"  - {a}" for a in apps]
+        out.append("")
+    if packages:
+        out.append("PackageIds:")
+        out += [f"  - {p}" for p in packages]
+        out.append("")
+    if depot:
+        out.append("DepotKeys:")
+        for app, deps in depot.items():
+            out.append(f"  {app}:")
+            for d, k in deps.items():
+                out.append(f"    {d}: {k}")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+def macsteam_config_add(appid, packages=(20200,)):
+    if sys.platform != "darwin":
+        return {"ok": False, "skipped": "macsteam config exists on macOS only"}
+    cfg = Path.home() / "Library" / "Application Support" / "macsteam"
+    cfg.mkdir(parents=True, exist_ok=True)
+    f = cfg / "config.yaml"
+    apps, pkgs, depot = ([], [], {})
+    if f.exists():
+        try:
+            apps, pkgs, depot = _ms_parse(f.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            pass
+    changed = False
+    if appid not in apps:
+        apps.append(appid)
+        changed = True
+    for p in packages:
+        if p not in pkgs:
+            pkgs.append(p)
+            changed = True
+    try:
+        f.write_text(_ms_serialize(apps, pkgs, depot), encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "error": f"config write failed: {exc}"}
+    return {"ok": True, "file": str(f), "apps": len(apps), "changed": changed}
 
 def _stage_macsteam_app(archive, dest):
     if archive.suffix.lower() == ".zip":
@@ -1077,6 +1278,28 @@ def _stage_macsteam_app(archive, dest):
     return None
 
 def loader_install_macsteam():
+    bundled = bundled_macsteam()
+    if bundled is not None:
+        dylib = bundled / "macsteam.dylib"
+        sig_roots = [p for p in bundled.rglob("signatures") if p.is_dir()]
+        res = {"ok": True, "repo": "bundled", "version": "vendored",
+               "asset": "inside app", "staged": str(bundled),
+               "dylib_src": str(dylib), "signatures": 0}
+        if sys.platform == "darwin":
+            fresh = _fetch_repo_signatures(MACSTEAM_REPOS[0],
+                                           TOOLS_DIR / "loader" / "macsteam"
+                                           / "signatures" / "macos.arm64")
+            if fresh:
+                sig_roots.append(TOOLS_DIR / "loader" / "macsteam" / "signatures")
+            inj = macsteam_inject(dylib, sig_roots)
+            res.update({k: inj.get(k) for k in
+                        ("ok", "error", "hint", "dylib", "signatures", "config_dir")})
+            res["injected"] = bool(inj.get("ok"))
+            res["next"] = ("loader ready - press Fetch in the app"
+                           if inj.get("ok") else "injection failed - see error")
+            return res
+        res["next"] = "bundled payload present (injection happens on macOS)"
+        return res
     tried = []
     for repo in MACSTEAM_REPOS:
         api = f"https://api.github.com/repos/{repo}/releases/latest"
@@ -1087,42 +1310,64 @@ def loader_install_macsteam():
         except Exception as exc:
             tried.append(f"{repo}: release fetch failed ({exc})")
             continue
-        assets = [a for a in data.get("assets", [])
-                  if a.get("name", "").lower().endswith((".zip", ".dmg"))]
-        if not assets:
-            tried.append(f"{repo}: no zip/dmg asset in latest release")
+        all_assets = data.get("assets", [])
+        bundles = [a for a in all_assets
+                   if a.get("name", "").lower().endswith((".zip", ".dmg"))]
+        raw_dylibs = [a for a in all_assets
+                      if a.get("name", "").lower().endswith(".dylib")]
+        if not bundles and not raw_dylibs:
+            tried.append(f"{repo}: no bundle or dylib asset in latest release")
             continue
-        asset = assets[0]
         dest = TOOLS_DIR / "loader" / "macsteam"
         dest.mkdir(parents=True, exist_ok=True)
-        archive = dest / asset["name"]
-        try:
-            archive.write_bytes(http_get(asset["browser_download_url"], timeout=600))
-            src = _stage_macsteam_app(archive, dest)
-            archive.unlink(missing_ok=True)
-        except Exception as exc:
-            tried.append(f"{repo}: {exc}")
-            continue
-        if src is None:
-            tried.append(f"{repo}: no .app found inside {asset['name']}")
-            continue
-        dylibs = sorted(str(p) for p in dest.rglob("*.dylib"))
-        installed = None
-        if sys.platform == "darwin":
-            target = Path("/Applications") / src.name
+        if bundles:
+            asset = bundles[0]
+            archive = dest / asset["name"]
             try:
-                if target.exists():
-                    target.rename(target.with_name(
-                        target.name + f".bak-{int(time.time())}"))
-                shutil.copytree(src, target)
-                installed = str(target)
+                archive.write_bytes(http_get(asset["browser_download_url"], timeout=600))
+                src = _stage_macsteam_app(archive, dest)
+                archive.unlink(missing_ok=True)
             except Exception as exc:
-                installed = f"copy to /Applications failed: {exc}"
-        return {"ok": True, "repo": repo, "version": data.get("tag_name"),
-                "asset": asset["name"], "staged": str(dest),
-                "config_app": installed, "dylib": dylibs,
-                "next": "open macSteam Config.app, press Install, approve the "
-                        "permission prompt, restart steam, then Grant from this app"}
+                tried.append(f"{repo}: {exc}")
+                continue
+            if src is None:
+                tried.append(f"{repo}: no .app found inside {asset['name']}")
+                continue
+        dylib = next(iter(sorted(dest.rglob("macsteam.dylib"))), None)
+        if dylib is None and raw_dylibs:
+            ra = raw_dylibs[0]
+            try:
+                dylib = dest / ra["name"]
+                dylib.write_bytes(http_get(ra["browser_download_url"], timeout=600))
+            except Exception as exc:
+                tried.append(f"{repo}: dylib asset failed ({exc})")
+                dylib = None
+        if dylib is None:
+            found = sorted(dest.rglob("*.dylib"))
+            dylib = found[0] if found else None
+        if dylib is None:
+            tried.append(f"{repo}: no macsteam.dylib inside {asset['name']}")
+            continue
+        sig_roots = [p for p in dest.rglob("signatures") if p.is_dir()]
+        fresh = _fetch_repo_signatures(repo, dest / "signatures" / "macos.arm64")
+        if fresh:
+            sig_roots.append(dest / "signatures")
+        result = {"ok": True, "repo": repo, "version": data.get("tag_name"),
+                  "asset": bundles[0]["name"] if bundles else raw_dylibs[0]["name"],
+                  "staged": str(dest), "dylib_src": str(dylib),
+                  "signatures": len(fresh)}
+        if sys.platform == "darwin":
+            inj = macsteam_inject(dylib, sig_roots)
+            result.update({k: inj.get(k) for k in
+                           ("ok", "error", "hint", "dylib", "signatures", "config_dir")})
+            result["injected"] = bool(inj.get("ok"))
+            if not inj.get("ok"):
+                result["next"] = "injection failed - see error above"
+                return result
+            result["next"] = "loader ready - press Fetch in the app, game lands in your library"
+        else:
+            result["next"] = "staged (injection happens on macOS)"
+        return result
     return {"ok": False, "error": "no macsteam source reachable",
             "tried": tried,
             "manual": f"https://github.com/{MACSTEAM_REPOS[0]}/releases"}
@@ -1362,6 +1607,43 @@ class Api:
                  else ("grant failed: " + str(inst.get("error"))))
         return inst
 
+    def unlock(self, appid, branch="public", want_os="mac"):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        branch = (branch or "public").strip() or "public"
+        want_os = (want_os or "mac").strip() or "mac"
+        steps = []
+        if sys.platform == "darwin":
+            ms = macsteam_status()
+            if not ms["injected"]:
+                LOGS.add("loader not injected - installing macSteam automatically...")
+                inst = loader_install_macsteam()
+                steps.append({"step": "loader", "ok": inst.get("ok"),
+                              "repo": inst.get("repo"), "version": inst.get("version"),
+                              "error": inst.get("error")})
+                for line in inst.get("tried", []):
+                    LOGS.add("  " + line)
+                if not inst.get("ok"):
+                    return {"ok": False, "stage": "loader",
+                            "error": inst.get("error"), "steps": steps}
+            else:
+                steps.append({"step": "loader", "ok": True, "note": "already injected"})
+        res = self.grant(aid, branch, want_os, True)
+        steps.append({"step": "grant", "ok": res.get("ok"),
+                      "dest": res.get("dest"), "depots": res.get("depots"),
+                      "error": res.get("error")})
+        if not res.get("ok"):
+            return {"ok": False, "stage": "grant", "error": res.get("error"),
+                    "steps": steps}
+        cfg = macsteam_config_add(int(aid))
+        steps.append({"step": "config", **cfg})
+        LOGS.add("steam restarting - game will show in your library")
+        restart_steam()
+        steps.append({"step": "restart", "ok": True})
+        return {"ok": True, "appid": aid, "steps": steps,
+                "hint": "game should appear in your library now"}
+
     def remove(self, appid):
         try:
             aid = int(appid)
@@ -1495,7 +1777,7 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
     </select>
     <label class="chk"><input type="checkbox" id="pin" checked> pin manifests</label>
     <button id="b-probe">Probe</button>
-    <button id="b-grant" class="pri">Grant</button>
+    <button id="b-grant" class="pri">Fetch &rarr; Library</button>
   </div>
   <div class="toolbar">
     <span class="muted">depot content:</span>
@@ -1583,7 +1865,8 @@ async function ldInstall(family){
   try{
     const r=await call("loader_install",family);
     if(!r.ok)return say("loader install failed: "+(r.error||""));
-    say((r.config_app?(r.config_app+" installed"):("loader staged at "+(r.staged||"")))+(r.version?" ("+r.version+")":""));
+    say((r.injected?"loader injected - ":"loader staged at ")+
+        (r.dylib||r.staged||"")+(r.version?" ("+r.version+")":""));
     if(r.next)say(r.next);
   }catch(e){say("loader install failed: "+e)}
   await ldRefresh();
@@ -1644,16 +1927,28 @@ async function doProbe(){
   busy(false);
 }
 async function doGrant(){
-  const id=$("#appid").value.trim();
-  if(!/^\d+$/.test(id))return say("appid must be numeric");
-  busy(true);say("granting "+id+"...");
+  let id=$("#appid").value.trim();
+  busy(true);
   try{
-    const r=await call("grant",id,$("#branch").value||"public",$("#os").value,$("#pin").checked);
-    if(!r.ok)return say("grant failed: "+(r.error||""));
-    say(`installed ${r.dest} - ${r.depots} depots - restart steam to load`);
+    if(!/^\d+$/.test(id)){
+      const term=id||$("#q").value.trim();
+      if(!term){say("type a game name or appid first");return}
+      say("searching "+term+"...");
+      const hits=await call("search",term);
+      if(!hits||!hits.length){say("no match for "+term);return}
+      id=hits[0].appid;
+      $("#appid").value=id;
+      say("picked "+hits[0].name+" ("+id+")");
+    }
+    say("fetching "+id+" - loader check, license, library...");
+    const r=await call("unlock",id,$("#branch").value||"public",$("#os").value);
+    if(!r.ok){say("fetch failed at "+r.stage+": "+(r.error||""));return}
+    say(id+" unlocked - "+r.steps.length+" steps ok - steam restarting");
+    if(r.hint)say(r.hint);
     await refreshInstalled();
-  }catch(e){say("grant failed: "+e)}
-  busy(false);
+    await ldRefresh();
+  }catch(e){say("fetch failed: "+e)}
+  finally{busy(false)}
 }
 $("#b-search").onclick=doSearch;
 $("#q").onkeydown=e=>{if(e.key==="Enter")doSearch()};

@@ -8,14 +8,16 @@ A Steam license kit for macOS: probe public appinfo, generate `stplug-in` lua (`
 
 ## بالعربي
 
-### الشغلة بتشتغل هيك — كل شيء من داخل البرنامج، بدون terminal
+### الشغلة بتشتغل هيك — زر واحد، كل شيء جوّه البرنامج
 
-1. افتح **LicenseTools** — تبويب **Loader** → اضغط **Install macSteam Loader** (بينزّل تلقائي ويحطه بـ Applications).
-2. افتح **macSteam Config** → اضغط **Install** → وافق على الإذن → اقفل ستيم.
-3. تبويب **Grant** → اكتب الـ appid أو اضغط Search واختار → **Grant** → **Restart Steam** → اللعبة بالمكتبكة.
-4. بدك ملفات اللعبة نفسها؟ حط اسم حسابك وكلمة السر وتبويب Grant → **Fetch Content** — بينزل على ~/.licensetools/games/.
+1. افتح **LicenseTools** واكتب اسم اللعبة أو الـ appid.
+2. اضغط **Fetch → Library**.
+3. البرنامج بيعمل كل شي لحاله: بيفحص الـ loader، وإذا مش منصّب بينصّبه من الـ payload المخزّن جوّاه (بدون تحميل ولا برنامج خارجي)، بيجيب الديبوتات، بيكتب الـ lua + إعدادات macSteam، وبيعيد تشغيل ستيم.
+4. اللعبة بتظهر بالمكتبة. خلص.
 
-> مجلد `stplug-in` لحاله ما بيعمل شي على ستيم نظيف — لازم يكون في loader شغّال (macSteam او SteamTools). كل الأزرار فوق من داخل البرنامج.
+> بدك ملفات اللعبة نفسها؟ حط اسم حسابك وكلمة السر واضغط **Fetch Content** — بينزل على `~/.licensetools/games/`.
+> تبويب **Loader** فيه نفس الأزرار يدوياً لو احتجت تعيد التنصيب.
+> الـ loader (macSteam dylib + signatures) متحمّل جوّه التطبيق وقت البناء — ما بتنزّل ولا برنامج تاني.
 
 ### أوامر
 
@@ -35,12 +37,16 @@ A Steam license kit for macOS: probe public appinfo, generate `stplug-in` lua (`
 
 ## English
 
-### Flow — everything is a button in the app, no terminal needed
+### Flow — one button, everything inside the app
 
-1. Open **LicenseTools** → **Loader** tab → **Install macSteam Loader** (auto-downloads the current fork, stages it into Applications).
-2. Open **macSteam Config** → press **Install** → approve the permission prompt → quit Steam.
-3. **Grant** tab → type the appid or hit Search → **Grant** → **Restart Steam** → game shows as owned.
-4. Want the actual game files too? Fill your Steam user/pass on the Grant tab → **Fetch Content** — downloads into `~/.licensetools/games/`.
+1. Open **LicenseTools** and type the game name or appid.
+2. Press **Fetch → Library**.
+3. The app does the rest by itself: checks the loader, injects it from the payload bundled inside the app (no downloads, no external program), probes depots, writes the lua + macSteam config, and restarts Steam.
+4. The game shows up in your library. Done.
+
+Want the actual game files too? Fill your Steam user/pass → **Fetch Content** — downloads into `~/.licensetools/games/`.
+The **Loader** tab keeps the same actions manually if you ever need to re-inject.
+The loader payload (macSteam dylib + signatures) is vendored into the app at build time — nothing to install on your side.
 
 The `stplug-in` folder alone does nothing on a stock client — a loader (macSteam or SteamTools) is required. Every step above is a button; the CLI commands below are the same engine for power users.
 

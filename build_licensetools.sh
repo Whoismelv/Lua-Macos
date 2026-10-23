@@ -36,6 +36,44 @@ unzip -q -o /tmp/dd-lic.zip -d vendor/dd
 find vendor/dd -type f -name 'DepotDownloader*' -exec chmod +x {} \;
 test -x vendor/dd/DepotDownloader || { echo "vendor: DepotDownloader missing" >&2; exit 1; }
 
+echo "== vendor: macSteam loader =="
+rm -rf vendor/macsteam && mkdir -p vendor/macsteam
+MS_URL="$(python3 - <<'PY'
+import json, urllib.request
+req = urllib.request.Request(
+    "https://api.github.com/repos/crghofficial/macsteam/releases/latest",
+    headers={"Accept": "application/vnd.github+json", "User-Agent": "licensetools"})
+d = json.load(urllib.request.urlopen(req, timeout=30))
+a = [x for x in d.get("assets", []) if x["name"].lower().endswith((".dmg", ".zip"))]
+print(a[0]["browser_download_url"] if a else "")
+PY
+)"
+if [ -n "$MS_URL" ]; then
+  MS_TMP=/tmp/macsteam-lic.${MS_URL##*.}
+  curl -fsSL --retry 3 -o "$MS_TMP" "$MS_URL" || true
+  if [ -s "$MS_TMP" ]; then
+    MS_MNT="$(mktemp -d /tmp/msmnt.XXXXXX)"
+    case "$MS_TMP" in
+      *.dmg) hdiutil attach -nobrowse -readonly -mountpoint "$MS_MNT" "$MS_TMP" >/dev/null ;;
+      *.zip) unzip -q -o "$MS_TMP" -d "$MS_MNT" ;;
+    esac
+    MS_DYLIB="$(find "$MS_MNT" -name 'macsteam.dylib' -type f | head -n1 || true)"
+    MS_SIG="$(find "$MS_MNT" -type d -name signatures | head -n1 || true)"
+    if [ -n "$MS_DYLIB" ]; then
+      cp "$MS_DYLIB" vendor/macsteam/macsteam.dylib
+      if [ -n "$MS_SIG" ]; then
+        mkdir -p vendor/macsteam/signatures
+        cp -R "$MS_SIG"/. vendor/macsteam/signatures/
+      fi
+      echo "vendored: $(basename "$MS_DYLIB") + $(find vendor/macsteam/signatures -name '*.json' | wc -l | tr -d ' ') signature files"
+    else
+      echo "vendor: macsteam.dylib not found in payload (network fallback stays active)"
+    fi
+    hdiutil detach "$MS_MNT" -quiet 2>/dev/null || true
+    rm -rf "$MS_MNT" "$MS_TMP"
+  fi
+fi
+
 echo "== offline selftest =="
 python licensetools_mac.py --selftest
 
@@ -49,6 +87,7 @@ pyinstaller \
   --icon icon.icns \
   --add-data "licensetools_mac.py:." \
   --add-data "vendor/dd:vendor/dd" \
+  --add-data "vendor/macsteam:vendor/macsteam" \
   --collect-data certifi \
   --hidden-import webview.platforms.cocoa \
   --collect-submodules webview \
