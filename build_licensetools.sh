@@ -38,41 +38,50 @@ test -x vendor/dd/DepotDownloader || { echo "vendor: DepotDownloader missing" >&
 
 echo "== vendor: macSteam loader =="
 rm -rf vendor/macsteam && mkdir -p vendor/macsteam
-MS_URL="$(python3 - <<'PY'
-import json, urllib.request
-req = urllib.request.Request(
-    "https://api.github.com/repos/crghofficial/macsteam/releases/latest",
-    headers={"Accept": "application/vnd.github+json", "User-Agent": "licensetools"})
-d = json.load(urllib.request.urlopen(req, timeout=30))
+set +e
+MS_JSON="$(curl -fsSL --retry 3 --max-time 60 \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'User-Agent: licensetools' \
+  https://api.github.com/repos/crghofficial/macsteam/releases/latest 2>/dev/null)"
+MS_URL="$(printf '%s' "$MS_JSON" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
 a = [x for x in d.get("assets", []) if x["name"].lower().endswith((".dmg", ".zip"))]
 print(a[0]["browser_download_url"] if a else "")
-PY
-)"
+' 2>/dev/null)"
 if [ -n "$MS_URL" ]; then
-  MS_TMP=/tmp/macsteam-lic.${MS_URL##*.}
-  curl -fsSL --retry 3 -o "$MS_TMP" "$MS_URL" || true
+  MS_TMP="/tmp/macsteam-lic.${MS_URL##*.}"
+  curl -fsSL --retry 3 --max-time 300 -o "$MS_TMP" "$MS_URL" || true
   if [ -s "$MS_TMP" ]; then
     MS_MNT="$(mktemp -d /tmp/msmnt.XXXXXX)"
     case "$MS_TMP" in
-      *.dmg) hdiutil attach -nobrowse -readonly -mountpoint "$MS_MNT" "$MS_TMP" >/dev/null ;;
-      *.zip) unzip -q -o "$MS_TMP" -d "$MS_MNT" ;;
+      *.dmg) hdiutil attach -nobrowse -readonly -mountpoint "$MS_MNT" "$MS_TMP" >/dev/null 2>&1 || true ;;
+      *.zip) unzip -q -o "$MS_TMP" -d "$MS_MNT" >/dev/null 2>&1 || true ;;
     esac
-    MS_DYLIB="$(find "$MS_MNT" -name 'macsteam.dylib' -type f | head -n1 || true)"
-    MS_SIG="$(find "$MS_MNT" -type d -name signatures | head -n1 || true)"
+    MS_DYLIB="$(find "$MS_MNT" -name 'macsteam.dylib' -type f 2>/dev/null | head -n1)"
+    MS_SIG="$(find "$MS_MNT" -type d -name signatures 2>/dev/null | head -n1)"
     if [ -n "$MS_DYLIB" ]; then
       cp "$MS_DYLIB" vendor/macsteam/macsteam.dylib
       if [ -n "$MS_SIG" ]; then
         mkdir -p vendor/macsteam/signatures
         cp -R "$MS_SIG"/. vendor/macsteam/signatures/
       fi
-      echo "vendored: $(basename "$MS_DYLIB") + $(find vendor/macsteam/signatures -name '*.json' | wc -l | tr -d ' ') signature files"
+      echo "vendored: macsteam.dylib + $(find vendor/macsteam/signatures -name '*.json' 2>/dev/null | wc -l | tr -d ' ') signature files"
     else
-      echo "vendor: macsteam.dylib not found in payload (network fallback stays active)"
+      echo "vendor: payload had no macsteam.dylib (runtime network fallback stays active)"
     fi
-    hdiutil detach "$MS_MNT" -quiet 2>/dev/null || true
+    hdiutil detach "$MS_MNT" -quiet >/dev/null 2>&1 || true
     rm -rf "$MS_MNT" "$MS_TMP"
+  else
+    echo "vendor: download failed (runtime network fallback stays active)"
   fi
+else
+  echo "vendor: release lookup failed (runtime network fallback stays active)"
 fi
+set -e
 
 echo "== offline selftest =="
 python licensetools_mac.py --selftest
