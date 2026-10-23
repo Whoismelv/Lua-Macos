@@ -1,0 +1,47 @@
+name: mac-smoke
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: engine surface
+        run: |
+          set -e
+          python3 luatools_mac.py --help
+          python3 luatools_mac.py detect
+          python3 luatools_mac.py status
+          python3 luatools_mac.py library || true
+      - name: gui imports
+        run: |
+          python3 - <<'PY'
+          import importlib.util, sys
+          spec = importlib.util.spec_from_file_location("g", "luatools_mac_gui.py")
+          m = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)
+          print("gui module ok, engine:", m.lt.__name__)
+          PY
+      - name: install DepotDownloader
+        run: |
+          python3 luatools_mac.py install-dd | tee /tmp/dd.json
+          test -x "$HOME/.luatools-mac/tools/DepotDownloader"
+          "$HOME/.luatools-mac/tools/DepotDownloader" || true
+      - name: probe a real app with a mac build
+        run: |
+          brew install --cask steamcmd
+          python3 luatools_mac.py probe 620 --out /tmp/depots.csv | tee /tmp/probe.json
+          grep -q '"os": "mac"' /tmp/probe.json
+          grep -q ',mac,' /tmp/depots.csv
+      - name: fetch a real depot
+        run: |
+          python3 luatools_mac.py fetch-game 480 auto --out /tmp/games | tee /tmp/fetch.json
+          find /tmp/games -type f | head -20
+          test -n "$(find /tmp/games -type f -name '*.vdf')"
