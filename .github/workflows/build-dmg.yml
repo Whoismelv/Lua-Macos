@@ -15,7 +15,13 @@ jobs:
           python-version: "3.12"
       - name: build app + dmg
         run: bash build_macos.sh
+      - name: build licensetools dmg
+        run: bash build_licensetools.sh
       - uses: actions/upload-artifact@v4
         with:
           name: LuaToolsMac-dmg
           path: dist/LuaToolsMac.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LicenseTools-dmg
+          path: dist/LicenseTools.dmg

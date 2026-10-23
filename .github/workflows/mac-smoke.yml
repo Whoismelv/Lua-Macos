@@ -47,6 +47,11 @@ jobs:
               assert app["depots"]["623"]["config"] == "oslist macos", label
           print("vdf parser ok")
           PY
+      - name: licensetools selftest
+        run: |
+          python3 -m py_compile licensetools_mac.py
+          python3 licensetools_mac.py --selftest
+          python3 licensetools_mac.py loader status
       - name: diagnostics
         run: |
           set -o pipefail

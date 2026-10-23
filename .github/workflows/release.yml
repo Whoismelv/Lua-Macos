@@ -18,9 +18,13 @@ jobs:
           python-version: "3.12"
       - name: build app + dmg
         run: bash build_macos.sh
+      - name: build licensetools dmg
+        run: bash build_licensetools.sh
       - name: publish
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/LuaToolsMac.dmg
+          files: |
+            dist/LuaToolsMac.dmg
+            dist/LicenseTools.dmg
           generate_release_notes: true
           name: LuaTools Mac ${{ github.ref_name }}
