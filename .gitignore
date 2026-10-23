@@ -1,0 +1,9 @@
+.build/
+build/
+dist/
+.build-venv/
+__pycache__/
+*.pyc
+.DS_Store
+.swiftpm/
+xcuserdata/
