@@ -33,6 +33,8 @@ jobs:
           echo "== csv =="; cat /tmp/depots.csv 2>/dev/null
           echo "== fetch 480 =="; python3 luatools_mac.py fetch-game 480 auto --out /tmp/games; echo "fetch_exit=$?"
           echo "== files =="; find /tmp/games -type f 2>/dev/null | head -20
+          echo "== gui import =="; python3 -c "import importlib.util as u; s=u.spec_from_file_location('g','luatools_mac_gui.py'); m=u.module_from_spec(s); s.loader.exec_module(m); print('gui ok')"
+          echo "== gui window =="; python3 luatools_mac_gui.py --selftest; echo "gui_exit=$?"
           echo "== done =="
           test -n "$(find /tmp/games -type f 2>/dev/null | head -1)"
       - name: publish log
