@@ -1589,6 +1589,38 @@ def _oslist_matches(oslist, target):
     parts = re.split(r"[\s,]+", str(oslist).lower())
     return any(a in parts for a in aliases)
 
+def _find_app_node(tree, appid, depth=0):
+    if not isinstance(tree, dict) or depth > 4:
+        return None
+    if isinstance(tree.get("depots"), dict) and ("appid" in tree or "common" in tree):
+        return tree
+    node = tree.get(str(appid))
+    if isinstance(node, dict) and isinstance(node.get("depots"), dict):
+        return node
+    for value in tree.values():
+        if isinstance(value, dict):
+            found = _find_app_node(value, appid, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+def _extract_appinfo(out, appid):
+    """steamcmd can print its banner, restart itself, or truncate the head of the
+    appinfo block; try every occurrence of the app key, newest first."""
+    pattern = re.compile(r'(?m)^[ \t]*"%s"[ \t]*\r?$' % re.escape(str(appid)))
+    starts = [m.start() for m in pattern.finditer(out)]
+    if not starts:
+        starts = [m.start() for m in re.finditer(r'"%s"\s*\{' % re.escape(str(appid)), out)]
+    for start in reversed(starts):
+        tree = vdf_parse(out[start:])
+        app = tree.get(str(appid))
+        if isinstance(app, dict) and isinstance(app.get("depots"), dict):
+            return app
+    quote = out.find('"')
+    if quote < 0:
+        return None
+    return _find_app_node(vdf_parse(out[quote:]), appid)
+
 def probe_app(appid, steamcmd=None):
     tool = steamcmd or _find_tool("steamcmd") or shutil.which("steamcmd")
     if not tool:
@@ -1601,13 +1633,10 @@ def probe_app(appid, steamcmd=None):
     except Exception as e:
         return {"ok": False, "error": str(e)}
     out = (pr.stdout or "") + "\n" + (pr.stderr or "")
-    start = out.find('"')
-    if start < 0:
+    if '"' not in out:
         return {"ok": False, "error": "empty steamcmd output", "tail": out[-400:]}
-    tree = vdf_parse(out[start:])
-    app = tree.get(str(appid)) or next((v for k, v in tree.items()
-                                        if isinstance(v, dict) and "depots" in v), None)
-    if not isinstance(app, dict) or "depots" not in app:
+    app = _extract_appinfo(out, appid)
+    if not isinstance(app, dict) or not isinstance(app.get("depots"), dict):
         return {"ok": False, "error": "appinfo has no depots section (app may be delisted)",
                 "tail": out[-400:]}
     rows, seen = [], set()
