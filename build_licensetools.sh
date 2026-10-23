@@ -121,6 +121,10 @@ echo "== selftest (frozen) =="
 echo "== ad-hoc sign =="
 codesign --force --deep --sign - "$APP" || echo "codesign skipped"
 
+echo "== prune build dirs =="
+rm -rf build-lic .build-venv
+df -h / | tail -1
+
 echo "== dmg =="
 rm -rf dmg-stage-lic && mkdir dmg-stage-lic
 cp -R "$APP" dmg-stage-lic/

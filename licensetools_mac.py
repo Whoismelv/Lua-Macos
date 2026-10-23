@@ -164,7 +164,11 @@ class SteamCtx:
         if r is None:
             return None
         if sys.platform == "darwin":
-            return Path("/Applications/Steam.app/Contents/MacOS/steam")
+            macos = Path("/Applications/Steam.app/Contents/MacOS")
+            for name in ("steam_osx", "steam"):
+                if (macos / name).exists():
+                    return macos / name
+            return macos / "steam_osx"
         return r / "steam.exe"
 
     def valid(self):
@@ -984,6 +988,10 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
             progress(f"depot {r['depot']} - manifest {r['manifest']} - downloading...")
         args = [str(tool), "-app", str(appid), "-depot", r["depot"],
                 "-manifest", r["manifest"], "-dir", str(outroot / r["depot"])]
+        if user and password:
+            args += ["-username", user, "-password", password]
+        else:
+            args += ["-anonymous"]
         if extra:
             args += list(extra)
         try:
@@ -1113,6 +1121,13 @@ def macsteam_inject(dylib_src, sig_roots):
         return {"ok": False, "error": "Steam.app layout unexpected (steam_osx missing)"}
     subprocess.run(["pkill", "-f", "steam_osx"], capture_output=True)
     target = steam_app / "Contents" / "MacOS" / "macsteam.dylib"
+    probe = steam_app / "Contents" / "MacOS" / ".licensetools-write-probe"
+    try:
+        probe.write_bytes(b"")
+        probe.unlink()
+    except Exception as exc:
+        return {"ok": False, "error": f"Steam.app is not writable: {exc}",
+                "hint": "run once as an admin user, or fix ownership of /Applications/Steam.app"}
     try:
         if target.exists():
             target.unlink()
@@ -1120,6 +1135,9 @@ def macsteam_inject(dylib_src, sig_roots):
     except Exception as exc:
         return {"ok": False, "error": f"copy payload failed: {exc}",
                 "hint": "Steam.app may need admin rights - move it to /Applications or chown it"}
+    subprocess.run(["xattr", "-cr", str(target)], capture_output=True)
+    subprocess.run(["xattr", "-d", "com.apple.quarantine", str(target)],
+                   capture_output=True)
     cfg = Path.home() / "Library" / "Application Support" / "macsteam"
     cfg.mkdir(parents=True, exist_ok=True)
     sig_dest = cfg / "signatures"
@@ -1127,26 +1145,39 @@ def macsteam_inject(dylib_src, sig_roots):
     if sig_roots:
         if sig_dest.exists():
             shutil.rmtree(sig_dest)
-        sig_dest.mkdir(parents=True, exist_ok=True)
+        arch_dest = sig_dest / "macos.arm64"
+        arch_dest.mkdir(parents=True, exist_ok=True)
         for root in sig_roots:
             root = Path(root)
             if not root.is_dir():
                 continue
             for src in root.rglob("*.json"):
-                dst = sig_dest / src.name
                 try:
-                    shutil.copy2(src, dst)
+                    shutil.copy2(src, arch_dest / src.name)
                     copied += 1
                 except Exception:
                     pass
-    val = str(target)
+    if not copied:
+        return {"ok": False, "error": "no signature json found - cannot resolve hooks",
+                "hint": "signatures/macos.arm64/*.json must exist"}
+    cur = None
+    pr_cur = _plistbuddy(["-c", "Print :LSEnvironment:DYLD_INSERT_LIBRARIES"], plist)
+    if pr_cur is not None and pr_cur.returncode == 0:
+        cur = (pr_cur.stdout or "").strip() or None
+    existing = [p for p in (cur or "").split(":")
+                if p and p != str(target) and Path(p).exists()]
+    val = ":".join([str(target)] + existing)
     pr = _plistbuddy(["-c", f"Set :LSEnvironment:DYLD_INSERT_LIBRARIES {val}"], plist)
     if pr is None or pr.returncode != 0:
+        _plistbuddy(["-c", "Add :LSEnvironment dict"], plist)
         pr = _plistbuddy(["-c",
                           f"Add :LSEnvironment:DYLD_INSERT_LIBRARIES string {val}"], plist)
         if pr is None or pr.returncode != 0:
-            return {"ok": False, "error": "Info.plist patch failed",
-                    "detail": (pr.stderr if pr else "")[:300]}
+            pr = _plistbuddy(["-c", f"Set :LSEnvironment:DYLD_INSERT_LIBRARIES {val}"],
+                             plist)
+            if pr is None or pr.returncode != 0:
+                return {"ok": False, "error": "Info.plist patch failed",
+                        "detail": (pr.stderr if pr else "")[:300]}
     for u in (target, exe, steam_app):
         subprocess.run(["codesign", "-f", "-s", "-", str(u)], capture_output=True)
     body = "BootStrapperInhibitUpdateOnLaunch=enable\n"
@@ -1320,6 +1351,7 @@ def loader_install_macsteam():
             continue
         dest = TOOLS_DIR / "loader" / "macsteam"
         dest.mkdir(parents=True, exist_ok=True)
+        archive_name = bundles[0]["name"] if bundles else raw_dylibs[0]["name"]
         if bundles:
             asset = bundles[0]
             archive = dest / asset["name"]
@@ -1346,7 +1378,7 @@ def loader_install_macsteam():
             found = sorted(dest.rglob("*.dylib"))
             dylib = found[0] if found else None
         if dylib is None:
-            tried.append(f"{repo}: no macsteam.dylib inside {asset['name']}")
+            tried.append(f"{repo}: no macsteam.dylib inside {archive_name}")
             continue
         sig_roots = [p for p in dest.rglob("signatures") if p.is_dir()]
         fresh = _fetch_repo_signatures(repo, dest / "signatures" / "macos.arm64")
@@ -1629,6 +1661,23 @@ class Api:
                             "error": inst.get("error"), "steps": steps}
             else:
                 steps.append({"step": "loader", "ok": True, "note": "already injected"})
+            cfg = macsteam_config_add(int(aid))
+            steps.append({"step": "config", **cfg})
+            if not cfg.get("ok"):
+                return {"ok": False, "stage": "config", "error": cfg.get("error"),
+                        "steps": steps}
+            LOGS.add(f"app {aid} added to the loader config")
+            LOGS.add("steam restarting - game will show in your library")
+            restart_steam()
+            steps.append({"step": "restart", "ok": True})
+            ctx = SteamCtx()
+            if ctx.plugin_dir() is not None and ctx.plugin_dir().is_dir():
+                extra = self.grant(aid, branch, want_os, True)
+                steps.append({"step": "grant", "ok": extra.get("ok"),
+                              "dest": extra.get("dest"), "depots": extra.get("depots"),
+                              "error": extra.get("error")})
+            return {"ok": True, "appid": aid, "steps": steps,
+                    "hint": "game should appear in your library now"}
         res = self.grant(aid, branch, want_os, True)
         steps.append({"step": "grant", "ok": res.get("ok"),
                       "dest": res.get("dest"), "depots": res.get("depots"),
@@ -1636,8 +1685,6 @@ class Api:
         if not res.get("ok"):
             return {"ok": False, "stage": "grant", "error": res.get("error"),
                     "steps": steps}
-        cfg = macsteam_config_add(int(aid))
-        steps.append({"step": "config", **cfg})
         LOGS.add("steam restarting - game will show in your library")
         restart_steam()
         steps.append({"step": "restart", "ok": True})

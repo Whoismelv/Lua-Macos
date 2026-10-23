@@ -15,6 +15,10 @@ jobs:
           python-version: "3.12"
       - name: build app + dmg
         run: bash build_macos.sh
+      - name: prune disk
+        run: |
+          rm -rf build dmg-stage* dist/*.app build-lic .build-venv "$HOME/.cache/pip"
+          df -h /
       - name: build licensetools dmg
         run: bash build_licensetools.sh
       - uses: actions/upload-artifact@v4

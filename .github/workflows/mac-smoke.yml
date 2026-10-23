@@ -52,6 +52,14 @@ jobs:
           python3 -m py_compile licensetools_mac.py
           python3 licensetools_mac.py --selftest
           python3 licensetools_mac.py loader status
+      - name: licensetools fetch smoke
+        run: |
+          set -o pipefail
+          python3 licensetools_mac.py probe 480 --os mac --csv /tmp/lic-depots.csv || echo "probe returned non-zero"
+          cat /tmp/lic-depots.csv 2>/dev/null || echo "no csv"
+          python3 licensetools_mac.py fetch 480 --os mac --out /tmp/lic-games
+          find /tmp/lic-games -type f | head -20
+          test -n "$(find /tmp/lic-games -type f | head -1)"
       - name: macsteam injector smoke
         run: |
           python3 - <<'PY'
@@ -75,12 +83,18 @@ jobs:
           dylib = tmp / "macsteam.dylib"
           subprocess.run(["clang", "-dynamiclib", "-o", str(dylib), "-x", "c", "-"],
                          input=b"int macsteam_probe(void){return 1;}\n", check=True)
-          res = lt.macsteam_inject(dylib, [])
+          sigs = tmp / "signatures" / "macos.arm64"
+          sigs.mkdir(parents=True)
+          (sigs / "1.json").write_text('{"schema_version":1,"profile_version":1,"steam_build":1,"signatures":[]}')
+          res = lt.macsteam_inject(dylib, [tmp / "signatures"])
           print("inject:", res)
           assert res.get("ok"), res
           st = lt.macsteam_status()
           print("status:", st)
           assert st["injected"], st
+          sig_dir = Path.home() / "Library/Application Support/macsteam/signatures/macos.arm64"
+          assert sig_dir.is_dir() and list(sig_dir.glob("*.json")), "signature dir missing"
+          print("signatures deployed:", [p.name for p in sig_dir.glob("*.json")])
           cfg = lt.macsteam_config_add(480)
           print("config:", cfg)
           assert cfg.get("ok"), cfg
