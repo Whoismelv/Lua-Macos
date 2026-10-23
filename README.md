@@ -40,11 +40,22 @@ xattr -dr com.apple.quarantine "/Applications/LuaTools Mac.app"
 No Mac at hand? `.github/workflows/build-dmg.yml` builds the DMG on a macOS runner and uploads it as an artifact;
 `release.yml` attaches it to a tag.
 
-## one-time tools
+## tools (automatic)
+
+Nothing to install by hand:
+
+- **DepotDownloader** ships inside the `.app` (`Contents/Resources/vendor/dd`) and is copied to
+  `~/.luatools-mac/tools/dd/` on first launch.
+- **SteamCMD** is downloaded from Valve (`steamcmd_osx.tar.gz`) into `~/.luatools-mac/tools/steamcmd/`
+  the first time `probe` needs it. No Homebrew, no casks.
+- HTTPS uses the bundled `certifi` CA store, then the macOS system store. A verify failure retries
+  once with an unverified context instead of dying.
+
+Manual overrides if you want them:
 
 ```bash
-python3 luatools_mac.py install-dd     # DepotDownloader binary for this arch (no dotnet needed)
-brew install --cask steamcmd           # optional: auto-detect depots/manifests
+python3 luatools_mac.py install-dd
+python3 luatools_mac.py install-steamcmd
 ```
 
 ## the pipeline

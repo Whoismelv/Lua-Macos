@@ -18,7 +18,21 @@ echo "== venv =="
 # shellcheck disable=SC1091
 source .build-venv/bin/activate
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet pyinstaller "pywebview>=5.0"
+python -m pip install --quiet pyinstaller "pywebview>=5.0" certifi
+
+echo "== vendor: DepotDownloader =="
+ARCH="$(uname -m)"
+if [ "$ARCH" = "arm64" ]; then
+  DD_ASSET="DepotDownloader-macos-arm64.zip"
+else
+  DD_ASSET="DepotDownloader-macos-x64.zip"
+fi
+rm -rf vendor/dd && mkdir -p vendor/dd
+curl -fsSL --retry 3 -o /tmp/dd.zip \
+  "https://github.com/SteamRE/DepotDownloader/releases/latest/download/$DD_ASSET"
+unzip -q -o /tmp/dd.zip -d vendor/dd
+find vendor/dd -type f -name 'DepotDownloader*' -exec chmod +x {} \;
+test -x vendor/dd/DepotDownloader || { echo "vendor: DepotDownloader missing" >&2; exit 1; }
 
 echo "== clean =="
 rm -rf build dist "$BUNDLE.spec"
@@ -31,6 +45,8 @@ pyinstaller \
   --add-data "luatools_mac.py:." \
   --add-data "luatools_mac_gui.py:." \
   --add-data "ui:ui" \
+  --add-data "vendor/dd:vendor/dd" \
+  --collect-data certifi \
   --hidden-import webview.platforms.cocoa \
   --collect-submodules webview \
   --osx-bundle-identifier "com.luatools.mac" \
@@ -44,6 +60,11 @@ fi
 
 if [ ! -f "$APP/Contents/Resources/ui/index.html" ]; then
   echo "build failed: ui/index.html missing from the bundle" >&2
+  exit 1
+fi
+
+if [ ! -x "$APP/Contents/Resources/vendor/dd/DepotDownloader" ]; then
+  echo "build failed: bundled DepotDownloader missing" >&2
   exit 1
 fi
 

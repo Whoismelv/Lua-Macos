@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # language: python3.9+, file: luatools_mac.py, runtime: stdlib only
 # reversed from LuaTools 1.3.2 IL (LuaTools.dll) and ported to macOS paths first, Windows fallback kept.
-import argparse, base64, itertools, json, os, re, shutil, socket, struct, subprocess, sys, tempfile, threading, time, urllib.parse, urllib.request, uuid, webbrowser, zipfile
+import argparse, base64, itertools, json, os, re, shutil, socket, ssl, struct, subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.parse, urllib.request, uuid, webbrowser, zipfile
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -534,9 +534,34 @@ def uninstall_lua(appid):
 
 # ---------- remote api ----------
 
+def _ssl_context():
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    for p in ("/etc/ssl/cert.pem", "/private/etc/ssl/cert.pem",
+              "/opt/homebrew/etc/openssl@3/cert.pem",
+              "/usr/local/etc/openssl@3/cert.pem"):
+        if Path(p).is_file():
+            try:
+                return ssl.create_default_context(cafile=p)
+            except Exception:
+                pass
+    return ssl.create_default_context()
+
+def _urlopen(req, timeout):
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=_ssl_context())
+    except urllib.error.URLError as exc:
+        if "CERTIFICATE_VERIFY_FAILED" not in str(exc):
+            raise
+        return urllib.request.urlopen(req, timeout=timeout,
+                                      context=ssl._create_unverified_context())
+
 def http_get(url, headers=None, timeout=30):
     req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _urlopen(req, timeout) as r:
         return r.read(), r.status
 
 def api_download_manifest(appid, source=None):
@@ -554,7 +579,7 @@ def check_sources(appid):
     req = urllib.request.Request(CHECK_APIS_URL + str(appid),
                                  headers={"User-Agent": UA_BACKEND_CHECK})
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with _urlopen(req, 10) as r:
             return json.loads(r.read() or "{}")
     except Exception:
         return {}
@@ -1272,13 +1297,39 @@ def fetch_plugin(token=""):
 
 TOOLS_DIR = ST_CACHE_DIR / "tools"
 
+def _bundle_roots():
+    here = Path(__file__).resolve().parent
+    roots = [here, here.parent / "Resources", here.parent / "Frameworks",
+             Path.cwd()]
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        roots.insert(0, Path(base))
+    try:
+        exe = Path(sys.executable).resolve()
+        roots += [exe.parent, exe.parent.parent / "Resources"]
+    except Exception:
+        pass
+    return roots
+
+def _bundled_tool(name):
+    for root in _bundle_roots():
+        for rel in (Path("vendor") / "dd" / name, Path("vendor") / name, Path(name)):
+            p = root / rel
+            if p.is_file():
+                return p
+    return None
+
 def _find_tool(name):
     env = os.environ.get(name.upper() + "_PATH", "")
     if env and Path(env).is_file():
         return Path(env)
-    p = TOOLS_DIR / name
-    if p.is_file():
-        return p
+    for rel in (name, f"dd/{name}", f"steamcmd/{name}", f"steamcmd/{name}.sh"):
+        p = TOOLS_DIR / rel
+        if p.is_file():
+            return p
+    bundled = _bundled_tool(name)
+    if bundled:
+        return bundled
     return shutil.which(name)
 
 def run_depotdownloader(lua_file, token="", extra=None):
@@ -1624,7 +1675,11 @@ def _extract_appinfo(out, appid):
 def probe_app(appid, steamcmd=None):
     tool = steamcmd or _find_tool("steamcmd") or shutil.which("steamcmd")
     if not tool:
-        return {"ok": False, "error": "steamcmd not found — brew install --cask steamcmd"}
+        installed = install_steamcmd()
+        tool = installed.get("tool") if installed.get("ok") else None
+    if not tool:
+        return {"ok": False,
+                "error": "steamcmd unavailable and the automatic download failed - check the network"}
     args = [str(tool), "+@ShutdownOnFailedCommand", "1", "+@NoPromptForPassword", "1",
             "+login", "anonymous", "+app_info_print", str(appid), "+quit"]
     try:
@@ -1677,6 +1732,18 @@ def dd_asset_name():
     return "DepotDownloader-windows-arm64.zip" if arm else "DepotDownloader-windows-x64.zip"
 
 def install_depotdownloader(token=""):
+    bundled = _bundled_tool("DepotDownloader") or _bundled_tool("DepotDownloader.exe")
+    if bundled:
+        dest = TOOLS_DIR / "dd"
+        dest.mkdir(parents=True, exist_ok=True)
+        target = dest / bundled.name
+        try:
+            shutil.copy2(bundled, target)
+            if os.name != "nt":
+                os.chmod(target, 0o755)
+            return {"ok": True, "tool": str(target), "source": "bundled"}
+        except Exception:
+            pass
     want = dd_asset_name()
     asset, err = gh_latest_asset("SteamRE/DepotDownloader", lambda n: n == want, token)
     if asset is None:
@@ -1707,6 +1774,50 @@ def install_depotdownloader(token=""):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# ---------- steamcmd auto-provision (Valve tarball, no brew) ----------
+
+STEAMCMD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz"
+
+def install_steamcmd():
+    dest = TOOLS_DIR / "steamcmd"
+    dest.mkdir(parents=True, exist_ok=True)
+    tgz = TOOLS_DIR / "steamcmd_osx.tar.gz"
+    try:
+        data, _ = http_get(STEAMCMD_URL, timeout=600,
+                           headers={"User-Agent": "luatools-mac"})
+        tgz.write_bytes(data)
+        with tarfile.open(tgz, "r:gz") as t:
+            try:
+                t.extractall(dest, filter="data")
+            except TypeError:
+                t.extractall(dest)
+        tgz.unlink(missing_ok=True)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    cands = [p for p in dest.rglob("steamcmd.sh") if p.is_file()]
+    if not cands:
+        cands = [p for p in dest.rglob("steamcmd") if p.is_file()]
+    if not cands:
+        return {"ok": False, "error": "steamcmd binary missing from archive", "dir": str(dest)}
+    exe = sorted(cands, key=lambda p: (p.name != "steamcmd.sh", len(p.parts)))[0]
+    for p in dest.rglob("*"):
+        if p.is_file():
+            try:
+                os.chmod(p, 0o755)
+            except OSError:
+                pass
+    return {"ok": True, "tool": str(exe), "source": "valve", "bytes": len(data)}
+
+def ensure_tools():
+    out = {}
+    try:
+        out["dd"] = install_depotdownloader(load_settings().get("auth_token", ""))
+    except Exception as e:
+        out["dd"] = {"ok": False, "error": str(e)}
+    sc = _find_tool("steamcmd")
+    out["steamcmd"] = {"ok": bool(sc), "tool": str(sc) if sc else None}
+    return out
+
 # ---------- native mac game fetch (DepotDownloader orchestrator) ----------
 
 def _dd_tool():
@@ -1723,6 +1834,9 @@ def _dd_tool():
 def cmd_install_dd(_a):
     print(json.dumps(install_depotdownloader(load_settings().get("auth_token", "")),
                      indent=2, ensure_ascii=False))
+
+def cmd_install_steamcmd(_a):
+    print(json.dumps(install_steamcmd(), indent=2, ensure_ascii=False))
 
 def cmd_probe(a):
     res = probe_app(a.appid)
@@ -1859,6 +1973,7 @@ def main():
     p = sub.add_parser("probe"); p.add_argument("appid"); p.add_argument("--out", default="")
     p.set_defaults(fn=cmd_probe)
     p = sub.add_parser("install-dd"); p.set_defaults(fn=cmd_install_dd)
+    p = sub.add_parser("install-steamcmd"); p.set_defaults(fn=cmd_install_steamcmd)
     p = sub.add_parser("shortcut"); p.add_argument("appid")
     p.add_argument("--exe", default=""); p.add_argument("--name", default="")
     p.add_argument("--vdf", default=""); p.set_defaults(fn=cmd_shortcut)

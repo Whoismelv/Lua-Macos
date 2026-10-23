@@ -12,7 +12,7 @@ import urllib.request
 from pathlib import Path
 
 APP_TITLE = "LuaTools"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 HERE = Path(__file__).resolve().parent
 
 
@@ -318,6 +318,10 @@ class Api:
                 return lt.denuvo_listings(safe_settings().get("auth_token", ""))
             if name == "install-dd":
                 return lt.install_depotdownloader(safe_settings().get("auth_token", ""))
+            if name == "install-steamcmd":
+                return lt.install_steamcmd()
+            if name == "ensure-tools":
+                return lt.ensure_tools()
             if name == "settings":
                 LOGS.add(json.dumps(lt.load_settings(), indent=2)[:2000])
                 return {"ok": True}
@@ -332,6 +336,16 @@ class Api:
         lt.save_settings(settings)
         LOGS.add("steam path saved: " + settings["steam_path"])
         return {"ok": True, "path": settings["steam_path"]}
+
+
+def _provision_tools():
+    try:
+        lt.ensure_tools()
+    except Exception as exc:
+        try:
+            LOGS.add("tool provisioning failed: %r" % (exc,))
+        except Exception:
+            pass
 
 
 def run():
@@ -355,6 +369,7 @@ def run():
 
     import webview
     api = Api()
+    threading.Thread(target=_provision_tools, daemon=True).start()
     webview.create_window(
         APP_TITLE,
         str(index),
