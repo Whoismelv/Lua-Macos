@@ -37,7 +37,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -208,6 +208,64 @@ def restart_steam():
     ctx.stop()
     ctx.start()
     return {"ok": True, "restarted": True}
+
+def mac_steam_root():
+    return Path.home() / "Library" / "Application Support" / "Steam"
+
+def library_roots():
+    roots = []
+    root = SteamCtx().root()
+    if root is not None:
+        roots.append(root)
+    else:
+        roots.append(mac_steam_root())
+    base = roots[0]
+    vdf = base / "steamapps" / "libraryfolders.vdf"
+    if vdf.is_file():
+        try:
+            data = vdf_parse(vdf.read_text(encoding="utf-8", errors="replace"))
+            folders = data.get("libraryfolders") or data.get("LibraryFolders") or {}
+            for key, val in folders.items():
+                raw = val.get("path") if isinstance(val, dict) else val
+                if isinstance(raw, str) and raw.strip():
+                    roots.append(Path(raw.strip()))
+        except Exception:
+            pass
+    seen, out = set(), []
+    for r in roots:
+        try:
+            key = str(r)
+        except Exception:
+            continue
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+def paths_report():
+    root = SteamCtx().root()
+    cfg = Path.home() / "Library" / "Application Support" / "macsteam"
+    app = Path("/Applications/Steam.app")
+    exe = SteamCtx().steam_exe()
+    return {
+        "platform": sys.platform,
+        "home": str(Path.home()),
+        "steam_root": str(root) if root else None,
+        "steam_root_expected": str(mac_steam_root()),
+        "steam_root_exists": bool(root),
+        "steamapps": str(root / "steamapps") if root else None,
+        "steamapps_exists": bool(root and (root / "steamapps").is_dir()),
+        "common": str(root / "steamapps" / "common") if root else None,
+        "libraries": [str(r) for r in library_roots()],
+        "steam_app": str(app) if app.is_dir() else None,
+        "steam_exe": str(exe) if exe else None,
+        "macsteam_dir": str(cfg),
+        "macsteam_dir_exists": cfg.is_dir(),
+        "macsteam_config": str(cfg / "config.yaml"),
+        "macsteam_config_exists": (cfg / "config.yaml").is_file(),
+        "dylib": str(app / "Contents" / "MacOS" / "macsteam.dylib"),
+        "dylib_exists": (app / "Contents" / "MacOS" / "macsteam.dylib").is_file(),
+    }
 
 # ---------- opensteamtool.toml editor (line-parity with the C# writer) ----------
 
@@ -1031,6 +1089,10 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
 # ---------- install downloaded content into the steam library ----------
 
 def steam_apps_dir():
+    for r in library_roots():
+        sa = r / "steamapps"
+        if sa.is_dir():
+            return sa
     root = SteamCtx().root()
     if root is None:
         return None
@@ -1045,9 +1107,6 @@ def read_appmanifest(appid):
     f = sa / f"appmanifest_{int(appid)}.acf"
     return parse_acf(f) if f.exists() else None
 
-def _acf_block_unused():  # kept out of the build path
-    return None
-
 def write_appmanifest(appid, name, installdir, buildid, depots, size_on_disk=0):
     sa = steam_apps_dir()
     if sa is None:
@@ -1055,12 +1114,12 @@ def write_appmanifest(appid, name, installdir, buildid, depots, size_on_disk=0):
     now = int(time.time())
     lines = ['"AppState"', "{"]
     lines += [f'\t"appid"\t\t"{int(appid)}"',
-              f'\t"Universe"\t\t"1"',
+              '\t"Universe"\t\t"1"',
               f'\t"name"\t\t"{name or appid}"',
-              f'\t"StateFlags"\t\t"4"',
+              '\t"StateFlags"\t\t"4"',
               f'\t"installdir"\t\t"{installdir}"',
               f'\t"LastUpdated"\t\t"{now}"',
-              f'\t"LastPlayed"\t\t"0"',
+              '\t"LastPlayed"\t\t"0"',
               f'\t"SizeOnDisk"\t\t"{int(size_on_disk)}"',
               f'\t"StagingPath"\t\t"{sa / "downloading" / str(int(appid))}"',
               f'\t"buildid"\t\t"{buildid}"']
@@ -1092,7 +1151,7 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
     probe = probe_app(aid, branch)
     if not probe.get("ok"):
         return {"ok": False, "stage": "probe", **probe}
-    rows = select_rows(probe["rows"], want_os, True)
+    rows = select_rows(probe["rows"], want_os, False)
     rows = [r for r in rows if r["manifest"]]
     if not rows:
         return {"ok": False, "error": f"no depot manifests for os={want_os}"}
@@ -1151,6 +1210,116 @@ def steam_install_url(appid):
         return {"ok": True, "url": url}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "url": url}
+
+def open_in_finder(path):
+    p = Path(path)
+    if not p.exists():
+        return {"ok": False, "error": f"not found: {p}", "path": str(p)}
+    if sys.platform == "darwin":
+        subprocess.run(["open", str(p)], capture_output=True, timeout=30)
+    elif sys.platform == "win32":
+        os.startfile(str(p))  # noqa: S606
+    else:
+        subprocess.run(["xdg-open", str(p)], capture_output=True, timeout=30)
+    return {"ok": True, "path": str(p)}
+
+def open_steam_folder(which="steamapps"):
+    root = SteamCtx().root()
+    if root is None:
+        return {"ok": False,
+                "error": "steam folder not found - open Steam once so it creates its library"}
+    targets = {
+        "steamapps": root / "steamapps",
+        "common": root / "steamapps" / "common",
+        "root": root,
+        "macsteam": Path.home() / "Library" / "Application Support" / "macsteam",
+    }
+    target = targets.get(str(which or "steamapps").strip(), targets["steamapps"])
+    return open_in_finder(target)
+
+def uninstall_game(appid, delete_files=True):
+    aid = int(appid)
+    sa = steam_apps_dir()
+    if sa is None:
+        return {"ok": False, "error": "steam library not found"}
+    acf = read_appmanifest(aid) or {}
+    installdir = acf.get("installdir", "") or ""
+    removed = []
+    manifest = sa / f"appmanifest_{aid}.acf"
+    if manifest.exists():
+        try:
+            manifest.unlink()
+            removed.append(str(manifest))
+        except OSError as exc:
+            return {"ok": False, "error": f"could not delete install record: {exc}"}
+    if delete_files and installdir:
+        game_dir = sa / "common" / installdir
+        if game_dir.is_dir():
+            shutil.rmtree(game_dir, ignore_errors=True)
+            removed.append(str(game_dir))
+    staging = sa / "downloading" / str(aid)
+    if staging.is_dir():
+        shutil.rmtree(staging, ignore_errors=True)
+        removed.append(str(staging))
+    root = SteamCtx().root()
+    if root is not None:
+        for cache in (root / "userdata").glob(f"*/config/librarycache/{aid}.json"):
+            try:
+                cache.unlink()
+                removed.append(str(cache))
+            except OSError:
+                pass
+    cfg = macsteam_config_remove(aid)
+    return {"ok": True, "appid": str(aid), "installdir": installdir,
+            "removed": removed, "config": cfg}
+
+def uninstall_loader():
+    if sys.platform != "darwin":
+        return {"ok": False, "error": "macOS only"}
+    steam_app = Path("/Applications/Steam.app")
+    if not steam_app.is_dir():
+        alt = Path.home() / "Applications" / "Steam.app"
+        if alt.is_dir():
+            steam_app = alt
+        else:
+            return {"ok": False, "error": "Steam.app not found in /Applications"}
+    subprocess.run(["pkill", "-f", "steam_osx"], capture_output=True)
+    removed = []
+    dylib = steam_app / "Contents" / "MacOS" / "macsteam.dylib"
+    if dylib.exists():
+        try:
+            dylib.unlink()
+            removed.append(str(dylib))
+        except OSError as exc:
+            return {"ok": False, "error": f"could not delete dylib: {exc}"}
+    plist = steam_app / "Contents" / "Info.plist"
+    for key in (":LSEnvironment:DYLD_INSERT_LIBRARIES", ":LSEnvironment"):
+        pr = _plistbuddy(["-c", f"Delete {key}"], plist)
+        if pr is not None and pr.returncode == 0:
+            removed.append(key)
+    for target in (steam_app / "Contents" / "MacOS" / "steam_osx", steam_app):
+        subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(target)],
+                       capture_output=True, timeout=180)
+    cfg = Path.home() / "Library" / "Application Support" / "macsteam"
+    if cfg.is_dir():
+        shutil.rmtree(cfg, ignore_errors=True)
+        removed.append(str(cfg))
+    root = SteamCtx().root()
+    if root is not None:
+        for f in (root / "steam.cfg",
+                  root / "Steam.AppBundle" / "Steam" / "Contents" / "MacOS" / "steam.cfg"):
+            if f.exists():
+                try:
+                    f.unlink()
+                    removed.append(str(f))
+                except OSError:
+                    pass
+    lsr = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+           "LaunchServices.framework/Support/lsregister")
+    if Path(lsr).exists():
+        subprocess.run([lsr, "-f", str(steam_app)], capture_output=True, timeout=60)
+    return {"ok": True, "removed": removed, "steam_app": str(steam_app),
+            "hint": "Steam is back to a clean install - reopen it from Applications"}
 
 # ---------- license loaders (stplug-in engine / macSteam) ----------
 
@@ -1404,31 +1573,100 @@ def _ms_serialize(apps, packages, depot):
         out.append("")
     return "\n".join(out).rstrip() + "\n"
 
+def _ms_section(lines, header):
+    start = next((i for i, l in enumerate(lines)
+                  if l.strip().startswith(header) and not l.startswith((" ", "\t"))), None)
+    if start is None:
+        return None
+    end = start + 1
+    while end < len(lines):
+        raw = lines[end]
+        if raw.strip() and not raw.startswith((" ", "\t", "-")):
+            break
+        end += 1
+    return start, end
+
+def _ms_ensure_list(lines, header, items):
+    bounds = _ms_section(lines, header)
+    if bounds is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(header)
+        lines.extend(f"  - {i}" for i in items)
+        return True
+    start, end = bounds
+    body = lines[start + 1:end]
+    have = set()
+    for raw in body:
+        tok = raw.strip().lstrip("-").strip().split("#")[0].strip().split()
+        if tok and tok[0].isdigit():
+            have.add(int(tok[0]))
+    missing = [i for i in items if int(i) not in have]
+    if not missing:
+        return False
+    insert_at = end
+    while insert_at > start + 1 and not lines[insert_at - 1].strip():
+        insert_at -= 1
+    lines[insert_at:insert_at] = [f"  - {i}" for i in missing]
+    return True
+
+def _ms_drop_from_list(lines, header, item):
+    bounds = _ms_section(lines, header)
+    if bounds is None:
+        return False
+    start, end = bounds
+    keep, dropped = [], False
+    for raw in lines[start + 1:end]:
+        tok = raw.strip().lstrip("-").strip().split("#")[0].strip().split()
+        if tok and tok[0].isdigit() and int(tok[0]) == int(item):
+            dropped = True
+            continue
+        keep.append(raw)
+    if dropped:
+        lines[start + 1:end] = keep
+    return dropped
+
 def macsteam_config_add(appid, packages=(20200,)):
     if sys.platform != "darwin":
         return {"ok": False, "skipped": "macsteam config exists on macOS only"}
     cfg = Path.home() / "Library" / "Application Support" / "macsteam"
     cfg.mkdir(parents=True, exist_ok=True)
     f = cfg / "config.yaml"
-    apps, pkgs, depot = ([], [], {})
-    if f.exists():
-        try:
-            apps, pkgs, depot = _ms_parse(f.read_text(encoding="utf-8", errors="replace"))
-        except Exception:
-            pass
-    changed = False
-    if appid not in apps:
-        apps.append(appid)
-        changed = True
-    for p in packages:
-        if p not in pkgs:
-            pkgs.append(p)
-            changed = True
+    text = f.read_text(encoding="utf-8", errors="replace") if f.exists() else ""
+    lines = text.replace("\r\n", "\n").split("\n")
+    if not any(l.strip().startswith("HideWhatsNew") for l in lines):
+        lines.insert(0, "HideWhatsNew: no")
+        lines.insert(1, "")
+    changed = _ms_ensure_list(lines, "Apps:", [int(appid)])
+    changed = _ms_ensure_list(lines, "PackageIds:", [int(p) for p in packages]) or changed
+    out = re.sub(r"\n{3,}", "\n\n", "\n".join(lines).strip("\n") + "\n")
     try:
-        f.write_text(_ms_serialize(apps, pkgs, depot), encoding="utf-8")
+        f.write_text(out, encoding="utf-8")
     except Exception as exc:
         return {"ok": False, "error": f"config write failed: {exc}"}
+    apps, _pkgs, _depot = _ms_parse(out)
     return {"ok": True, "file": str(f), "apps": len(apps), "changed": changed}
+
+def macsteam_config_remove(appid):
+    if sys.platform != "darwin":
+        return {"ok": False, "skipped": "macOS only"}
+    cfg = Path.home() / "Library" / "Application Support" / "macsteam"
+    f = cfg / "config.yaml"
+    if not f.exists():
+        return {"ok": True, "removed": False, "reason": "no config file"}
+    try:
+        text = f.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    lines = text.replace("\r\n", "\n").split("\n")
+    had = _ms_drop_from_list(lines, "Apps:", appid)
+    out = re.sub(r"\n{3,}", "\n\n", "\n".join(lines).strip("\n") + "\n")
+    try:
+        f.write_text(out, encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "error": f"config write failed: {exc}"}
+    apps, _pkgs, _depot = _ms_parse(out)
+    return {"ok": True, "removed": had, "file": str(f), "apps": len(apps)}
 
 def _stage_macsteam_app(archive, dest):
     if archive.suffix.lower() == ".zip":
@@ -1885,6 +2123,43 @@ class Api:
     def install_status(self):
         return FETCH_RESULT.get("install") or {"ok": None, "running": _FETCH_LOCK.locked()}
 
+    def open_folder(self, which="steamapps"):
+        res = open_steam_folder(which)
+        LOGS.add(("opened " + res["path"]) if res.get("ok")
+                 else ("open failed: " + str(res.get("error"))))
+        return res
+
+    def paths(self):
+        return paths_report()
+
+    def repair(self, appid):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        res = repair_install_state(int(aid))
+        LOGS.add("repair " + aid + ": " + json.dumps(res)[:240])
+        return res
+
+    def uninstall(self, appid):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        LOGS.add(f"uninstall {aid}")
+        res = uninstall_game(int(aid), True)
+        if res.get("ok"):
+            LOGS.add("removed: " + (", ".join(res.get("removed") or []) or "nothing on disk"))
+            restart_steam()
+        else:
+            LOGS.add("uninstall failed: " + str(res.get("error")))
+        return res
+
+    def remove_loader(self):
+        LOGS.add("removing the loader from Steam.app")
+        res = uninstall_loader()
+        LOGS.add(("loader removed: " + ", ".join(res.get("removed") or []))
+                 if res.get("ok") else ("loader removal failed: " + str(res.get("error"))))
+        return res
+
     def remove(self, appid):
         try:
             aid = int(appid)
@@ -2000,6 +2275,7 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
   <button class="tab" data-t="library">Library</button>
   <button class="tab" data-t="installed">Installed</button>
   <button class="tab" data-t="loader">Loader</button>
+  <button class="tab" data-t="maint">Maintenance</button>
   <span class="sp"></span>
   <button id="b-restart">Restart Steam</button>
 </nav>
@@ -2047,6 +2323,22 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
   </div>
   <div id="ldout"></div>
 </section>
+<section id="t-maint">
+  <div class="toolbar">
+    <input id="m-appid" placeholder="appid" style="width:120px">
+    <button id="b-m-repair">Repair install record</button>
+    <button id="b-m-del">Delete game</button>
+    <button id="b-m-open">Open Steam folder</button>
+    <button id="b-m-common">Open game files</button>
+  </div>
+  <div class="toolbar">
+    <button id="b-m-paths">Show Steam paths</button>
+    <button id="b-m-unloader">Remove loader from Steam</button>
+    <span class="muted">Removes the injected dylib, the plist entry, and the macsteam config - Steam goes back to a clean install</span>
+  </div>
+  <div id="pathsout"></div>
+  <div class="muted" style="margin-top:8px">Delete game removes the install record, the game folder, the staging folder, the library cache entry, and the license line.</div>
+</section>
 </main>
 <div id="status">booting...</div>
 <pre id="log"></pre>
@@ -2055,7 +2347,7 @@ let api=null,logIdx=0;
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const say=t=>{$("#status").textContent=t};
-function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-ldref","#b-ldmac","#b-ldst"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
+function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
 async function call(fn,...args){if(!api)throw new Error("bridge not ready");return api[fn](...args)}
 document.querySelectorAll("button.tab").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("button.tab").forEach(x=>x.classList.toggle("pri",x===b));
@@ -2225,6 +2517,73 @@ $("#b-ldref").onclick=ldRefresh;
 $("#b-ldmac").onclick=()=>ldInstall("macsteam");
 $("#b-ldst").onclick=()=>ldInstall("steamtools");
 $("#b-fetch").onclick=doFetch;
+$("#b-m-open").onclick=async()=>{
+  try{
+    const r=await call("open_folder","steamapps");
+    say(r.ok?("opened "+r.path):("open failed: "+(r.error||"")));
+  }catch(e){say("open failed: "+e)}
+};function renderPaths(p){
+  const rows=[
+    ["steam root",p.steam_root||("NOT FOUND (expected "+p.steam_root_expected+")")],
+    ["steamapps",p.steamapps||"-"],
+    ["common",p.common||"-"],
+    ["libraries",(p.libraries||[]).join("  |  ")||"-"],
+    ["Steam.app",p.steam_app||"not installed"],
+    ["steam binary",p.steam_exe||"-"],
+    ["macsteam config",(p.macsteam_config_exists?"ok  ":"missing  ")+p.macsteam_config],
+    ["injected dylib",(p.dylib_exists?"ok  ":"missing  ")+p.dylib]
+  ];
+  $("#pathsout").innerHTML=`<table><thead><tr><th>Item</th><th>Path</th></tr></thead><tbody>`+
+    rows.map(([k,v])=>`<tr><td>${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join("")+
+    `</tbody></table>`;
+}
+$("#b-m-paths").onclick=async()=>{
+  try{
+    const p=await call("paths");
+    renderPaths(p);
+    say(p.steam_root_exists?"steam folder found":"steam folder not found - open Steam once");
+  }catch(e){say("path check failed: "+e)}
+};
+$("#b-m-common").onclick=async()=>{
+  try{
+    const r=await call("open_folder","common");
+    say(r.ok?("opened "+r.path):("open failed: "+(r.error||"")));
+  }catch(e){say("open failed: "+e)}
+};
+function maintId(){
+  const raw=($("#m-appid").value||$("#appid").value||"").trim();
+  if(!/^\d+$/.test(raw)){say("type the appid first");return null}
+  return raw;
+}
+$("#b-m-repair").onclick=async()=>{
+  const id=maintId();if(!id)return;
+  try{
+    const r=await call("repair",id);
+    say(r.ok?(`repair ${id}: ${r.files} files, record ${r.acf?"kept":"missing"}${r.stale_removed?", stale record cleared":""}`):("repair failed: "+(r.error||"")));
+  }catch(e){say("repair failed: "+e)}
+  await refreshInstalled();
+};
+$("#b-m-del").onclick=async()=>{
+  const id=maintId();if(!id)return;
+  if(!confirm("Delete game "+id+" and everything it downloaded?"))return;
+  busy(true);
+  try{
+    const r=await call("uninstall",id);
+    say(r.ok?(`deleted ${id} - ${(r.removed||[]).length} paths removed`):("delete failed: "+(r.error||"")));
+  }catch(e){say("delete failed: "+e)}
+  busy(false);
+  await refreshInstalled();
+};
+$("#b-m-unloader").onclick=async()=>{
+  if(!confirm("Remove the loader from Steam.app? Steam goes back to a clean install."))return;
+  busy(true);
+  try{
+    const r=await call("remove_loader");
+    say(r.ok?"loader removed - reopen Steam":("remove failed: "+(r.error||"")));
+  }catch(e){say("remove failed: "+e)}
+  busy(false);
+  await ldRefresh();
+};
 async function pollLogs(){
   if(!api)return;
   try{

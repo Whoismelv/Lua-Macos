@@ -44,8 +44,14 @@ A Steam license kit for macOS: probe public appinfo, generate `stplug-in` lua (`
 3. The app does the rest by itself: checks the loader, injects it from the payload bundled inside the app (no downloads, no external program), probes depots, writes the lua + macSteam config, and restarts Steam.
 4. The game shows up in your library. Done.
 
-Want the actual game files too? Fill your Steam user/pass → **Fetch Content** — downloads into `~/.licensetools/games/`.
+Want the actual game files too? Press **Download files** — the app pulls the game depots straight into
+`~/Library/Application Support/Steam/steamapps/common/<installdir>`, writes a real `appmanifest_<appid>.acf`,
+and restarts Steam so the Play button launches real content. DepotDownloader needs a Steam login that owns the
+game; without one it asks Steam to download instead.
 The **Loader** tab keeps the same actions manually if you ever need to re-inject.
+The **Maintenance** tab is GUI-only housekeeping: show the resolved Steam paths, repair a stale install record,
+delete a game (record + files + staging + library cache + license line), open the Steam folder or the game
+folder in Finder, and remove the loader from `Steam.app` to get a clean client back.
 The loader payload (macSteam dylib + signatures) is vendored into the app at build time — nothing to install on your side.
 
 The `stplug-in` folder alone does nothing on a stock client — a loader (macSteam or SteamTools) is required. Every step above is a button; the CLI commands below are the same engine for power users.
