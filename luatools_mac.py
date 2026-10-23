@@ -1274,10 +1274,10 @@ TOOLS_DIR = ST_CACHE_DIR / "tools"
 
 def _find_tool(name):
     env = os.environ.get(name.upper() + "_PATH", "")
-    if env and Path(env).exists():
+    if env and Path(env).is_file():
         return Path(env)
     p = TOOLS_DIR / name
-    if p.exists():
+    if p.is_file():
         return p
     return shutil.which(name)
 
@@ -1652,7 +1652,7 @@ def install_depotdownloader(token=""):
     asset, err = gh_latest_asset("SteamRE/DepotDownloader", lambda n: n == want, token)
     if asset is None:
         return {"ok": False, "error": err, "wanted": want}
-    dest = TOOLS_DIR / "depotdownloader"
+    dest = TOOLS_DIR / "dd"
     dest.mkdir(parents=True, exist_ok=True)
     zp = dest / want
     try:
