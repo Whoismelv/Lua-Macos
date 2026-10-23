@@ -37,7 +37,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.1.0"
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -592,6 +592,58 @@ def local_depot_keys(depots):
             break
     return out
 
+DEPOT_KEYS_URL = ("https://raw.githubusercontent.com/SteamAutoCracks/"
+                  "ManifestHub/main/depotkeys.json")
+_DEPOT_DB = {"data": None, "stamp": 0.0, "path": None}
+
+def depot_key_db(refresh=False, progress=None, max_age=7 * 86400):
+    path = CACHE_DIR / "depotkeys.json"
+    now = time.time()
+    if not refresh and _DEPOT_DB["data"] is not None and now - _DEPOT_DB["stamp"] < 3600:
+        return _DEPOT_DB["data"]
+    fresh = path.exists() and (now - path.stat().st_mtime) < max_age
+    if refresh or not fresh:
+        try:
+            if progress:
+                progress("updating the depot key table (one time, ~16MB)...")
+            req = urllib.request.Request(DEPOT_KEYS_URL,
+                                         headers={"User-Agent": "licensetools"})
+            with urllib.request.urlopen(req, timeout=240) as r:
+                blob = r.read()
+            if len(blob) > 1_000_000:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".part")
+                tmp.write_bytes(blob)
+                tmp.replace(path)
+                LOGS.add(f"depot key table: {len(blob) // 1024} KB")
+        except Exception as exc:
+            LOGS.add("depot key table download failed: " + str(exc))
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception as exc:
+        LOGS.add("depot key table unreadable: " + str(exc))
+        return {}
+    table = {str(k): str(v).lower() for k, v in data.items()
+             if isinstance(v, str) and len(v) == 64}
+    _DEPOT_DB.update({"data": table, "stamp": now, "path": str(path)})
+    return table
+
+def keys_for_depots(depots, progress=None):
+    want = [int(d) for d in depots]
+    if not want:
+        return {}
+    out = local_depot_keys(want)
+    missing = [d for d in want if d not in out]
+    if missing:
+        table = depot_key_db(progress=progress)
+        for d in missing:
+            key = table.get(str(d))
+            if key:
+                out[d] = key
+    return out
+
 def import_lua_file(path):
     p = Path(path).expanduser()
     if not p.is_file():
@@ -1132,9 +1184,10 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
             if code:
                 item["error_code"], item["hint"] = code, hint
             if pr.returncode != 0 and progress:
-                last = next((ln.strip() for ln in reversed(raw.splitlines())
-                             if ln.strip()), "no output")
-                progress(f"depot {r['depot']} exit {pr.returncode} - {last[:220]}")
+                lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+                tail_lines = lines[-4:] or ["no output"]
+                progress(f"depot {r['depot']} exit {pr.returncode} - "
+                         + " | ".join(x[:160] for x in tail_lines))
             results.append(item)
         except Exception as exc:
             results.append({"depot": r["depot"], "error": str(exc),
@@ -1231,12 +1284,24 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
         return {"ok": False, "error": "steam library not found - install Steam first"}
     installdir = probe.get("installdir") or probe.get("name") or str(aid)
     target = sa / "common" / installdir
-    target.mkdir(parents=True, exist_ok=True)
     depots = [int(r["depot"]) for r in rows]
-    keys = local_depot_keys(depots)
-    macsteam_config_add(aid, depots=depots, keys=keys)
+    keys = keys_for_depots(depots, progress)
+    cfg = macsteam_config_add(aid, depots=depots, keys=keys)
+    missing = [d for d in depots if d not in keys]
     if progress:
-        progress(f"loader config: {len(depots)} depot(s), {len(keys)} key(s) pinned")
+        progress(f"loader config: {len(depots)} depot(s), {len(keys)} key(s)")
+        if missing:
+            progress("no depot key found for: " + ", ".join(str(d) for d in missing))
+    if not (user and password):
+        if progress:
+            progress("handing the install to Steam - it pulls the depots itself")
+        restart_steam()
+        fb = steam_install_url(aid)
+        return {"ok": True, "appid": str(aid), "mode": "steam", "dir": str(target),
+                "depots": depots, "keys": len(keys), "missing_keys": missing,
+                "config": cfg, "steam": fb,
+                "note": "Steam downloads into steamapps/common and writes the acf"}
+    target.mkdir(parents=True, exist_ok=True)
     res = fetch_game(aid, branch, rows, want_os, True, user, password,
                      str(target), None, None, progress, flat=True)
     if not res.get("ok"):
@@ -2091,6 +2156,22 @@ def cmd_fetch(a):
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0 if res.get("ok") else 1
 
+def cmd_keys(a):
+    aid = _appid(a.appid)
+    probe = probe_app(aid, a.branch)
+    if not probe.get("ok"):
+        print(json.dumps(probe, indent=2, ensure_ascii=False))
+        return 1
+    rows = select_rows(probe["rows"], a.os, not a.no_shared)
+    depots = [int(r["depot"]) for r in rows]
+    keys = keys_for_depots(depots, progress=lambda m: print(m, file=sys.stderr))
+    out = [{"depot": d, "key": keys.get(d, ""),
+            "found": d in keys} for d in depots]
+    print(json.dumps({"appid": aid, "depots": out,
+                      "found": sum(1 for x in out if x["found"])},
+                     indent=2, ensure_ascii=False))
+    return 0
+
 def cmd_selftest(_a):
     return selftest()
 
@@ -2193,13 +2274,17 @@ class Api:
         inst["depots"] = len(rows)
         inst["manifest_files"] = files
         depots = [int(r["depot"]) for r in rows]
-        keys = local_depot_keys(depots)
+        keys = keys_for_depots(depots)
         cfg = macsteam_config_add(int(appid), depots=depots, keys=keys)
         inst["config"] = cfg
         inst["depot_keys"] = len(keys)
         if not cfg.get("ok"):
             inst["config_error"] = cfg.get("error") or cfg.get("skipped")
         LOGS.add(f"loader config: {len(depots)} depot(s), {len(keys)} key(s)")
+        missing = [d for d in depots if d not in keys]
+        if missing:
+            LOGS.add("no key for depot(s): " + ", ".join(map(str, missing))
+                     + " - steam will report encrypted content for those")
         LOGS.add(("installed " + inst["dest"]) if inst.get("ok")
                  else ("grant failed: " + str(inst.get("error"))))
         return inst
@@ -2231,7 +2316,7 @@ class Api:
             if probe.get("ok"):
                 rows = select_rows(probe["rows"], want_os)
                 depots = [int(r["depot"]) for r in rows]
-                keys = local_depot_keys(depots)
+                keys = keys_for_depots(depots)
             else:
                 LOGS.add("probe failed before config: " + str(probe.get("error")))
             cfg = macsteam_config_add(int(aid), depots=depots, keys=keys)
@@ -2241,6 +2326,9 @@ class Api:
                         "steps": steps}
             LOGS.add(f"app {aid} added to the loader config - {len(depots)} depot(s), "
                      f"{len(keys)} key(s)")
+            missing = [d for d in depots if d not in keys]
+            if missing:
+                LOGS.add("no key for depot(s): " + ", ".join(map(str, missing)))
             LOGS.add("steam restarting - game will show in your library")
             restart_steam()
             steps.append({"step": "restart", "ok": True})
@@ -2286,10 +2374,15 @@ class Api:
                 res = install_to_library(int(aid), "public", "mac", u, p,
                                          progress=lambda m: LOGS.add(str(m)))
                 if res.get("ok"):
-                    LOGS.add(f"install {aid} done - {res.get('files_bytes', 0)} bytes "
-                             f"in {res.get('dir')}")
-                    LOGS.add("restarting steam so the play button uses the new files")
-                    restart_steam()
+                    if res.get("mode") == "steam":
+                        LOGS.add("steam is downloading the depots itself - watch the downloads page")
+                        if res.get("missing_keys"):
+                            LOGS.add("no key for: " + ", ".join(str(d) for d in res["missing_keys"]))
+                    else:
+                        LOGS.add(f"install {aid} done - {res.get('files_bytes', 0)} bytes "
+                                 f"in {res.get('dir')}")
+                        LOGS.add("restarting steam so the play button uses the new files")
+                        restart_steam()
                 else:
                     LOGS.add("install failed: " + str(res.get("error")))
                     if res.get("hint"):
@@ -2318,6 +2411,16 @@ class Api:
 
     def paths(self):
         return paths_report()
+
+    def refresh_keys(self):
+        try:
+            table = depot_key_db(refresh=True,
+                                 progress=lambda m: LOGS.add(m))
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        LOGS.add(f"depot key table: {len(table)} keys")
+        return {"ok": bool(table), "keys": len(table),
+                "error": None if table else "table came back empty"}
 
     def _pick_lua(self):
         try:
@@ -2516,7 +2619,7 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
     <input id="f-pass" placeholder="password" type="password" style="width:160px">
     <button id="b-fetch">Fetch Content</button>
     <button id="b-lua">Import .lua</button>
-    <span class="muted">Download files puts the game into steamapps/common and fixes the install record</span>
+    <span class="muted">Download files writes the depot keys and lets Steam install it; add a login to pull with DepotDownloader instead</span>
   </div>
   <div id="hits" class="muted"></div>
   <div id="probeout"></div>
@@ -2547,6 +2650,7 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
   </div>
   <div class="toolbar">
     <button id="b-m-paths">Show Steam paths</button>
+    <button id="b-m-keys">Refresh depot keys</button>
     <button id="b-m-unloader">Remove loader from Steam</button>
     <span class="muted">Removes the injected dylib, the plist entry, and the macsteam config - Steam goes back to a clean install</span>
   </div>
@@ -2775,6 +2879,14 @@ $("#b-m-common").onclick=async()=>{
     say(r.ok?("opened "+r.path):("open failed: "+(r.error||"")));
   }catch(e){say("open failed: "+e)}
 };
+$("#b-m-keys").onclick=async()=>{
+  busy(true);say("refreshing the depot key table...");
+  try{
+    const r=await call("refresh_keys");
+    say(r.ok?("depot key table: "+r.keys+" keys"):("refresh failed: "+(r.error||"")));
+  }catch(e){say("refresh failed: "+e)}
+  busy(false);
+};
 function maintId(){
   const raw=($("#m-appid").value||$("#appid").value||"").trim();
   if(!/^\d+$/.test(raw)){say("type the appid first");return null}
@@ -2848,6 +2960,12 @@ def _provision_quiet():
                                          else "failed " + str(r.get("error", ""))))
     except Exception as exc:
         LOGS.add(f"tool provisioning failed: {exc}")
+    try:
+        table = depot_key_db(progress=lambda m: LOGS.add(str(m)))
+        if table:
+            LOGS.add(f"depot key table ready: {len(table)} keys")
+    except Exception as exc:
+        LOGS.add(f"depot key table failed: {exc}")
 
 def cmd_gui(_a):
     run_gui()
@@ -2908,6 +3026,13 @@ def build_argparser():
                        help="install a .lua and copy its depot keys into the loader config")
     p.add_argument("file")
     p.set_defaults(fn=cmd_import_lua)
+
+    p = sub.add_parser("keys", help="resolve depot decryption keys for an appid")
+    p.add_argument("appid")
+    p.add_argument("--branch", default="public")
+    p.add_argument("--os", dest="os", default="mac", choices=("mac", "win", "linux", "all"))
+    p.add_argument("--no-shared", dest="no_shared", action="store_true")
+    p.set_defaults(fn=cmd_keys)
 
     p = sub.add_parser("fetch", help="download depot content with DepotDownloader")
     p.add_argument("appid")

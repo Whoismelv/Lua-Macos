@@ -86,6 +86,28 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time). steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
 
+### What changed in 1.1.0
+
+`CONTENT STILL ENCRYPTED` in the Steam downloads page means the depots were injected but Steam got a zero decryption key. 1.1.0 fixes that:
+
+- The app now resolves **real depot decryption keys** from a public key table (ManifestHub, ~288k depots), cached at `~/.licensetools/depotkeys.json` and refreshed every 7 days. First run pulls it in the background.
+- Every grant / unlock / download writes those keys into the `DepotKeys:` group next to the depots, so Steam decrypts instead of stalling.
+- **Refresh depot keys** (Maintenance tab) forces a table update.
+- **Download files** now hands the install to Steam when no Steam login is typed in — an anonymous DepotDownloader cannot fetch a paid depot, which is what produced `InitializeSteam failed`. Type a login that owns the game and it uses DepotDownloader instead.
+- Failed depot lines in the log now show the last four lines of DepotDownloader output, not just the final one.
+- CLI: `keys APPID` prints the resolved key per depot.
+
+### ما الجديد في 1.1.0
+
+رسالة `CONTENT STILL ENCRYPTED` في صفحة التنزيلات معناها أن الـ depots انحقنت لكن Steam استلم مفتاح فك تشفير أصفار. هذا الإصدار يحلّها:
+
+- التطبيق يجلب **مفاتيح فك تشفير الـ depot الحقيقية** من جدول مفاتيح عام (ManifestHub، حوالي 288 ألف depot)، ويخزّنها في `~/.licensetools/depotkeys.json` ويحدّثها كل 7 أيام. أول تشغيل ينزّلها في الخلفية.
+- كل grant / unlock / download يكتب هذه المفاتيح داخل قسم `DepotKeys:` بجانب الـ depots، فيفك Steam التشفير بدل ما يتوقف.
+- زر **Refresh depot keys** في تبويب Maintenance يحدّث الجدول فورًا.
+- زر **Download files** صار يسلّم التنزيل إلى Steam إذا ما كتبت حساب Steam — لأن DepotDownloader المجهول ما يقدر يجيب depot مدفوع، وهذا سبب `InitializeSteam failed`. اكتب حسابًا يملك اللعبة فيستخدم DepotDownloader.
+- سطور الـ depot الفاشلة في السجل تعرض آخر أربعة أسطر من مخرجات DepotDownloader بدل سطر واحد.
+- في الـ CLI: `keys APPID` يطبع المفتاح لكل depot.
+
 ### What changed in 1.0.9
 
 The loader injects depots into a package from the `DepotKeys:` groups in its config. Before this build the app wrote only `Apps:` and `PackageIds:`, so Steam saw the game as owned but with **zero depots** — the install finished instantly with 0 bytes and Play said the executable was missing.
