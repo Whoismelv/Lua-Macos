@@ -86,6 +86,32 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time). steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
 
+### What changed in 1.2.0
+
+1.1.0 shipped the key table but a Mac with a strict TLS chain or a filtered network could end up with an empty table — the log said `0 key(s)` and Steam kept showing `CONTENT STILL ENCRYPTED`. 1.2.0 makes the table impossible to miss:
+
+- Six download routes tried in order: GitHub raw, jsDelivr, Fastly jsDelivr, githack, ghproxy, GitHub contents API. First one that returns a valid table wins and is cached.
+- TLS fallback chain: bundled `certifi` store, then the system store, then an unverified context — public read-only data, so a missing root certificate on the machine can't zero out the table.
+- The key table is now **bundled inside the dmg** at build time and copied to `~/.licensetools/depotkeys.json` on first run, so keys exist even with no network at all.
+- `gzip` and `identity` encodings both handled, so a proxy that mangles compression can't break the fetch.
+- The window title bar shows the running version (`LICENSETOOLS v1.2.0`) — no more guessing which dmg is open.
+- Key lookup also scans `~/Downloads`, `~/Library/Application Support/macsteam` and the tool's own vault for `.lua` files, not just `config/stplug-in`.
+- **Show Steam paths** now prints the key table path, size, age, key count and the last fetch error, so a failed download is visible without a Terminal.
+- CLI: `keydb [--refresh]`.
+
+### ما الجديد في 1.2.0
+
+الإصدار 1.1.0 نزّل جدول المفاتيح، لكن جهازًا بشهادة TLS ناقصة أو شبكة مفلترة قد ينتهي بجدول فارغ — السجل يقول `0 key(s)` وSteam يظل يعرض `CONTENT STILL ENCRYPTED`. هذا الإصدار يجعل الجدول مضمونًا:
+
+- ستة مسارات تنزيل بالترتيب: GitHub raw، jsDelivr، Fastly jsDelivr، githack، ghproxy، GitHub contents API. أول جدول صالح يفوز ويُخزَّن.
+- سلسلة بدائل TLS: مخزن `certifi` المضمّن، ثم مخزن النظام، ثم سياق بلا تحقق — بيانات عامة للقراءة فقط، فشهادة جذر ناقصة على الجهاز ما تعطّل الجدول.
+- جدول المفاتيح صار **مضمّنًا داخل الـ dmg** وقت البناء ويُنسخ إلى `~/.licensetools/depotkeys.json` أول تشغيل، فالمفاتيح موجودة حتى بدون إنترنت.
+- معالجة `gzip` و`identity` معًا، فأي بروكسي يعبث بالضغط ما يكسر الجلب.
+- شريط العنوان يعرض الإصدار (`LICENSETOOLS v1.2.0`) — ما عاد فيه تخمين أي dmg مفتوح.
+- البحث عن المفاتيح يمسح أيضًا `~/Downloads` و`~/Library/Application Support/macsteam` ومخزن التطبيق، لا `config/stplug-in` فقط.
+- **Show Steam paths** يطبع مسار جدول المفاتيح وحجمه وعمره وعدد المفاتيح وآخر خطأ، فيظهر فشل التنزيل بدون Terminal.
+- في الـ CLI: `keydb [--refresh]`.
+
 ### What changed in 1.1.0
 
 `CONTENT STILL ENCRYPTED` in the Steam downloads page means the depots were injected but Steam got a zero decryption key. 1.1.0 fixes that:

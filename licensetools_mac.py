@@ -3,6 +3,7 @@
 # Steam license kit for macOS: probe public appinfo, write stplug-in lua, pin manifests.
 # Mac paths first, Windows fallback kept so the same file runs on the bench.
 import argparse
+import gzip
 import json
 import os
 import re
@@ -37,7 +38,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -247,6 +248,7 @@ def paths_report():
     cfg = Path.home() / "Library" / "Application Support" / "macsteam"
     app = Path("/Applications/Steam.app")
     exe = SteamCtx().steam_exe()
+    keys = key_status()
     return {
         "platform": sys.platform,
         "home": str(Path.home()),
@@ -265,6 +267,12 @@ def paths_report():
         "macsteam_config_exists": (cfg / "config.yaml").is_file(),
         "dylib": str(app / "Contents" / "MacOS" / "macsteam.dylib"),
         "dylib_exists": (app / "Contents" / "MacOS" / "macsteam.dylib").is_file(),
+        "depot_keys_path": keys["path"],
+        "depot_keys_exists": keys["exists"],
+        "depot_keys_count": keys["keys"],
+        "depot_keys_bytes": keys["bytes"],
+        "depot_keys_age_hours": keys["age_hours"],
+        "depot_keys_error": keys["error"],
     }
 
 # ---------- opensteamtool.toml editor (line-parity with the C# writer) ----------
@@ -574,61 +582,199 @@ def lua_scan(text):
     return {"main": main, "ids": ids, "depots": depots,
             "keys": keys, "manifests": manifests}
 
+def _lua_scan_dirs():
+    dirs = []
+    plugin = SteamCtx().plugin_dir()
+    if plugin:
+        dirs.append(plugin)
+    home = Path.home()
+    dirs.append(home / "Library" / "Application Support" / "macsteam")
+    dirs.append(CACHE_DIR / "vault")
+    dirs.append(home / "Downloads")
+    out = []
+    for d in dirs:
+        try:
+            if d and d.is_dir() and d not in out:
+                out.append(d)
+        except OSError:
+            continue
+    return out
+
 def local_depot_keys(depots):
     want = {int(d) for d in depots}
     out = {}
-    st = SteamCtx().plugin_dir()
-    if not st or not st.is_dir():
-        return out
-    for f in sorted(st.glob("*.lua")):
+    seen = 0
+    for root in _lua_scan_dirs():
         try:
-            found = lua_scan(f.read_text(encoding="utf-8", errors="replace"))["keys"]
+            files = sorted(root.rglob("*.lua"))
         except OSError:
             continue
-        for d, k in found.items():
-            if d in want:
-                out[d] = k
-        if len(out) == len(want):
-            break
+        for f in files:
+            seen += 1
+            if seen > 500:
+                break
+            try:
+                if f.stat().st_size > 4 * 1024 * 1024:
+                    continue
+                found = lua_scan(f.read_text(encoding="utf-8", errors="replace"))["keys"]
+            except OSError:
+                continue
+            for d, k in found.items():
+                if d in want and d not in out:
+                    out[d] = k
+            if len(out) == len(want):
+                return out
     return out
 
-DEPOT_KEYS_URL = ("https://raw.githubusercontent.com/SteamAutoCracks/"
-                  "ManifestHub/main/depotkeys.json")
-_DEPOT_DB = {"data": None, "stamp": 0.0, "path": None}
+DEPOT_KEYS_SOURCES = (
+    "https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json",
+    "https://cdn.jsdelivr.net/gh/SteamAutoCracks/ManifestHub@main/depotkeys.json",
+    "https://fastly.jsdelivr.net/gh/SteamAutoCracks/ManifestHub@main/depotkeys.json",
+    "https://raw.githack.com/SteamAutoCracks/ManifestHub/main/depotkeys.json",
+    "https://ghproxy.net/https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json",
+    "https://api.github.com/repos/SteamAutoCracks/ManifestHub/contents/depotkeys.json",
+)
+_DEPOT_DB = {"data": None, "stamp": 0.0, "path": None, "source": "",
+             "error": "", "bytes": 0}
+
+def _ssl_contexts():
+    out = []
+    try:
+        import certifi
+        out.append(ssl.create_default_context(cafile=certifi.where()))
+    except Exception:
+        pass
+    try:
+        out.append(ssl.create_default_context())
+    except Exception:
+        pass
+    try:
+        out.append(ssl._create_unverified_context())
+    except Exception:
+        pass
+    return out
+
+def _http_bytes(url, timeout=180):
+    base = {"User-Agent": "licensetools/1.2",
+            "Accept": "application/vnd.github.raw, application/json, */*"}
+    last = ""
+    for encoding in ("gzip", "identity"):
+        headers = dict(base, **{"Accept-Encoding": encoding})
+        for ctx in _ssl_contexts():
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                    raw = r.read()
+                    if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+                        raw = gzip.decompress(raw)
+                    return raw, ""
+            except Exception as exc:
+                last = f"{type(exc).__name__}: {exc}"
+    return b"", last
+
+def _table_from_blob(blob):
+    data = json.loads(blob.decode("utf-8", "replace"))
+    if not isinstance(data, dict):
+        raise ValueError("not a json object")
+    return {str(k): str(v).lower() for k, v in data.items()
+            if isinstance(v, str) and len(v) == 64}
+
+def _bundled_keys():
+    roots = []
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        roots.append(Path(meipass))
+    try:
+        roots.append(Path(__file__).resolve().parent)
+    except Exception:
+        pass
+    for base in roots:
+        p = base / "depotkeys.json"
+        try:
+            if p.is_file() and p.stat().st_size > 100_000:
+                return p
+        except OSError:
+            continue
+    return None
 
 def depot_key_db(refresh=False, progress=None, max_age=7 * 86400):
     path = CACHE_DIR / "depotkeys.json"
     now = time.time()
     if not refresh and _DEPOT_DB["data"] is not None and now - _DEPOT_DB["stamp"] < 3600:
         return _DEPOT_DB["data"]
+    if not path.exists():
+        src = _bundled_keys()
+        if src:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, path)
+                LOGS.add("depot key table: using the bundled copy")
+            except OSError as exc:
+                LOGS.add("bundled key table copy failed: " + str(exc))
     fresh = path.exists() and (now - path.stat().st_mtime) < max_age
     if refresh or not fresh:
-        try:
+        errors = []
+        for url in DEPOT_KEYS_SOURCES:
+            host = urllib.parse.urlsplit(url).netloc
             if progress:
-                progress("updating the depot key table (one time, ~16MB)...")
-            req = urllib.request.Request(DEPOT_KEYS_URL,
-                                         headers={"User-Agent": "licensetools"})
-            with urllib.request.urlopen(req, timeout=240) as r:
-                blob = r.read()
-            if len(blob) > 1_000_000:
+                progress("fetching the depot key table from " + host + "...")
+            blob, err = _http_bytes(url)
+            if err:
+                errors.append(f"{host}: {err}")
+                continue
+            if len(blob) < 100_000:
+                errors.append(f"{host}: short reply {len(blob)}B")
+                continue
+            try:
+                table = _table_from_blob(blob)
+            except Exception as exc:
+                errors.append(f"{host}: bad json {exc}")
+                continue
+            if len(table) < 1000:
+                errors.append(f"{host}: only {len(table)} keys")
+                continue
+            try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_suffix(".part")
                 tmp.write_bytes(blob)
                 tmp.replace(path)
-                LOGS.add(f"depot key table: {len(blob) // 1024} KB")
-        except Exception as exc:
-            LOGS.add("depot key table download failed: " + str(exc))
+            except OSError as exc:
+                errors.append(f"{host}: cache write {exc}")
+            _DEPOT_DB.update({"data": table, "stamp": now, "path": str(path),
+                              "source": url, "error": "", "bytes": len(blob)})
+            LOGS.add(f"depot key table: {len(table)} keys via {host}")
+            return table
+        _DEPOT_DB["error"] = " | ".join(errors[-3:]) or "no source answered"
+        LOGS.add("depot key table download failed: " + _DEPOT_DB["error"])
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        blob = path.read_bytes()
+        table = _table_from_blob(blob)
     except Exception as exc:
         LOGS.add("depot key table unreadable: " + str(exc))
         return {}
-    table = {str(k): str(v).lower() for k, v in data.items()
-             if isinstance(v, str) and len(v) == 64}
-    _DEPOT_DB.update({"data": table, "stamp": now, "path": str(path)})
+    if not table:
+        return {}
+    _DEPOT_DB.update({"data": table, "stamp": now, "path": str(path),
+                      "bytes": len(blob)})
     return table
+
+def key_status():
+    path = CACHE_DIR / "depotkeys.json"
+    data = _DEPOT_DB.get("data") or {}
+    age = None
+    size = 0
+    try:
+        if path.exists():
+            size = path.stat().st_size
+            age = round((time.time() - path.stat().st_mtime) / 3600.0, 1)
+    except OSError:
+        pass
+    return {"path": str(path), "exists": path.exists(), "bytes": size,
+            "age_hours": age, "keys": len(data),
+            "source": _DEPOT_DB.get("source", ""),
+            "error": _DEPOT_DB.get("error", "")}
 
 def keys_for_depots(depots, progress=None):
     want = [int(d) for d in depots]
@@ -2156,6 +2302,13 @@ def cmd_fetch(a):
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0 if res.get("ok") else 1
 
+def cmd_keydb(a):
+    table = depot_key_db(refresh=bool(a.refresh),
+                         progress=lambda m: print(m, file=sys.stderr))
+    print(json.dumps({"status": key_status(), "keys": len(table)},
+                     indent=2, ensure_ascii=False))
+    return 0
+
 def cmd_keys(a):
     aid = _appid(a.appid)
     probe = probe_app(aid, a.branch)
@@ -2417,10 +2570,14 @@ class Api:
             table = depot_key_db(refresh=True,
                                  progress=lambda m: LOGS.add(m))
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-        LOGS.add(f"depot key table: {len(table)} keys")
-        return {"ok": bool(table), "keys": len(table),
-                "error": None if table else "table came back empty"}
+            LOGS.add("depot key refresh crashed: " + str(exc))
+            return {"ok": False, "error": str(exc), "keys": 0}
+        st = key_status()
+        LOGS.add(f"depot key table: {len(table)} keys - {st['path']}")
+        if not table and st.get("error"):
+            LOGS.add("key table error: " + st["error"])
+        return {"ok": bool(table), "keys": len(table), "status": st,
+                "error": None if table else (st.get("error") or "table came back empty")}
 
     def _pick_lua(self):
         try:
@@ -2585,7 +2742,7 @@ th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;lett
 #probeout{margin-top:14px}
 label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
 </style></head><body>
-<header><b>LICENSETOOLS</b><span id="h-root">detecting...</span><span id="h-loader"></span></header>
+<header><b>LICENSETOOLS</b><span id="h-ver" class="mono" style="color:#7C8797">v{{VER}}</span><span id="h-root">detecting...</span><span id="h-loader"></span></header>
 <nav>
   <button class="tab pri" data-t="grant">Grant</button>
   <button class="tab" data-t="library">Library</button>
@@ -2883,7 +3040,8 @@ $("#b-m-keys").onclick=async()=>{
   busy(true);say("refreshing the depot key table...");
   try{
     const r=await call("refresh_keys");
-    say(r.ok?("depot key table: "+r.keys+" keys"):("refresh failed: "+(r.error||"")));
+    if(r.ok)say("depot key table: "+r.keys+" keys"+(r.status&&r.status.path?(" - "+r.status.path):""));
+    else say("refresh failed: "+(r.error||"")+(r.status&&r.status.path?(" ["+r.status.path+"]"):""));
   }catch(e){say("refresh failed: "+e)}
   busy(false);
 };
@@ -2944,7 +3102,7 @@ def run_gui():
         sys.exit("pywebview missing - pip install 'pywebview>=5.0'")
     index = CACHE_DIR / "ui" / "index.html"
     index.parent.mkdir(parents=True, exist_ok=True)
-    index.write_text(GUI_HTML, encoding="utf-8")
+    index.write_text(GUI_HTML.replace("{{VER}}", APP_VERSION), encoding="utf-8")
     threading.Thread(target=_provision_quiet, daemon=True).start()
     webview.create_window(
         "LicenseTools", str(index), js_api=Api(),
@@ -3026,6 +3184,10 @@ def build_argparser():
                        help="install a .lua and copy its depot keys into the loader config")
     p.add_argument("file")
     p.set_defaults(fn=cmd_import_lua)
+
+    p = sub.add_parser("keydb", help="show or refresh the depot key table")
+    p.add_argument("--refresh", action="store_true")
+    p.set_defaults(fn=cmd_keydb)
 
     p = sub.add_parser("keys", help="resolve depot decryption keys for an appid")
     p.add_argument("appid")

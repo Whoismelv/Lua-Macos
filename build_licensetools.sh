@@ -89,6 +89,21 @@ python licensetools_mac.py --selftest
 echo "== clean =="
 rm -rf build-lic dist-lic "$BUNDLE.spec"
 
+echo "== depot key table =="
+KEYDB_ARG=()
+if curl -fsSL --max-time 240 -o depotkeys.json \
+  "https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json"; then
+  KEYDB_SIZE=$(wc -c < depotkeys.json | tr -d ' ')
+  if [ "$KEYDB_SIZE" -gt 1000000 ]; then
+    echo "key table: $KEYDB_SIZE bytes, bundling"
+    KEYDB_ARG=(--add-data "depotkeys.json:.")
+  else
+    echo "key table: too small ($KEYDB_SIZE), runtime fetch stays active"
+  fi
+else
+  echo "key table: download failed, runtime fetch stays active"
+fi
+
 echo "== pyinstaller =="
 pyinstaller \
   --noconfirm --clean --windowed \
@@ -97,6 +112,7 @@ pyinstaller \
   --add-data "licensetools_mac.py:." \
   --add-data "vendor/dd:vendor/dd" \
   --add-data "vendor/macsteam:vendor/macsteam" \
+  "${KEYDB_ARG[@]}" \
   --collect-data certifi \
   --hidden-import webview.platforms.cocoa \
   --collect-submodules webview \
