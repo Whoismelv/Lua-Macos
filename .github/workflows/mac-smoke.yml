@@ -106,7 +106,9 @@ jobs:
           print("synthetic bundle cleaned")
           PY
       - name: diagnostics
+        continue-on-error: true
         run: |
+          set +e
           set -o pipefail
           {
             echo "## mac-smoke"
