@@ -37,7 +37,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -554,6 +554,65 @@ def install_lua_text(appid, text, branch="public"):
     return {"ok": True, "appid": int(appid), "dest": str(dest),
             "lines": text.count("\n"), "notes": notes}
 
+LUA_ADD_RE = re.compile(
+    r'addappid\s*\(\s*(\d+)\s*(?:,\s*\d+\s*(?:,\s*"([0-9a-fA-F]+)"\s*)?)?\)')
+LUA_MANIFEST_RE = re.compile(r'setManifestid\s*\(\s*(\d+)\s*,\s*"(\d+)"')
+
+def lua_scan(text):
+    ids, keys, manifests = [], {}, {}
+    for m in LUA_ADD_RE.finditer(text or ""):
+        aid = int(m.group(1))
+        if aid not in ids:
+            ids.append(aid)
+        key = (m.group(2) or "").lower()
+        if len(key) == 64:
+            keys[aid] = key
+    for m in LUA_MANIFEST_RE.finditer(text or ""):
+        manifests[int(m.group(1))] = m.group(2)
+    main = ids[0] if ids else None
+    depots = [i for i in ids if i != main]
+    return {"main": main, "ids": ids, "depots": depots,
+            "keys": keys, "manifests": manifests}
+
+def local_depot_keys(depots):
+    want = {int(d) for d in depots}
+    out = {}
+    st = SteamCtx().plugin_dir()
+    if not st or not st.is_dir():
+        return out
+    for f in sorted(st.glob("*.lua")):
+        try:
+            found = lua_scan(f.read_text(encoding="utf-8", errors="replace"))["keys"]
+        except OSError:
+            continue
+        for d, k in found.items():
+            if d in want:
+                out[d] = k
+        if len(out) == len(want):
+            break
+    return out
+
+def import_lua_file(path):
+    p = Path(path).expanduser()
+    if not p.is_file():
+        return {"ok": False, "error": f"not found: {p}"}
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    scan = lua_scan(text)
+    if scan["main"] is None:
+        return {"ok": False, "error": "no addappid(...) lines in that file"}
+    main = scan["main"]
+    inst = install_lua_text(main, text, "public")
+    cfg = macsteam_config_add(main, depots=scan["depots"], keys=scan["keys"])
+    LOGS.add(f"imported lua for {main}: {len(scan['depots'])} depot(s), "
+             f"{len(scan['keys'])} key(s)")
+    return {"ok": bool(inst.get("ok")), "appid": main,
+            "depots": len(scan["depots"]), "keys": len(scan["keys"]),
+            "lua": inst.get("dest"), "config": cfg,
+            "error": inst.get("error") or cfg.get("error")}
+
 def remove_lua(appid):
     st = SteamCtx().plugin_dir()
     if st is None:
@@ -1065,16 +1124,23 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
         try:
             pr = subprocess.run(args, capture_output=True, text=True, errors="replace",
                                 timeout=3600, env=env, cwd=str(outroot))
-            tail = (pr.stderr or pr.stdout or "")[-600:]
+            raw = (pr.stderr or "") + "\n" + (pr.stdout or "")
+            tail = raw.strip()[-1200:]
             code, hint = classify_dd(tail)
             item = {"depot": r["depot"], "manifest": r["manifest"],
                     "exit": pr.returncode, "out": str(ddir), "tail": tail}
             if code:
                 item["error_code"], item["hint"] = code, hint
+            if pr.returncode != 0 and progress:
+                last = next((ln.strip() for ln in reversed(raw.splitlines())
+                             if ln.strip()), "no output")
+                progress(f"depot {r['depot']} exit {pr.returncode} - {last[:220]}")
             results.append(item)
         except Exception as exc:
             results.append({"depot": r["depot"], "error": str(exc),
                             "error_code": "run_failed", "hint": str(exc)})
+            if progress:
+                progress(f"depot {r['depot']} could not start - {exc}")
     ok = all(x.get("exit") == 0 for x in results if "exit" in x)
     failed = next((x for x in results if x.get("error_code")), None)
     res = {"ok": ok, "root": str(outroot), "results": results, "skipped_depots": skipped}
@@ -1082,8 +1148,13 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
         res["error_code"] = failed["error_code"]
         res["hint"] = failed.get("hint")
     elif not ok:
+        bad = next((x for x in results if x.get("exit") not in (0, None)), {})
+        last = next((ln.strip() for ln in reversed((bad.get("tail") or "").splitlines())
+                     if ln.strip()), "")
         res["error_code"] = "download_failed"
-        res["hint"] = "DepotDownloader exited non-zero - check the depot lines in the log"
+        res["hint"] = last or "DepotDownloader exited non-zero - check the depot lines in the log"
+    if not ok:
+        res["error"] = res.get("hint") or res.get("error_code") or "download failed"
     return res
 
 # ---------- install downloaded content into the steam library ----------
@@ -1161,6 +1232,11 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
     installdir = probe.get("installdir") or probe.get("name") or str(aid)
     target = sa / "common" / installdir
     target.mkdir(parents=True, exist_ok=True)
+    depots = [int(r["depot"]) for r in rows]
+    keys = local_depot_keys(depots)
+    macsteam_config_add(aid, depots=depots, keys=keys)
+    if progress:
+        progress(f"loader config: {len(depots)} depot(s), {len(keys)} key(s) pinned")
     res = fetch_game(aid, branch, rows, want_os, True, user, password,
                      str(target), None, None, progress, flat=True)
     if not res.get("ok"):
@@ -1174,6 +1250,10 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
                 size += p.stat().st_size
             except OSError:
                 pass
+    if size == 0:
+        return {"ok": False, "stage": "download", "target": str(target),
+                "error": "depot download wrote no files",
+                "hint": "no content came back - press Download files again, or let Steam install it"}
     acf = write_appmanifest(aid, probe.get("name"), installdir,
                             probe.get("buildid", ""), rows, size)
     return {"ok": bool(acf.get("ok")), "appid": str(aid), "dir": str(target),
@@ -1626,7 +1706,71 @@ def _ms_drop_from_list(lines, header, item):
         lines[start + 1:end] = keep
     return dropped
 
-def macsteam_config_add(appid, packages=(20200,)):
+def _ms_ensure_depot_group(lines, appid, depots, keys=None):
+    appid = int(appid)
+    keys = {int(k): str(v).strip() for k, v in (keys or {}).items()}
+    depots = [int(d) for d in depots]
+    if not depots:
+        return False
+    bounds = _ms_section(lines, "DepotKeys:")
+    if bounds is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append("DepotKeys:")
+        bounds = (len(lines) - 1, len(lines))
+    start, end = bounds
+    group = None
+    for i in range(start + 1, end):
+        raw = lines[i]
+        if len(raw) - len(raw.lstrip(" ")) == 2 and raw.strip().endswith(":"):
+            tok = raw.strip()[:-1].strip()
+            if tok.isdigit() and int(tok) == appid:
+                group = i
+                break
+    changed = False
+    if group is None:
+        insert_at = end
+        while insert_at > start + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines[insert_at:insert_at] = [f"  {appid}:"]
+        group = insert_at
+        changed = True
+        end += 1
+    have = {}
+    j = group + 1
+    while j < len(lines):
+        raw = lines[j]
+        if not raw.strip():
+            j += 1
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if indent <= 2:
+            break
+        if indent == 4 and ":" in raw:
+            k, v = raw.strip().split(":", 1)
+            if k.strip().isdigit():
+                have[int(k.strip())] = v.strip().strip("'\"")
+        j += 1
+    for d, key in keys.items():
+        if d in have and len(key) == 64 and have[d].lower() != key:
+            for i in range(group + 1, j):
+                raw = lines[i]
+                if len(raw) - len(raw.lstrip(" ")) != 4 or ":" not in raw:
+                    continue
+                k = raw.strip().split(":", 1)[0].strip()
+                if k.isdigit() and int(k) == d:
+                    lines[i] = f"    {d}: {key}"
+                    have[d] = key
+                    changed = True
+                    break
+    missing = [d for d in depots if d not in have]
+    if missing:
+        at = group + 1 if not have else j
+        lines[at:at] = [f"    {d}: {keys.get(d, '0')}" for d in missing]
+        changed = True
+    return changed
+
+def macsteam_config_add(appid, packages=(20200,), depots=(), keys=None):
     if sys.platform != "darwin":
         return {"ok": False, "skipped": "macsteam config exists on macOS only"}
     cfg = Path.home() / "Library" / "Application Support" / "macsteam"
@@ -1639,13 +1783,32 @@ def macsteam_config_add(appid, packages=(20200,)):
         lines.insert(1, "")
     changed = _ms_ensure_list(lines, "Apps:", [int(appid)])
     changed = _ms_ensure_list(lines, "PackageIds:", [int(p) for p in packages]) or changed
+    changed = _ms_ensure_depot_group(lines, appid, depots, keys) or changed
     out = re.sub(r"\n{3,}", "\n\n", "\n".join(lines).strip("\n") + "\n")
     try:
         f.write_text(out, encoding="utf-8")
     except Exception as exc:
         return {"ok": False, "error": f"config write failed: {exc}"}
-    apps, _pkgs, _depot = _ms_parse(out)
-    return {"ok": True, "file": str(f), "apps": len(apps), "changed": changed}
+    apps, _pkgs, depot = _ms_parse(out)
+    return {"ok": True, "file": str(f), "apps": len(apps),
+            "depots": len(depot.get(int(appid), {})), "changed": changed}
+
+def _ms_drop_depot_group(lines, appid):
+    bounds = _ms_section(lines, "DepotKeys:")
+    if bounds is None:
+        return False
+    start, end = bounds
+    for i in range(start + 1, end):
+        raw = lines[i]
+        if len(raw) - len(raw.lstrip(" ")) == 2 and raw.strip().endswith(":"):
+            if raw.strip()[:-1].strip() == str(int(appid)):
+                j = i + 1
+                while j < end and (not lines[j].strip() or
+                                   len(lines[j]) - len(lines[j].lstrip(" ")) > 2):
+                    j += 1
+                del lines[i:j]
+                return True
+    return False
 
 def macsteam_config_remove(appid):
     if sys.platform != "darwin":
@@ -1660,13 +1823,15 @@ def macsteam_config_remove(appid):
         return {"ok": False, "error": str(exc)}
     lines = text.replace("\r\n", "\n").split("\n")
     had = _ms_drop_from_list(lines, "Apps:", appid)
+    dropped_keys = _ms_drop_depot_group(lines, appid)
     out = re.sub(r"\n{3,}", "\n\n", "\n".join(lines).strip("\n") + "\n")
     try:
         f.write_text(out, encoding="utf-8")
     except Exception as exc:
         return {"ok": False, "error": f"config write failed: {exc}"}
     apps, _pkgs, _depot = _ms_parse(out)
-    return {"ok": True, "removed": had, "file": str(f), "apps": len(apps)}
+    return {"ok": True, "removed": had, "keys_removed": dropped_keys,
+            "file": str(f), "apps": len(apps)}
 
 def _stage_macsteam_app(archive, dest):
     if archive.suffix.lower() == ".zip":
@@ -1888,6 +2053,11 @@ def cmd_install(a):
     aid = _appid(a.appid) if a.appid else None
     print(json.dumps(install_local(a.file, aid, a.branch), indent=2, ensure_ascii=False))
 
+def cmd_import_lua(a):
+    res = import_lua_file(a.file)
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("ok") else 1
+
 def cmd_library(_a):
     print(json.dumps(library_list(), indent=2, ensure_ascii=False))
 
@@ -2022,6 +2192,14 @@ class Api:
         inst = install_lua_text(int(appid), lua, branch)
         inst["depots"] = len(rows)
         inst["manifest_files"] = files
+        depots = [int(r["depot"]) for r in rows]
+        keys = local_depot_keys(depots)
+        cfg = macsteam_config_add(int(appid), depots=depots, keys=keys)
+        inst["config"] = cfg
+        inst["depot_keys"] = len(keys)
+        if not cfg.get("ok"):
+            inst["config_error"] = cfg.get("error") or cfg.get("skipped")
+        LOGS.add(f"loader config: {len(depots)} depot(s), {len(keys)} key(s)")
         LOGS.add(("installed " + inst["dest"]) if inst.get("ok")
                  else ("grant failed: " + str(inst.get("error"))))
         return inst
@@ -2048,12 +2226,21 @@ class Api:
                             "error": inst.get("error"), "steps": steps}
             else:
                 steps.append({"step": "loader", "ok": True, "note": "already injected"})
-            cfg = macsteam_config_add(int(aid))
+            probe = probe_app(int(aid), branch)
+            depots, keys = [], {}
+            if probe.get("ok"):
+                rows = select_rows(probe["rows"], want_os)
+                depots = [int(r["depot"]) for r in rows]
+                keys = local_depot_keys(depots)
+            else:
+                LOGS.add("probe failed before config: " + str(probe.get("error")))
+            cfg = macsteam_config_add(int(aid), depots=depots, keys=keys)
             steps.append({"step": "config", **cfg})
             if not cfg.get("ok"):
                 return {"ok": False, "stage": "config", "error": cfg.get("error"),
                         "steps": steps}
-            LOGS.add(f"app {aid} added to the loader config")
+            LOGS.add(f"app {aid} added to the loader config - {len(depots)} depot(s), "
+                     f"{len(keys)} key(s)")
             LOGS.add("steam restarting - game will show in your library")
             restart_steam()
             steps.append({"step": "restart", "ok": True})
@@ -2131,6 +2318,32 @@ class Api:
 
     def paths(self):
         return paths_report()
+
+    def _pick_lua(self):
+        try:
+            import webview
+            wins = getattr(webview, "windows", None) or []
+            if not wins:
+                return ""
+            picked = wins[0].create_file_dialog(
+                webview.OPEN_DIALOG, allow_multiple=False,
+                file_types=("Lua files (*.lua)", "All files (*.*)"))
+        except Exception:
+            return ""
+        if not picked:
+            return ""
+        return picked[0] if isinstance(picked, (list, tuple)) else str(picked)
+
+    def import_lua(self, path=""):
+        p = str(path or "").strip()
+        if not p:
+            p = self._pick_lua()
+            if not p:
+                return {"ok": False, "cancelled": True}
+        res = import_lua_file(p)
+        LOGS.add(("lua " + str(res.get("appid")) + " imported")
+                 if res.get("ok") else ("lua import failed: " + str(res.get("error"))))
+        return res
 
     def repair(self, appid):
         aid = str(appid or "").strip()
@@ -2302,6 +2515,7 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
     <input id="f-user" placeholder="steam user" style="width:160px">
     <input id="f-pass" placeholder="password" type="password" style="width:160px">
     <button id="b-fetch">Fetch Content</button>
+    <button id="b-lua">Import .lua</button>
     <span class="muted">Download files puts the game into steamapps/common and fixes the install record</span>
   </div>
   <div id="hits" class="muted"></div>
@@ -2347,7 +2561,7 @@ let api=null,logIdx=0;
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const say=t=>{$("#status").textContent=t};
-function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
+function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-lua","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
 async function call(fn,...args){if(!api)throw new Error("bridge not ready");return api[fn](...args)}
 document.querySelectorAll("button.tab").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("button.tab").forEach(x=>x.classList.toggle("pri",x===b));
@@ -2435,6 +2649,16 @@ async function doFetch(){
   }catch(e){say("fetch failed: "+e)}
   busy(false);
 }
+async function doImportLua(){
+  busy(true);say("pick the .lua file...");
+  try{
+    const r=await call("import_lua","");
+    if(r.cancelled)say("cancelled");
+    else if(r.ok)say(`lua imported for ${r.appid} - ${r.depots} depot(s), ${r.keys} key(s)`);
+    else say("lua import failed: "+(r.error||""));
+  }catch(e){say("lua import failed: "+e)}
+  busy(false);
+}
 async function boot(){
   try{
     const d=await call("bootstrap");
@@ -2517,6 +2741,7 @@ $("#b-ldref").onclick=ldRefresh;
 $("#b-ldmac").onclick=()=>ldInstall("macsteam");
 $("#b-ldst").onclick=()=>ldInstall("steamtools");
 $("#b-fetch").onclick=doFetch;
+$("#b-lua").onclick=doImportLua;
 $("#b-m-open").onclick=async()=>{
   try{
     const r=await call("open_folder","steamapps");
@@ -2678,6 +2903,11 @@ def build_argparser():
     p.add_argument("--appid", default="")
     p.add_argument("--branch", default="public")
     p.set_defaults(fn=cmd_install)
+
+    p = sub.add_parser("import-lua",
+                       help="install a .lua and copy its depot keys into the loader config")
+    p.add_argument("file")
+    p.set_defaults(fn=cmd_import_lua)
 
     p = sub.add_parser("fetch", help="download depot content with DepotDownloader")
     p.add_argument("appid")
