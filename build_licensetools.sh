@@ -20,7 +20,7 @@ fi
 # shellcheck disable=SC1091
 source .build-venv/bin/activate
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet pyinstaller "pywebview>=5.0" certifi
+python -m pip install --quiet pyinstaller "pywebview>=5.0" certifi pycryptodome zstandard
 
 echo "== vendor: DepotDownloader =="
 ARCH="$(uname -m)"
@@ -109,12 +109,13 @@ pyinstaller \
   --noconfirm --clean --windowed \
   --name "$BUNDLE" \
   --icon icon.icns \
-  --add-data "licensetools_mac.py:." \
   --add-data "vendor/dd:vendor/dd" \
   --add-data "vendor/macsteam:vendor/macsteam" \
   "${KEYDB_ARG[@]}" \
   --collect-data certifi \
   --hidden-import webview.platforms.cocoa \
+  --hidden-import Crypto.Cipher.AES \
+  --hidden-import zstandard \
   --collect-submodules webview \
   --osx-bundle-identifier "com.whoismelv.licensetools" \
   --distpath dist-lic --workpath build-lic \

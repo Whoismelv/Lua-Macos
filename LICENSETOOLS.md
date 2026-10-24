@@ -1,6 +1,6 @@
 # LicenseTools for macOS
 
-أدوات ترخيص ستيم لنظام macOS — توليد ملفات الـ lua، تثبيتها في `config/stplug-in`، تثبيت المانيفست، ونزول المحتوى عبر DepotDownloader.
+أدوات ترخيص ستيم لنظام macOS — توليد ملفات الـ lua، تثبيتها في `config/stplug-in`، تثبيت المانيفست، ونزول المحتوى مباشرة من شبكة Steam (CDN) بدون حساب وبدون رمز إيميل.
 
 A Steam license kit for macOS: probe public appinfo, generate `stplug-in` lua (`addappid` / `setManifestid`), pin manifests, fetch depot content.
 
@@ -15,7 +15,12 @@ A Steam license kit for macOS: probe public appinfo, generate `stplug-in` lua (`
 3. البرنامج بيعمل كل شي لحاله: بيفحص الـ loader، وإذا مش منصّب بينصّبه من الـ payload المخزّن جوّاه (بدون تحميل ولا برنامج خارجي)، بيجيب الديبوتات، بيكتب الـ lua + إعدادات macSteam، وبيعيد تشغيل ستيم.
 4. اللعبة بتظهر بالمكتبة. خلص.
 
-> بدك ملفات اللعبة نفسها؟ حط اسم حسابك وكلمة السر واضغط **Fetch Content** — بينزل على `~/.licensetools/games/`.
+> بدك ملفات اللعبة نفسها؟ اضغط **Download files** — بينزل الـ depots مباشرة من شبكة Steam جوّه
+> `~/Library/Application Support/Steam/steamapps/common/<installdir>`، كل ملف متحقَّق منه بالـ hash، وبيعدّل
+> صلاحية التنفيذ على ملفات `Contents/MacOS`.
+> زر **Update game** بيعمل نفس الشي بس بيتخطى الملفات اللي حجمها و hash تبعها صح — ما بتمسح ولا بتحمّل من جديد.
+> بعد التنزيل البرنامج بيستبدل مكتبة `libsteam_api.dylib` جوّه اللعبة بنسخة مولَّدة من الرموز اللي اللعبة نفسها بتستوردها،
+> فما بيسألك فحص ملكية. زر **Restore DRM files** بيرجّع الأصلية، وزر **Skip Steam DRM** بيعيد العملية يدوياً.
 > تبويب **Loader** فيه نفس الأزرار يدوياً لو احتجت تعيد التنصيب.
 > الـ loader (macSteam dylib + signatures) متحمّل جوّه التطبيق وقت البناء — ما بتنزّل ولا برنامج تاني.
 
@@ -28,7 +33,7 @@ A Steam license kit for macOS: probe public appinfo, generate `stplug-in` lua (`
 | `grant APPID` | توليد + تثبيت الـ lua (`--os mac` `--branch` `--no-pin` `--dry-run`) |
 | `remove APPID` | مسح ملف الـ lua |
 | `loader status` / `loader install` | فحص وتثبيت الـ loader |
-| `fetch APPID` | نزول المحتوى عبر DepotDownloader (`--user` / `--pass`) |
+| `fetch APPID` | نزول المحتوى عبر DepotDownloader (`--user` / `--pass`) — للمستخدمين المتقدّمين فقط |
 | `library` / `list` / `restart` / `ensure` / `settings` / `gui` | الباقي مثل ما هو |
 
 الوقت اللي بتحفظ فيه ملفات الـ lua القديمة: `~/.licensetools/vault/`.
@@ -44,10 +49,13 @@ A Steam license kit for macOS: probe public appinfo, generate `stplug-in` lua (`
 3. The app does the rest by itself: checks the loader, injects it from the payload bundled inside the app (no downloads, no external program), probes depots, writes the lua + macSteam config, and restarts Steam.
 4. The game shows up in your library. Done.
 
-Want the actual game files too? Press **Download files** — the app pulls the game depots straight into
-`~/Library/Application Support/Steam/steamapps/common/<installdir>`, writes a real `appmanifest_<appid>.acf`,
-and restarts Steam so the Play button launches real content. DepotDownloader needs a Steam login that owns the
-game; without one it asks Steam to download instead.
+Want the actual game files too? Press **Download files** — the app pulls the depots straight from the Steam CDN into
+`~/Library/Application Support/Steam/steamapps/common/<installdir>`, verifies every file against the manifest SHA-1,
+and restarts Steam so the Play button launches real content. No account, no password, no Steam Guard code.
+**Update game** re-checks the installed files and only re-pulls what actually changed.
+Right after a download the app replaces the game's `libsteam_api.dylib` with one generated from the exact symbols the
+game imports, so the ownership check answers yes. **Restore DRM files** puts the original back;
+**Skip Steam DRM** runs the same step on its own.
 The **Loader** tab keeps the same actions manually if you ever need to re-inject.
 The **Maintenance** tab is GUI-only housekeeping: show the resolved Steam paths, repair a stale install record,
 delete a game (record + files + staging + library cache + license line), open the Steam folder or the game
@@ -84,9 +92,65 @@ bash build_licensetools.sh   # -> dist/LicenseTools.dmg
 python3 licensetools_mac.py --selftest
 ```
 
-Bundled: DepotDownloader (vendored at build time). steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
+Bundled: DepotDownloader (vendored at build time) and `pycryptodome` for the AES fast path. steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
 
-### What changed in 1.3.0
+### What changed in 1.5.0
+
+1.5.0 is the release where Play actually launches, and where Steam stops fighting the app over the library.
+
+- **The game's ownership check is replaced, not argued with.** Some mac builds load `libsteam_api.dylib` and ask it whether you own the app. `Skip Steam DRM` (Maintenance) scans the game binary with `nm -u`, collects the exact `Steam*` symbols it imports, generates a matching C source, compiles it with `clang` as a `arm64 + x86_64` fat dylib, ad-hoc codesigns it, and drops it over the original. The original is kept as `libsteam_api.dylib.orig`, and `steam_appid.txt` is written next to the executable and at the install root so `SteamAPI_Init` knows which app it is. Done automatically after **Download files**.
+- **Symbols are read, never guessed.** A hand-written stand-in misses one export and the game dies with `symbol not found`. The generated one exports exactly what the binary imports, plus every interface accessor, so `SteamAPI_SteamUser_v023()` returns a live object pointer instead of `NULL`.
+- **`Restore DRM files`** puts the untouched original back, deletes `steam_appid.txt` and the marker, and re-signs the bundle.
+- **Steam quit/launch was rewritten.** The old quit sent one Apple event and gave up after a few seconds, so Steam was very often still alive when the app wrote the library record — which is why the record vanished on the next launch. Now: Apple event → `SIGTERM` on the real pids → `SIGKILL` → orphan `steamwebhelper` cleanup, each with its own wait, and the install **refuses to write** when Steam will not close instead of losing the record silently.
+- **Launch tries three routes** (`open -b com.valvesoftware.steam`, `open -a Steam`, then the bundle path) and reports which one worked. `Restart Steam` now reports the real outcome in the log instead of claiming success.
+- **`steamapps/depotcache` path fixed.** Manifests dropped by the app were written one directory too high, so Steam never saw them while the paths report showed a correct count.
+- **Manifest symlinks are validated.** A mirror serving `{"name": "...", "link": "/Users/you/Library"}` can no longer redirect the following file writes outside the install folder: absolute links and `..` are refused, and every write re-checks containment after resolution.
+- **`installdir` is validated** before joining, so a hostile appinfo cannot turn Download or Delete into writes or deletes outside `steamapps/common`.
+- **Multi-library aware.** The appmanifest lookup, install target, repair and uninstall now find the library that actually owns the app instead of always assuming the first one.
+- **The queued library record is cleaned up** on every early return (missing key, missing manifest, Steam still open, failed download), so a phantom 0-byte entry no longer sits in the library forever.
+- **Smaller fixes:** `state` parsing can't crash the whole library list any more, `pkill -f` is gone in favour of exact pids, `zstandard` is bundled for `VSZa` chunks, the steamcmd tar fallback refuses links and absolute paths, the lua importer only reads what the file dialog returns, and probe rows are escaped before they hit the webview table.
+
+### ما الجديد في 1.5.0
+
+الإصدار 1.5.0 هو اللي بيخلّي زر Play يفتح اللعبة فعلاً، وبيوقف ستيم عن مسح سجل المكتبة.
+
+- **فحص الملكية جوّه اللعبة صار مُستبدَل، مش مُتفاوَض عليه.** بعض إصدارات الماك بتحمّل `libsteam_api.dylib` وتسألها إذا اللعبة مملوكة. زر **Skip Steam DRM** (تبويب Maintenance) بيفحص ملف اللعبة بـ `nm -u`، بيجمع رموز `Steam*` اللي بتستوردها بالظبط، بيولّد ملف C مطابق، بيبنيه بـ `clang` كـ dylib fat `arm64 + x86_64`، بيوقّعه ad-hoc، وبيحطّه مكان الأصلي. الأصلي محفوظ باسم `libsteam_api.dylib.orig`، و`steam_appid.txt` بينكتب جانب الملف التنفيذي وفي جذر التثبيت عشان `SteamAPI_Init` يعرف أي تطبيق. بينعمل تلقائياً بعد **Download files**.
+- **الرموز بتتقرأ، ما بتتخمّن.** stand-in مكتوب بالإيد بينسى رمز واحد فتقع اللعبة بـ `symbol not found`. المولَّد بيصدّر اللي اللعبة بتستورده بالظبط، زائد كل accessors الواجهات، فـ `SteamAPI_SteamUser_v023()` بترجّع مؤشر حقيقي بدل `NULL`.
+- **`Restore DRM files`** بيرجّع الأصلي، بيمسح `steam_appid.txt` والـ marker، وبيعيد توقيع الحزمة.
+- **إغلاق وفتح ستيم انكتبوا من جديد.** الإغلاق القديم كان يبعت Apple event واحد ويستسلم بعد ثوانٍ، فستيم كان يظل شغّال وقت كتابة سجل المكتبة — ولهذا السجل كان يختفي بعد إعادة التشغيل. هلق: Apple event → `SIGTERM` على الـ pids الحقيقية → `SIGKILL` → تنظيف `steamwebhelper` اليتيم، كل خطوة بانتظارها، والتثبيت **بيرفض يكتب** إذا ستيم ما انغلق بدل ما يضيّع السجل بصمت.
+- **الفتح بيجرّب ثلاث طرق** (`open -b com.valvesoftware.steam`، `open -a Steam`، بعدها مسار الحزمة) وبيقول أي وحدة نجحت. و**Restart Steam** صار يبلّغ بالنتيجة الحقيقية بالسجل بدل ما يدّعي النجاح.
+- **مسار `steamapps/depotcache` انتصلح.** المانيفست اللي كان البرنامج يحطّه كان بمجلد أعلى بمستوى، فستيم ما كان يشوفه بينما تقرير المسارات يعرض عدد صحيح.
+- **الـ symlinks بالمانيفست صارت متحقَّقة.** مرآة تخدم `{"name": "...", "link": "/Users/you/Library"}` ما عاد تقدر تحوّل كتابة الملفات برّا مجلد التثبيت: الروابط المطلقة و`..` مرفوضة، وكل كتابة بتعيد التحقق من الاحتواء بعد الـ resolution.
+- **`installdir` صار متحقَّق** قبل الدمج، فـ appinfo خبيث ما بيقدر يحوّل التنزيل أو الحذف لكتابة أو مسح برّا `steamapps/common`.
+- **دعم أكثر من مكتبة.** البحث عن الـ appmanifest، ومكان التثبيت، والإصلاح، والحذف صاروا يلقون المكتبة اللي فعلاً بتملك اللعبة بدل ما يفترضوا الأولى دايماً.
+- **سجل المكتبة المؤقّت بينمسح** بكل خروج مبكر (مفتاح ناقص، مانيفست ناقص، ستيم ما انغلق، تنزيل فاشل)، فما بيظل سجل وهمي بحجم 0 بالمكتبة للأبد.
+- **إصلاحات أصغر:** قراءة `state` ما عادت تقدر تفشّل قائمة المكتبة كلها، `pkill -f` انشال لصالح pids دقيقة، `zstandard` صار محمول لحزم `VSZa`، فكّ tar لستيم-سي إم دي بيرفض الروابط والمسارات المطلقة، مستورد الـ lua بيقرأ بس اللي رجعه ملف الحوار، وصفوف الـ probe صارت مهرَّبة قبل ما تدخل جدول الويب.
+
+### What changed in 1.4.0
+
+Both old download paths were dead ends, so 1.4.0 stops using either of them.
+
+- **Steam-side download was unfixable.** The loader hooks `CAppInfo::GetManifestRequestCode` and asks `gmrc.wudrm.com` for the code; that host answers `502`, the hook falls through, Valve's CM returns `0` for an app you do not own, and the CDN manifest request comes back `401` — which Steam shows as `NO INTERNET CONNECTION`. Every mirror of that service is dead too.
+- **DepotDownloader needed a login, and the login needed an email code.** A Steam Guard code cannot be typed into a background downloader, so that path always ended at `InitializeSteam failed`. Both login fields are gone from the window.
+- **The app now pulls the depots itself.** It reads the staged manifest, walks the chunk table, fetches each chunk from the Steam CDN (`/depot/<id>/chunk/<sha1>`, no account, no request code), decrypts it with the depot key and decompresses it. Depots are AES-256-CBC: the first 16 bytes decrypt with AES-ECB into the CBC IV, the rest is CBC plus PKCS7. Payloads are `VZa` (raw LZMA1 with a 5-byte property block and a CRC/size footer), `VSZa` (zstd) or a plain zip — all three are handled.
+- **Every file is hash-verified** against the SHA-1 in the manifest while it is written. A mismatch is reported per file instead of being written silently. Directory and symlink entries are created, manifest `\` separators become `/`, and `Contents/MacOS/*` gets `0755` so the binary actually launches.
+- **Chunks are cached** at `~/.licensetools/chunks/<depot>/<sha1>`, so an interrupted download resumes instead of starting over.
+- **Update game** (Maintenance) is the new button: it re-reads the manifest and skips any file whose size and SHA-1 already match, so a patch pulls only the changed bytes instead of a fresh 700 MB.
+- **AES backends, in order:** CommonCrypto through `ctypes` (native on macOS, no dependency), then `pycryptodome` if bundled, then a pure-Python AES-256 fallback that is verified against the FIPS-197 test vector. `--selftest` now proves the AES block, the VZip frame decoder, the path flattener and the traversal refusal.
+
+### ما الجديد في 1.4.0
+
+طريقتي التنزيل القديمتين كانتا مسدودتين، فالإصدار 1.4.0 ما عاد يستخدم ولا وحدة منهن.
+
+- **التنزيل من جهة Steam غير قابل للإصلاح.** الـ loader يعترض `CAppInfo::GetManifestRequestCode` ويسأل `gmrc.wudrm.com` عن الكود؛ المضيف يرد `502`، الاعتراض يمرّ بدون نتيجة، خادم Valve يرد `0` لأن اللعبة غير مملوكة، وطلب الـ manifest من الـ CDN يرجع `401` — وSteam يترجمها `NO INTERNET CONNECTION`. كل بدائل هذه الخدمة ميتة كذلك.
+- **DepotDownloader بدّه تسجيل دخول، والتسجيل بدّه رمز إيميل.** رمز Steam Guard ما بينكتب داخل برنامج بيشتغل بالخلفية، فالمسار دايماً بينتهي بـ `InitializeSteam failed`. خانات الاسم وكلمة السر انشالت من الواجهة.
+- **البرنامج صار بينزّل الـ depots بنفسه.** بيقرأ المانيفست المثبَّت، بيمشي على جدول الـ chunks، بيجيب كل chunk من شبكة Steam (`/depot/<id>/chunk/<sha1>` بدون حساب وبدون request code)، بيفك تشفيرها بمفتاح الـ depot وبيفك ضغطها. التشفير AES-256-CBC: أول 16 بايت تنفك بـ AES-ECB لتصير الـ IV، والباقي CBC مع PKCS7. الحِزم ثلاثة أنواع: `VZa` (LZMA1 خام مع بلوك خصائص 5 بايت وfooter فيه CRC والحجم)، `VSZa` (zstd)، أو zip عادي — والثلاثة مدعومين.
+- **كل ملف متحقَّق منه بالـ hash** مقابل SHA-1 الموجود بالمانيفست وقت الكتابة. أي اختلاف بيطلع بالـ log كملف مرفوض بدل ما ينكتب بصمت. المجلدات والـ symlinks بتنعمل، وفواصل `\` بالمانيفست بتنقلب `/`، وملفات `Contents/MacOS/*` بتاخد صلاحية `0755` عشان الملف التنفيذي يشتغل فعلاً.
+- **الـ chunks مخزّنة** بـ `~/.licensetools/chunks/<depot>/<sha1>`، فإذا انقطع التنزيل بيكمّل من وين وقف بدل ما يبدأ من الصفر.
+- **Update game** (تبويب Maintenance) هو الزر الجديد: بيعيد قراءة المانيفست وبيتخطى أي ملف حجمه و SHA-1 تبعه مطابقين، فتحديث اللعبة بينزل الفروقات بس بدل 700 MB من جديد.
+- **محرّكات فك التشفير بالترتيب:** CommonCrypto عبر `ctypes` (أصلي على macOS وبدون أي مكتبة)، بعدها `pycryptodome` إذا كان محمّل، بعدها AES-256 بلغة بايثون صافية متحقَّق منه مقابل متجه FIPS-197. و`--selftest` صار يفحص بلوك AES وفكّ حزمة VZip وتسطيح المسارات ورفض `..`.
+
+
 
 `NO INTERNET CONNECTION` in the Steam downloads page is not your network. The loader hooks `CAppInfo::GetManifestRequestCode` and fetches the code from `http://gmrc.wudrm.com/manifest/<manifest_id>`; that host answers `502`, so the hook falls through, Valve's CM returns no code for an app you don't own, the CDN manifest request comes back `401`, and Steam reports it as no connection. Every mirror of that service is dead, so the code path is unfixable from the outside. 1.3.0 removes the need for it:
 

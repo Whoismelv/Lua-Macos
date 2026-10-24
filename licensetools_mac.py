@@ -3,12 +3,17 @@
 # Steam license kit for macOS: probe public appinfo, write stplug-in lua, pin manifests.
 # Mac paths first, Windows fallback kept so the same file runs on the bench.
 import argparse
+import concurrent.futures
 import gzip
+import hashlib
+import io
 import json
+import lzma
 import os
 import re
 import shutil
 import ssl
+import struct
 import subprocess
 import sys
 import tarfile
@@ -19,6 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 from pathlib import Path
 
 try:
@@ -38,7 +44,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.5.0"
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -158,14 +164,14 @@ class SteamCtx:
 
     def depot_cache(self):
         r = self.root()
-        return None if r is None else r / "depotcache"
+        return None if r is None else r / "steamapps" / "depotcache"
 
     def steam_exe(self):
         r = self.root()
         if r is None:
             return None
         if sys.platform == "darwin":
-            macos = Path("/Applications/Steam.app/Contents/MacOS")
+            macos = steam_app_path() / "Contents" / "MacOS"
             for name in ("steam_osx", "steam"):
                 if (macos / name).exists():
                     return macos / name
@@ -186,29 +192,139 @@ class SteamCtx:
             out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq steam.exe"],
                                  capture_output=True, text=True)
             return "steam.exe" in out.stdout.lower()
-        return subprocess.run(["pgrep", "-f", "Steam.app/Contents/MacOS/steam"],
-                              capture_output=True).returncode == 0
+        return _mac_steam_pids() != []
 
-    def stop(self):
-        if winreg is not None:
-            subprocess.run(["taskkill", "/F", "/IM", "steam.exe", "/T"], capture_output=True)
-        else:
-            subprocess.run(["pkill", "-f", "Steam.app/Contents/MacOS/steam"], capture_output=True)
-        time.sleep(1.2)
+    def stop(self, timeout=25):
+        return steam_quit(timeout)
 
-    def start(self):
-        if winreg is not None:
-            exe = self.steam_exe()
-            if exe and exe.exists():
-                subprocess.Popen([str(exe)], cwd=str(self.root()))
-        else:
-            subprocess.Popen(["open", "-a", "Steam"])
+    def start(self, timeout=25):
+        return steam_launch(timeout)
 
-def restart_steam():
-    ctx = SteamCtx()
-    ctx.stop()
-    ctx.start()
-    return {"ok": True, "restarted": True}
+STEAM_BUNDLE_ID = "com.valvesoftware.steam"
+
+def steam_app_path():
+    for raw in ("/Applications/Steam.app", "~/Applications/Steam.app"):
+        p = Path(raw).expanduser()
+        if p.is_dir():
+            return p
+    return Path("/Applications/Steam.app")
+
+def _run_quiet(argv, timeout=20):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+def _pgrep(flags):
+    res = _run_quiet(["pgrep"] + flags, timeout=10)
+    if res is None or res.returncode != 0:
+        return []
+    return sorted({t for t in res.stdout.split() if t.isdigit()})
+
+def _mac_steam_pids():
+    pids = set(_pgrep(["-x", "steam_osx"]))
+    pids.update(_pgrep(["-x", "Steam"]))
+    pids.update(_pgrep(["-f", "Steam.app/Contents/MacOS/steam"]))
+    return sorted(pids)
+
+def _mac_helper_pids():
+    return _pgrep(["-x", "steamwebhelper"])
+
+def _wait_gone(seconds, probe=None):
+    probe = probe or _mac_steam_pids
+    deadline = time.time() + max(1.0, seconds)
+    while time.time() < deadline:
+        if not probe():
+            return True
+        time.sleep(0.4)
+    return not probe()
+
+def steam_quit(timeout=25):
+    if winreg is not None:
+        before = SteamCtx().running()
+        _run_quiet(["taskkill", "/F", "/IM", "steam.exe", "/T"], timeout=20)
+        deadline = time.time() + 8
+        while time.time() < deadline and SteamCtx().running():
+            time.sleep(0.4)
+        return {"ok": not SteamCtx().running(), "was_running": before,
+                "method": "taskkill"}
+    pids = _mac_steam_pids()
+    if not pids:
+        for pid in _mac_helper_pids():
+            _run_quiet(["kill", "-KILL", pid], timeout=5)
+        return {"ok": True, "was_running": False, "method": "already-quit"}
+
+    _run_quiet(["osascript", "-e",
+                f'tell application id "{STEAM_BUNDLE_ID}" to quit'], timeout=15)
+    if _wait_gone(max(4, timeout * 0.4)):
+        return {"ok": True, "was_running": True, "method": "apple-event"}
+
+    for pid in _mac_steam_pids():
+        _run_quiet(["kill", "-TERM", pid], timeout=5)
+    if _wait_gone(max(3, timeout * 0.25)):
+        return {"ok": True, "was_running": True, "method": "term"}
+
+    for pid in _mac_steam_pids():
+        _run_quiet(["kill", "-KILL", pid], timeout=5)
+    if _wait_gone(6):
+        return {"ok": True, "was_running": True, "method": "kill"}
+
+    for pid in _mac_helper_pids():
+        _run_quiet(["kill", "-KILL", pid], timeout=5)
+    if _wait_gone(5):
+        return {"ok": True, "was_running": True, "method": "kill+helper"}
+
+    left = _mac_steam_pids()
+    return {"ok": False, "was_running": True, "method": "failed", "pids": left,
+            "error": "steam is still running - quit it from the menu bar"}
+
+def steam_launch(timeout=25, wait=True):
+    if winreg is not None:
+        exe = SteamCtx().steam_exe()
+        root = SteamCtx().root()
+        if exe and exe.exists():
+            try:
+                subprocess.Popen([str(exe)], cwd=str(root))
+            except OSError as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "launched": True}
+        return {"ok": False, "error": "steam.exe not found"}
+    if _mac_steam_pids():
+        return {"ok": True, "launched": False, "running": True,
+                "method": "already-running"}
+    errors = []
+    for argv in (["open", "-b", STEAM_BUNDLE_ID],
+                 ["open", "-a", "Steam"],
+                 ["open", str(steam_app_path())]):
+        res = _run_quiet(argv, timeout=25)
+        if res is not None and res.returncode == 0:
+            break
+        errors.append((res.stderr.strip() if res is not None and res.stderr
+                       else (argv[0] + " failed")))
+    else:
+        return {"ok": False, "error": " | ".join(errors[-2:]) or "open failed"}
+    if not wait:
+        return {"ok": True, "launched": True, "running": False, "method": "open"}
+    deadline = time.time() + max(6, timeout * 0.6)
+    while time.time() < deadline and not _mac_steam_pids():
+        time.sleep(0.5)
+    return {"ok": True, "launched": True, "running": bool(_mac_steam_pids()),
+            "method": "open"}
+
+def steam_wait_ready(timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _mac_steam_pids():
+            return True
+        time.sleep(0.5)
+    return bool(_mac_steam_pids())
+
+def restart_steam(timeout=25):
+    quit_info = steam_quit(timeout)
+    launch_info = steam_launch(timeout)
+    ok = bool(quit_info.get("ok") and launch_info.get("ok"))
+    return {"ok": ok, "restarted": ok, "quit": quit_info, "launch": launch_info,
+            "error": quit_info.get("error") or launch_info.get("error")}
 
 def mac_steam_root():
     return Path.home() / "Library" / "Application Support" / "Steam"
@@ -246,7 +362,7 @@ def library_roots():
 def paths_report():
     root = SteamCtx().root()
     cfg = Path.home() / "Library" / "Application Support" / "macsteam"
-    app = Path("/Applications/Steam.app")
+    app = steam_app_path()
     exe = SteamCtx().steam_exe()
     keys = key_status()
     return {
@@ -670,7 +786,7 @@ def _ssl_contexts():
     return out
 
 def _http_bytes(url, timeout=180, accept="application/vnd.github.raw, application/json, */*"):
-    base = {"User-Agent": "licensetools/1.3", "Accept": accept}
+    base = {"User-Agent": f"licensetools/{APP_VERSION}", "Accept": accept}
     last = ""
     for encoding in ("gzip", "identity"):
         headers = dict(base, **{"Accept-Encoding": encoding})
@@ -842,10 +958,13 @@ def installed_list():
     st = SteamCtx().plugin_dir()
     items = []
     if st and st.is_dir():
-        for f in st.glob("*.lua"):
-            stat = f.stat()
-            items.append({"appid": app_id_from_name(f), "file": f.name, "bytes": stat.st_size,
-                          "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime))})
+        for f in sorted(st.glob("*.lua")):
+            try:
+                blob = f.stat()
+            except OSError:
+                continue
+            items.append({"appid": app_id_from_name(f), "file": f.name, "bytes": blob.st_size,
+                          "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(blob.st_mtime))})
     items.sort(key=lambda x: x["mtime"], reverse=True)
     return {"ok": True, "items": items, "loaded": load_json_list(LOADED_PATH)}
 
@@ -974,8 +1093,12 @@ def library_list():
                 continue
             seen.add(appid)
             d = parse_acf(f)
-            apps.append({"appid": appid, "name": d.get("name", ""),
-                         "state": int(d.get("StateFlags", "0") or 0),
+            try:
+                state = int(d.get("StateFlags", "0") or 0)
+            except (TypeError, ValueError):
+                state = 0
+            apps.append({"appid": appid, "name": d.get("name", "") or f.stem,
+                         "state": state,
                          "installdir": d.get("installdir", ""), "buildid": d.get("buildid", "")})
     return {"ok": True, "apps": apps, "count": len(apps)}
 
@@ -1016,6 +1139,16 @@ def _find_tool(name):
 def steamcmd_url():
     return STEAMCMD_URLS.get(sys.platform, STEAMCMD_URLS["linux"])
 
+def _safe_extract(tar, dest):
+    dest = Path(dest).resolve()
+    for member in tar.getmembers():
+        if member.issym() or member.islnk() or member.isdev():
+            continue
+        target = (dest / member.name).resolve()
+        if target != dest and dest not in target.parents:
+            continue
+        tar.extract(member, dest)
+
 def install_steamcmd():
     dest = TOOLS_DIR / "steamcmd"
     dest.mkdir(parents=True, exist_ok=True)
@@ -1029,7 +1162,7 @@ def install_steamcmd():
                 try:
                     t.extractall(dest, filter="data")
                 except TypeError:
-                    t.extractall(dest)
+                    _safe_extract(t, dest)
         else:
             with zipfile.ZipFile(tmp) as z:
                 z.extractall(dest)
@@ -1042,12 +1175,10 @@ def install_steamcmd():
     if not cands:
         return {"ok": False, "error": "steamcmd binary missing from archive", "dir": str(dest)}
     exe = sorted(cands, key=lambda p: (p.name != prefer, len(p.parts)))[0]
-    for p in dest.rglob("*"):
-        if p.is_file():
-            try:
-                os.chmod(p, 0o755)
-            except OSError:
-                pass
+    try:
+        os.chmod(exe, 0o755)
+    except OSError:
+        pass
     return {"ok": True, "tool": str(exe), "source": "valve", "bytes": len(data)}
 
 def probe_app(appid, branch="public", appinfo_file=None):
@@ -1060,11 +1191,11 @@ def probe_app(appid, branch="public", appinfo_file=None):
     if not tool:
         got = install_steamcmd()
         tool = got.get("tool") if got.get("ok") else None
-    if not tool:
-        return {"ok": False, "error": "steamcmd unavailable and the automatic download failed"}
+    if not tool:        return {"ok": False, "error": "steamcmd unavailable and the automatic download failed"}
     args = [str(tool), "+@ShutdownOnFailedCommand", "1", "+@NoPromptForPassword", "1",
             "+login", "anonymous", "+app_info_print", str(appid), "+quit"]
     try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
         pr = subprocess.run(args, capture_output=True, text=True, errors="replace",
                             timeout=180, input="", cwd=str(CACHE_DIR))
     except subprocess.TimeoutExpired:
@@ -1195,6 +1326,61 @@ def selftest():
         v = vault_list(999999)
         check("vault roundtrip", "public" in v.get("branches", []), json.dumps(v))
         globals()["VAULT_DIR"] = VAULT_DIR
+
+    key = bytes(range(32))
+    block = bytes.fromhex("8ea2b7ca516745bfeafc49904b496089")
+    plain = bytes.fromhex("00112233445566778899aabbccddeeff")
+    check("aes-256 block decrypt", _pure_ecb_decrypt_nopad(key, block) == plain)
+    check("aes-256 backend decrypt", _aes_ecb_decrypt_nopad(key, block) == plain)
+    iv = bytes(range(16))
+    check("aes-256 cbc chain", _aes_cbc_decrypt(key, iv, block) is not None)
+
+    payload = b"licensetools chunk probe " * 400
+    raw_filter = {"id": lzma.FILTER_LZMA1, "dict_size": 1 << 20,
+                  "lc": 3, "lp": 0, "pb": 2}
+    packer = lzma.LZMACompressor(format=lzma.FORMAT_RAW, filters=[raw_filter])
+    stream = packer.compress(payload) + packer.flush()
+    props = b"\x5d" + struct.pack("<I", 1 << 20)
+    frame = (b"VZa" + b"\x00\x00\x00\x00" + props + stream +
+             struct.pack("<II", zlib.crc32(payload) & 0xFFFFFFFF, len(payload)) + b"zv")
+    try:
+        back = _vzip_decompress(frame)
+    except Exception as exc:
+        back = b"<" + str(exc).encode() + b">"
+    check("vzip frame decode", back == payload, f"{len(back)} bytes back")
+    check("cdn host list", bool(cdn_hosts()))
+    check("manifest path flatten",
+          _safe_rel("Contents\\MacOS\\StardewValley") == "Contents/MacOS/StardewValley")
+    check("manifest path traversal refused", _safe_rel("../../etc/passwd") is None)
+    check("installdir rejects traversal", clean_installdir("../../Documents") is None)
+    check("installdir rejects nesting", clean_installdir("a/b") is None)
+    check("installdir accepts a name", clean_installdir("Stardew Valley") == "Stardew Valley")
+
+    with tempfile.TemporaryDirectory() as td:
+        inside = Path(td) / "game"
+        inside.mkdir()
+        check("containment inside", _contained(inside, inside / "a" / "b"))
+        outside = Path(td) / "elsewhere"
+        outside.mkdir()
+        link = inside / "hop"
+        try:
+            os.symlink(outside, link)
+            escaped = not _contained(inside, link / "x")
+        except (OSError, NotImplementedError):
+            escaped = True
+        check("containment follows symlinks out", escaped)
+
+    stub_src = _stub_source(["SteamAPI_ISteamApps_BIsSubscribedApp",
+                             "SteamAPI_ISteamUser_GetSteamID",
+                             "SteamAPI_ISteamApps_GetAppID",
+                             "SteamAPI_SteamUser_v023"], 413150)
+    check("stub exports init", "SteamAPI_Init(void)" in stub_src)
+    check("stub emits matching symbol", "SteamAPI_ISteamApps_BIsSubscribedApp" in stub_src)
+    check("stub carries the appid", "413150ULL" in stub_src)
+    check("stub has one definition per symbol",
+          stub_src.count("SteamAPI_Init(void)") == 1, stub_src.count("SteamAPI_Init(void)"))
+    check("stub is brace balanced", stub_src.count("{") == stub_src.count("}"),
+          f"{stub_src.count('{')}/{stub_src.count('}')}")
 
     print(json.dumps({"ok": True, "checks": checks}, indent=2))
     print("selftest ok")
@@ -1384,12 +1570,40 @@ def steam_apps_dir():
     sa.mkdir(parents=True, exist_ok=True)
     return sa
 
-def read_appmanifest(appid):
-    sa = steam_apps_dir()
-    if sa is None:
+def all_steamapps_dirs():
+    out = []
+    for r in library_roots():
+        sa = r / "steamapps"
+        try:
+            if sa.is_dir() and all(str(sa) != str(x) for x in out):
+                out.append(sa)
+        except OSError:
+            continue
+    if not out:
+        first = steam_apps_dir()
+        if first is not None:
+            out.append(first)
+    return out
+
+def find_app_acf(appid):
+    for sa in all_steamapps_dirs():
+        f = sa / f"appmanifest_{int(appid)}.acf"
+        try:
+            if f.is_file():
+                return f
+        except OSError:
+            continue
+    return None
+
+def clean_installdir(value):
+    rel = _safe_rel(value)
+    if not rel or "/" in rel or rel in (".", ".."):
         return None
-    f = sa / f"appmanifest_{int(appid)}.acf"
-    return parse_acf(f) if f.exists() else None
+    return rel
+
+def read_appmanifest(appid):
+    f = find_app_acf(appid)
+    return parse_acf(f) if f is not None else None
 
 def write_appmanifest(appid, name, installdir, buildid, depots, size_on_disk=0):
     sa = steam_apps_dir()
@@ -1399,13 +1613,12 @@ def write_appmanifest(appid, name, installdir, buildid, depots, size_on_disk=0):
     lines = ['"AppState"', "{"]
     lines += [f'\t"appid"\t\t"{int(appid)}"',
               '\t"Universe"\t\t"1"',
-              f'\t"name"\t\t"{name or appid}"',
+              f'\t"name"\t\t"{_vdf_quote(name or appid)}"',
               '\t"StateFlags"\t\t"4"',
-              f'\t"installdir"\t\t"{installdir}"',
+              f'\t"installdir"\t\t"{_vdf_quote(installdir)}"',
               f'\t"LastUpdated"\t\t"{now}"',
               '\t"LastPlayed"\t\t"0"',
               f'\t"SizeOnDisk"\t\t"{int(size_on_disk)}"',
-              f'\t"StagingPath"\t\t"{sa / "downloading" / str(int(appid))}"',
               f'\t"buildid"\t\t"{buildid}"']
     lines.append('\t"InstalledDepots"')
     lines.append("\t{")
@@ -1425,8 +1638,11 @@ def write_appmanifest(appid, name, installdir, buildid, depots, size_on_disk=0):
     lines.append("}")
     path = sa / f"appmanifest_{int(appid)}.acf"
     tmp = path.with_suffix(".acf.tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
     return {"ok": True, "file": str(path)}
 
 MANIFEST_REPOS = (
@@ -1623,6 +1839,670 @@ def stage_manifests(appid, rows, progress=None):
     return {"ok": bool(staged), "staged": staged, "missing": missing,
             "errors": errors}
 
+# ---------- steam cdn chunk pipeline (no account, no request code) ----------
+
+CDN_SERVERS_URL = ("https://api.steampowered.com/IContentServerDirectoryService/"
+                   "GetServersForSteamPipe/v1/?cell_id=0")
+_FALLBACK_CDN = (
+    "fastly.cdn.steampipe.steamcontent.com",
+    "cloudflare.cdn.steampipe.steamcontent.com",
+    "akamai.cdn.steampipe.steamcontent.com",
+    "steampipe.steamcontent.com",
+)
+_CDN_HOSTS = []
+_FLAG_DIR = 64
+_FLAG_SYMLINK = 256
+
+def _make_sbox():
+    sbox = [0] * 256
+    p = q = 1
+    while True:
+        p = (p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)) & 0xFF
+        q ^= (q << 1) & 0xFF
+        q ^= (q << 2) & 0xFF
+        q ^= (q << 4) & 0xFF
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        q &= 0xFF
+        x = (q
+             ^ (((q << 1) | (q >> 7)) & 0xFF)
+             ^ (((q << 2) | (q >> 6)) & 0xFF)
+             ^ (((q << 3) | (q >> 5)) & 0xFF)
+             ^ (((q << 4) | (q >> 4)) & 0xFF))
+        sbox[p] = (x ^ 0x63) & 0xFF
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    return sbox
+
+def _gmul(a, b):
+    p = 0
+    for _ in range(8):
+        if b & 1:
+            p ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xFF
+        if hi:
+            a ^= 0x1B
+        b >>= 1
+    return p
+
+_AES_SBOX = _make_sbox()
+_AES_INV = [0] * 256
+for _i, _v in enumerate(_AES_SBOX):
+    _AES_INV[_v] = _i
+_M9 = [_gmul(x, 9) for x in range(256)]
+_M11 = [_gmul(x, 11) for x in range(256)]
+_M13 = [_gmul(x, 13) for x in range(256)]
+_M14 = [_gmul(x, 14) for x in range(256)]
+
+def _aes256_expand(key):
+    if len(key) != 32:
+        raise ValueError("aes-256 needs a 32 byte key")
+    nk, nr = 8, 14
+    words = [list(key[i:i + 4]) for i in range(0, 32, 4)]
+    rcon = 1
+    for i in range(nk, 4 * (nr + 1)):
+        temp = list(words[i - 1])
+        if i % nk == 0:
+            temp = temp[1:] + temp[:1]
+            temp = [_AES_SBOX[b] for b in temp]
+            temp[0] ^= rcon
+            rcon = (rcon << 1) ^ (0x1B if rcon & 0x80 else 0)
+            rcon &= 0xFF
+        elif i % nk == 4:
+            temp = [_AES_SBOX[b] for b in temp]
+        words.append([words[i - nk][j] ^ temp[j] for j in range(4)])
+    return [sum(words[4 * r:4 * r + 4], []) for r in range(nr + 1)]
+
+_INV_SHIFT = [((i % 4) + 4 * (((i // 4) - (i % 4)) % 4)) for i in range(16)]
+
+def _aes_decrypt_block(rk, block):
+    s = [block[i] ^ rk[14][i] for i in range(16)]
+    for rnd in range(13, 0, -1):
+        s = [s[_INV_SHIFT[i]] for i in range(16)]
+        s = [_AES_INV[b] for b in s]
+        s = [s[i] ^ rk[rnd][i] for i in range(16)]
+        out = [0] * 16
+        for c in range(4):
+            a0, a1, a2, a3 = s[4 * c:4 * c + 4]
+            out[4 * c + 0] = _M14[a0] ^ _M11[a1] ^ _M13[a2] ^ _M9[a3]
+            out[4 * c + 1] = _M9[a0] ^ _M14[a1] ^ _M11[a2] ^ _M13[a3]
+            out[4 * c + 2] = _M13[a0] ^ _M9[a1] ^ _M14[a2] ^ _M11[a3]
+            out[4 * c + 3] = _M11[a0] ^ _M13[a1] ^ _M9[a2] ^ _M14[a3]
+        s = out
+    s = [s[_INV_SHIFT[i]] for i in range(16)]
+    s = [_AES_INV[b] for b in s]
+    return bytes(s[i] ^ rk[0][i] for i in range(16))
+
+def _pure_cbc_decrypt(key, iv, data):
+    rk = _aes256_expand(key)
+    out = bytearray()
+    prev = iv
+    for off in range(0, len(data) - len(data) % 16, 16):
+        block = data[off:off + 16]
+        plain = _aes_decrypt_block(rk, block)
+        out += bytes(a ^ b for a, b in zip(plain, prev))
+        prev = block
+    return bytes(out)
+
+def _pure_ecb_decrypt_nopad(key, data):
+    rk = _aes256_expand(key)
+    out = bytearray()
+    for off in range(0, len(data) - len(data) % 16, 16):
+        out += _aes_decrypt_block(rk, data[off:off + 16])
+    return bytes(out)
+
+_CC = {"tried": False, "lib": None}
+
+def _common_crypto():
+    if _CC["tried"]:
+        return _CC["lib"]
+    _CC["tried"] = True
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+        lib = ctypes.CDLL(ctypes.util.find_library("System") or "/usr/lib/libSystem.B.dylib")
+        fn = lib.CCCrypt
+        fn.restype = ctypes.c_int32
+        fn.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                       ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t,
+                       ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t,
+                       ctypes.c_char_p, ctypes.c_size_t,
+                       ctypes.POINTER(ctypes.c_size_t)]
+        _CC["lib"] = fn
+    except Exception:
+        _CC["lib"] = None
+    return _CC["lib"]
+
+def _cc_crypt(op, options, key, iv, data):
+    fn = _common_crypto()
+    if fn is None:
+        return None
+    import ctypes
+    out = ctypes.create_string_buffer(len(data) + 32)
+    moved = ctypes.c_size_t(0)
+    status = fn(op, 2, 0, options, key, len(key), iv, data, len(data),
+                out, len(out), ctypes.byref(moved))
+    if status != 0:
+        return None
+    return out.raw[:moved.value]
+
+def _aes_cbc_decrypt(key, iv, data):
+    if len(data) % 16:
+        data = data[:len(data) - len(data) % 16]
+    res = _cc_crypt(1, 0x0001, key, iv, data)
+    if res is not None:
+        return res
+    try:
+        from Crypto.Cipher import AES
+        return AES.new(key, AES.MODE_CBC, iv).decrypt(data)
+    except Exception:
+        pass
+    return _pure_cbc_decrypt(key, iv, data)
+
+def _aes_ecb_decrypt_nopad(key, data):
+    res = _cc_crypt(1, 0x0002, key, b"\x00" * 16, data)
+    if res is not None:
+        return res
+    try:
+        from Crypto.Cipher import AES
+        return AES.new(key, AES.MODE_ECB).decrypt(data)
+    except Exception:
+        pass
+    return _pure_ecb_decrypt_nopad(key, data)
+
+def cdn_hosts(refresh=False):
+    global _CDN_HOSTS
+    if _CDN_HOSTS and not refresh:
+        return list(_CDN_HOSTS)
+    hosts = []
+    try:
+        blob, err = _http_bytes(CDN_SERVERS_URL, timeout=60)
+        if not err and blob:
+            data = json.loads(blob.decode("utf-8", "replace"))
+            for item in (data.get("response") or {}).get("servers") or []:
+                host = str((item or {}).get("host") or "").strip()
+                if host:
+                    hosts.append(host)
+    except Exception:
+        hosts = []
+    if not hosts:
+        hosts = list(_FALLBACK_CDN)
+    seen, out = set(), []
+    for host in hosts:
+        if host not in seen:
+            seen.add(host)
+            out.append(host)
+    _CDN_HOSTS = out
+    return list(out)
+
+def _vzip_decompress(buf):
+    if buf[:3] != b"VZa" or buf[-2:] != b"zv":
+        raise ValueError("not a vzip frame")
+    crc, size = struct.unpack("<II", buf[-10:-2])
+    props = buf[7:12]
+    head = props[0]
+    lc = head % 9
+    rest = head // 9
+    lp = rest % 5
+    pb = rest // 5
+    dict_size = struct.unpack("<I", props[1:5])[0]
+    dec = lzma.LZMADecompressor(
+        format=lzma.FORMAT_RAW,
+        filters=[{"id": lzma.FILTER_LZMA1, "dict_size": max(dict_size, 4096),
+                  "lc": lc, "lp": lp, "pb": pb}])
+    out = dec.decompress(buf[12:-10], max_length=size)
+    if len(out) != size:
+        raise ValueError(f"vzip short decode {len(out)}/{size}")
+    if zlib.crc32(out) & 0xFFFFFFFF != crc:
+        raise ValueError("vzip crc mismatch")
+    return out
+
+def _vzstd_decompress(buf):
+    if buf[:4] != b"VSZa" or buf[-3:] != b"zsv":
+        raise ValueError("not a vzstd frame")
+    size = struct.unpack("<i", buf[-11:-7])[0]
+    payload = buf[8:-15]
+    try:
+        import zstandard
+        return zstandard.ZstdDecompressor().decompress(payload, max_output_size=size)
+    except Exception:
+        pass
+    try:
+        import ctypes
+        import ctypes.util
+        name = ctypes.util.find_library("zstd")
+        lib = ctypes.CDLL(name) if name else None
+        if lib is None:
+            raise OSError("no libzstd")
+        out = ctypes.create_string_buffer(size)
+        got = lib.ZSTD_decompress(out, ctypes.c_size_t(size),
+                                  payload, ctypes.c_size_t(len(payload)))
+        if got > size:
+            raise OSError("zstd failed")
+        return out.raw[:got]
+    except Exception as exc:
+        raise ValueError(f"zstd payload needs libzstd ({exc})")
+
+def _zip_decompress(buf):
+    with zipfile.ZipFile(io.BytesIO(buf)) as zf:
+        names = zf.namelist()
+        if not names:
+            raise ValueError("empty zip chunk")
+        return zf.read(names[0])
+
+def chunk_plaintext(blob, key, expect=None):
+    if len(blob) < 32:
+        raise ValueError(f"chunk too small ({len(blob)} bytes)")
+    iv = _aes_ecb_decrypt_nopad(key, blob[:16])
+    plain = _aes_cbc_decrypt(key, iv, blob[16:])
+    pad = plain[-1] if plain else 0
+    if 1 <= pad <= 16:
+        plain = plain[:-pad]
+    if plain[:4] == b"VSZa":
+        plain = _vzstd_decompress(plain)
+    elif plain[:3] == b"VZa":
+        plain = _vzip_decompress(plain)
+    elif plain[:4] == b"PK\x03\x04":
+        plain = _zip_decompress(plain)
+    if expect is not None and len(plain) != expect:
+        raise ValueError(f"chunk size {len(plain)} != {expect}")
+    return plain
+
+def parse_manifest(path):
+    try:
+        blob = Path(path).read_bytes()
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    if blob[:4] != MANIFEST_MAGIC:
+        return {"ok": False, "error": "bad manifest magic"}
+    files = []
+    total = 0
+    chunk_count = 0
+    i = 8
+    end = len(blob)
+    try:
+        while i < end:
+            key, i = _pb_varint(blob, i, end)
+            field, wire = key >> 3, key & 7
+            if field != 1 or wire != 2:
+                break
+            length, i = _pb_varint(blob, i, end)
+            if i + length > end:
+                break
+            body = blob[i:i + length]
+            i += length
+            entry = {"name": "", "size": 0, "flags": 0, "sha": b"",
+                     "link": "", "chunks": []}
+            j = 0
+            while j < len(body):
+                key2, j = _pb_varint(body, j, len(body))
+                f2, w2 = key2 >> 3, key2 & 7
+                if w2 == 0:
+                    val, j = _pb_varint(body, j, len(body))
+                    if f2 == 2:
+                        entry["size"] = val
+                    elif f2 == 3:
+                        entry["flags"] = val
+                elif w2 == 2:
+                    ln, j = _pb_varint(body, j, len(body))
+                    node = body[j:j + ln]
+                    j += ln
+                    if f2 == 1:
+                        entry["name"] = node.decode("utf-8", "replace")
+                    elif f2 == 5:
+                        entry["sha"] = node
+                    elif f2 == 7:
+                        entry["link"] = node.decode("utf-8", "replace")
+                    elif f2 == 6:
+                        ch = {"id": b"", "crc": 0, "off": 0, "ulen": 0, "clen": 0}
+                        k2 = 0
+                        while k2 < len(node):
+                            key3, k2 = _pb_varint(node, k2, len(node))
+                            f3, w3 = key3 >> 3, key3 & 7
+                            if w3 == 0:
+                                v3, k2 = _pb_varint(node, k2, len(node))
+                                if f3 == 3:
+                                    ch["off"] = v3
+                                elif f3 == 4:
+                                    ch["ulen"] = v3
+                                elif f3 == 5:
+                                    ch["clen"] = v3
+                            elif w3 == 2:
+                                l3, k2 = _pb_varint(node, k2, len(node))
+                                if f3 == 1:
+                                    ch["id"] = node[k2:k2 + l3]
+                                k2 += l3
+                            elif w3 == 5:
+                                if f3 == 2:
+                                    ch["crc"] = struct.unpack("<I", node[k2:k2 + 4])[0]
+                                k2 += 4
+                            elif w3 == 1:
+                                k2 += 8
+                            else:
+                                break
+                        entry["chunks"].append(ch)
+                        chunk_count += 1
+                elif w2 == 5:
+                    j += 4
+                elif w2 == 1:
+                    j += 8
+                else:
+                    break
+            total += entry["size"]
+            files.append(entry)
+    except (ValueError, IndexError):
+        pass
+    if not files:
+        return {"ok": False, "error": "no file entries in manifest"}
+    named = sum(1 for f in files if f["name"])
+    if named < len(files) // 2:
+        return {"ok": False, "error": "manifest filenames are encrypted - cannot map paths"}
+    return {"ok": True, "files": files, "bytes": total,
+            "chunks": chunk_count, "count": len(files)}
+
+def _safe_rel(name):
+    parts = []
+    for piece in str(name or "").replace("\\", "/").split("/"):
+        if piece in ("", ".", ".."):
+            if piece == "..":
+                return None
+            continue
+        parts.append(piece)
+    return "/".join(parts) if parts else None
+
+def _chunk_cache_dir(depot):
+    root = Path.home() / ".licensetools" / "chunks" / str(int(depot))
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    except OSError:
+        return None
+
+def _prune_chunks(limit=6 * 1024 ** 3, keep_depot=None):
+    base = Path.home() / ".licensetools" / "chunks"
+    if not base.is_dir():
+        return 0
+    rows = []
+    total = 0
+    try:
+        for depot_dir in base.iterdir():
+            if not depot_dir.is_dir():
+                continue
+            for f in depot_dir.iterdir():
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                if not f.is_file():
+                    continue
+                rows.append((st.st_mtime, st.st_size, f))
+                total += st.st_size
+    except OSError:
+        return 0
+    if total <= limit:
+        return 0
+    rows.sort()
+    removed = 0
+    for _mtime, size, f in rows:
+        if total <= limit:
+            break
+        if keep_depot is not None and f.parent.name == str(int(keep_depot)):
+            continue
+        try:
+            f.unlink()
+            total -= size
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+_STICKY_HOST = {"host": ""}
+
+def _host_order(hosts):
+    hosts = list(hosts or cdn_hosts())
+    sticky = _STICKY_HOST["host"]
+    if sticky and sticky in hosts:
+        hosts.remove(sticky)
+        hosts.insert(0, sticky)
+    out, seen = [], set()
+    for h in hosts:
+        if h and h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out[:12]
+
+def fetch_chunk(depot, chunk_id, expect_len, cache, hosts=None):
+    sha = chunk_id.hex()
+    dest = cache / sha if cache is not None else None
+    if dest is not None and dest.is_file():
+        try:
+            if dest.stat().st_size == expect_len:
+                return dest, ""
+        except OSError:
+            pass
+    errors = []
+    for host in _host_order(hosts):
+        url = f"https://{host}/depot/{int(depot)}/chunk/{sha}"
+        blob, err = _http_bytes(url, timeout=120, accept="*/*")
+        if err:
+            errors.append(f"{host.split('.')[0]}: {err}")
+            continue
+        if not blob:
+            errors.append(f"{host.split('.')[0]}: empty reply")
+            continue
+        if expect_len and len(blob) != expect_len:
+            errors.append(f"{host.split('.')[0]}: {len(blob)}/{expect_len} bytes")
+            continue
+        _STICKY_HOST["host"] = host
+        if dest is None:
+            return blob, ""
+        try:
+            tmp = dest.with_suffix(".part")
+            tmp.write_bytes(blob)
+            tmp.replace(dest)
+        except OSError as exc:
+            errors.append(f"write {exc}")
+            continue
+        return dest, ""
+    return None, " | ".join(errors[-2:]) or "no cdn host answered"
+
+def _contained(root, path):
+    try:
+        r = Path(root).resolve()
+        p = Path(path).resolve()
+    except (OSError, RuntimeError):
+        return False
+    return p == r or r in p.parents
+
+def _sha1_file(path, block=1 << 20):
+    h = hashlib.sha1()
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                buf = fh.read(block)
+                if not buf:
+                    break
+                h.update(buf)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+def download_depot(depot, manifest_path, target_root, key, progress=None,
+                   workers=6, verify_existing=True):
+    parsed = parse_manifest(manifest_path)
+    if not parsed.get("ok"):
+        return {"ok": False, "depot": int(depot), "error": parsed.get("error")}
+    if isinstance(key, str):
+        try:
+            key = bytes.fromhex(key.strip())
+        except ValueError:
+            key = b""
+    if not key or len(key) != 32:
+        return {"ok": False, "depot": int(depot),
+                "error": "no 32 byte depot key - cannot decrypt"}
+    root = Path(target_root)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "depot": int(depot), "error": str(exc)}
+    cache = _chunk_cache_dir(depot)
+    hosts = cdn_hosts()
+    todo = []
+    skipped = 0
+    for entry in parsed["files"]:
+        rel = _safe_rel(entry["name"])
+        if rel is None:
+            continue
+        dest = root / rel
+        if entry["flags"] & _FLAG_DIR:
+            try:
+                dest.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            continue
+        if entry["flags"] & _FLAG_SYMLINK:
+            link = str(entry.get("link") or "").replace("\\", "/")
+            if not link or link.startswith("/") or ".." in link.split("/"):
+                continue
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if dest.is_symlink() or dest.exists():
+                    dest.unlink()
+                os.symlink(link, dest)
+            except OSError:
+                pass
+            continue
+        if not _contained(root, dest.parent):
+            continue
+        if verify_existing and dest.is_file() and dest.stat().st_size == entry["size"]:
+            want = entry["sha"].hex() if entry["sha"] else ""
+            if not want or _sha1_file(dest) == want:
+                skipped += 1
+                continue
+        todo.append((entry, dest))
+    unique = {}
+    for entry, _dest in todo:
+        for ch in entry["chunks"]:
+            if ch["id"] and ch["id"] not in unique:
+                unique[ch["id"]] = ch["clen"]
+    total = len(unique)
+    if progress:
+        progress(f"depot {int(depot)}: {parsed['count']} files, "
+                 f"{parsed['bytes'] // (1024 * 1024)} MB, "
+                 f"{total} chunk(s) to pull, {skipped} file(s) already good")
+    if not total and not todo:
+        return {"ok": True, "depot": int(depot), "files": 0,
+                "bytes": 0, "skipped": skipped, "chunks": 0}
+    done = {"n": 0, "bytes": 0}
+    lock = threading.Lock()
+    failures = []
+
+    def pull(item):
+        chunk_id, clen = item
+        path, err = fetch_chunk(depot, chunk_id, clen, cache, hosts)
+        with lock:
+            done["n"] += 1
+            if path is None:
+                failures.append(f"{chunk_id.hex()[:12]}: {err}")
+            else:
+                done["bytes"] += clen
+            if progress and (done["n"] % 100 == 0 or done["n"] == total):
+                progress(f"depot {int(depot)}: {done['n']}/{total} chunks, "
+                         f"{done['bytes'] // (1024 * 1024)} MB")
+
+    if total:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+            list(pool.map(pull, list(unique.items())))
+    if failures:
+        return {"ok": False, "depot": int(depot),
+                "error": f"{len(failures)} chunk(s) failed",
+                "detail": failures[:3]}
+    written = 0
+    hashed = 0
+    mismatch = []
+    for entry, dest in todo:
+        if not _contained(root, dest.parent):
+            return {"ok": False, "depot": int(depot),
+                    "error": f"{entry['name']}: path escapes the install folder"}
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        digest = hashlib.sha1()
+        try:
+            with dest.open("wb") as fh:
+                for ch in sorted(entry["chunks"], key=lambda c: c["off"]):
+                    src = cache / ch["id"].hex() if cache is not None else None
+                    raw = src.read_bytes() if src is not None and src.is_file() else None
+                    if raw is None:
+                        raw, err = fetch_chunk(depot, ch["id"], ch["clen"], None, hosts)
+                        if raw is None:
+                            raise OSError(f"chunk lost: {err}")
+                    data = chunk_plaintext(raw, key, ch["ulen"])
+                    fh.seek(ch["off"])
+                    fh.write(data)
+                    digest.update(data)
+                fh.truncate(entry["size"])
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "depot": int(depot),
+                    "error": f"{entry['name']}: {exc}"}
+        written += 1
+        got = digest.hexdigest()
+        if not entry["sha"] or entry["size"] == 0:
+            hashed += 1
+        elif got == entry["sha"].hex():
+            hashed += 1
+        else:
+            mismatch.append(entry["name"])
+        rel = _safe_rel(entry["name"]) or ""
+        if rel.startswith("Contents/MacOS/"):
+            try:
+                if _contained(root, dest):
+                    os.chmod(dest, 0o755)
+            except OSError:
+                pass
+    if progress:
+        progress(f"depot {int(depot)}: {written} file(s) written, "
+                 f"{hashed} hash-verified")
+    if mismatch:
+        return {"ok": False, "depot": int(depot),
+                "error": f"{len(mismatch)} file(s) failed the sha1 check",
+                "detail": mismatch[:5], "files": written, "skipped": skipped}
+    return {"ok": True, "depot": int(depot), "files": written,
+            "skipped": skipped, "chunks": total,
+            "bytes": sum(int(e["size"]) for e, _d in todo),
+            "verified": hashed}
+
+def download_app(appid, rows, target_root, progress=None, keys=None,
+                 verify_existing=True):
+    keys = keys or {}
+    total = {"files": 0, "bytes": 0, "skipped": 0}
+    done = []
+    pruned = _prune_chunks(keep_depot=int(rows[0]["depot"]) if rows else None)
+    if pruned and progress:
+        progress(f"chunk cache trimmed - {pruned} old chunk(s) removed")
+    for r in rows:
+        depot = int(r["depot"])
+        key = keys.get(depot) or keys.get(str(depot)) or ""
+        path = depotcache_dir() / f"{depot}_{r['manifest']}.manifest" if depotcache_dir() else None
+        if path is None or not path.is_file():
+            return {"ok": False, "stage": "manifest", "depot": depot,
+                    "error": f"manifest for depot {depot} is not on disk"}
+        res = download_depot(depot, path, target_root, key, progress,
+                             verify_existing=verify_existing)
+        if not res.get("ok"):
+            return {"ok": False, "stage": "download", **res}
+        total["files"] += res.get("files", 0)
+        total["bytes"] += res.get("bytes", 0)
+        total["skipped"] += res.get("skipped", 0)
+        done.append(depot)
+    return {"ok": True, "depots": done, **total}
+
 def current_steamid():
     root = SteamCtx().root()
     if root is None:
@@ -1689,7 +2569,7 @@ def write_pending_appmanifest(appid, name, installdir, buildid, rows, total, dow
     return {"ok": True, "file": str(path)}
 
 def install_to_library(appid, branch="public", want_os="mac", user="", password="",
-                       progress=None):
+                       progress=None, update=False, skip_drm=False):
     aid = int(appid)
     probe = probe_app(aid, branch)
     if not probe.get("ok"):
@@ -1698,10 +2578,14 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
     rows = [r for r in rows if r["manifest"]]
     if not rows:
         return {"ok": False, "error": f"no depot manifests for os={want_os}"}
-    sa = steam_apps_dir()
+    installdir = clean_installdir(probe.get("installdir") or probe.get("name") or aid)
+    if installdir is None:
+        return {"ok": False, "stage": "probe",
+                "error": f"appinfo has an unusable installdir: {probe.get('installdir')!r}"}
+    existing = find_app_acf(aid)
+    sa = existing.parent if existing is not None else steam_apps_dir()
     if sa is None:
         return {"ok": False, "error": "steam library not found - install Steam first"}
-    installdir = probe.get("installdir") or probe.get("name") or str(aid)
     target = sa / "common" / installdir
     depots = [int(r["depot"]) for r in rows]
     keys = keys_for_depots(depots, progress)
@@ -1711,38 +2595,48 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
         progress(f"loader config: {len(depots)} depot(s), {len(keys)} key(s)")
         if missing:
             progress("no depot key found for: " + ", ".join(str(d) for d in missing))
-    if not (user and password):
+    absent = [d for d in depots if not (keys.get(d) or keys.get(str(d)))]
+    if absent:
+        return {"ok": False, "stage": "keys", "target": str(target),
+                "error": "no depot key for " + ", ".join(str(d) for d in absent),
+                "hint": "press Refresh depot keys, then Download files again",
+                "config": cfg}
+    if progress:
+        progress("staging depot manifests so Steam never asks the CM for them")
+    staged = stage_manifests(aid, rows, progress)
+    if staged["missing"]:
+        msg = ", ".join(str(d) for d in staged["missing"])
         if progress:
-            progress("staging depot manifests so Steam never asks the CM for them")
-        staged = stage_manifests(aid, rows, progress)
-        if staged["missing"]:
-            if progress:
-                progress("manifest missing for: " +
-                         ", ".join(str(d) for d in staged["missing"]))
-        total = sum(int(r["size"]) for r in rows if str(r.get("size", "")).isdigit())
-        download = sum(int(r["download"]) for r in rows
-                       if str(r.get("download", "")).isdigit())
-        acf = write_pending_appmanifest(aid, probe.get("name"), installdir,
+            progress("manifest missing for: " + msg)
+        return {"ok": False, "stage": "manifest", "target": str(target),
+                "error": f"no manifest on any mirror for depot(s) {msg}",
+                "manifests": staged, "config": cfg}
+    total = sum(int(r["size"]) for r in rows if str(r.get("size", "")).isdigit())
+    download_size = sum(int(r["download"]) for r in rows
+                        if str(r.get("download", "")).isdigit())
+    pending = write_pending_appmanifest(aid, probe.get("name"), installdir,
                                         probe.get("buildid", ""), rows,
-                                        total, download)
-        if progress:
-            if acf.get("ok"):
-                progress(f"library entry: {acf['file']} (update queued)")
-            else:
-                progress("library entry failed: " + str(acf.get("error")))
-        if progress:
-            progress("handing the install to Steam - it pulls the depots itself")
-        restart_steam()
-        fb = steam_install_url(aid)
-        return {"ok": True, "appid": str(aid), "mode": "steam", "dir": str(target),
-                "depots": depots, "keys": len(keys), "missing_keys": missing,
-                "manifests": staged, "acf": acf, "config": cfg, "steam": fb,
-                "note": "Steam reads the local manifest and downloads the chunks"}
-    target.mkdir(parents=True, exist_ok=True)
-    res = fetch_game(aid, branch, rows, want_os, True, user, password,
-                     str(target), None, None, progress, flat=True)
+                                        total, download_size)
+    if progress:
+        progress("queued the library entry")
+    if progress:
+        progress("closing steam first so it cannot overwrite the new library record")
+    quit_info = steam_quit()
+    if progress:
+        progress("steam: " + ("closed" if quit_info.get("ok")
+                              else "still open - " + str(quit_info.get("error"))))
+    if not quit_info.get("ok"):
+        _drop_pending(pending)
+        return {"ok": False, "stage": "steam", "target": str(target),
+                "error": "Steam would not close, so the library record would be lost",
+                "hint": "quit Steam from the menu bar, then press Download files again",
+                "steam": quit_info}
+    if progress:
+        progress("pulling the depots from the Steam CDN myself - no account needed")
+    res = download_app(aid, rows, target, progress, keys=keys, verify_existing=True)
     if not res.get("ok"):
-        res["stage"] = "download"
+        _drop_pending(pending)
+        steam_launch()
         res["target"] = str(target)
         return res
     size = 0
@@ -1753,31 +2647,451 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
             except OSError:
                 pass
     if size == 0:
+        _drop_pending(pending)
+        steam_launch()
         return {"ok": False, "stage": "download", "target": str(target),
                 "error": "depot download wrote no files",
-                "hint": "no content came back - press Download files again, or let Steam install it"}
+                "hint": "press Download files again"}
     acf = write_appmanifest(aid, probe.get("name"), installdir,
                             probe.get("buildid", ""), rows, size)
-    return {"ok": bool(acf.get("ok")), "appid": str(aid), "dir": str(target),
-            "installdir": installdir, "files_bytes": size,
-            "depots": [r["depot"] for r in rows],
+    if progress:
+        progress(f"installed {size // (1024 * 1024)} MB into {target}")
+        progress("library entry: " + str(acf.get("file") or acf.get("error")))
+    drm = {"ok": False, "skipped": True}
+    if not skip_drm and sys.platform == "darwin":
+        if progress:
+            progress("matching the steam library the game links against...")
+        drm = drm_skip(target, aid, progress)
+        if progress:
+            progress("drm layer: " + ("patched " + ", ".join(drm.get("patched") or [])
+                                      if drm.get("ok") else
+                                      str(drm.get("error") or "no dylib in this game")))
+    launch_info = steam_launch()
+    if progress:
+        progress("steam: " + ("opened - check your library" if launch_info.get("ok")
+                              else "could not open - " + str(launch_info.get("error"))))
+    return {"ok": bool(acf.get("ok")), "appid": str(aid), "mode": "local",
+            "dir": str(target), "installdir": installdir, "files_bytes": size,
+            "depots": depots, "keys": len(keys),
+            "files": res.get("files", 0), "skipped": res.get("skipped", 0),
+            "manifests": staged, "config": cfg, "drm": drm,
+            "steam": {"quit": quit_info, "launch": launch_info},
             "manifest": acf.get("file"), "error": acf.get("error")}
+
+def _drop_pending(pending):
+    try:
+        f = (pending or {}).get("file")
+        if f and Path(f).is_file():
+            Path(f).unlink()
+    except OSError:
+        pass
+
+# ---------- steam api stand-in (the game's ownership check) ----------
+
+STUB_NAME = "libsteam_api.dylib"
+STUB_MARK = ".licensetools-stub"
+STUB_APPID_FILE = "steam_appid.txt"
+
+_STUB_ACCESSORS = [
+    "SteamAPI_SteamUser_v023", "SteamAPI_SteamUser_v022", "SteamAPI_SteamUser_v021",
+    "SteamAPI_SteamUser_v020", "SteamAPI_SteamApps_v008", "SteamAPI_SteamApps_v007",
+    "SteamAPI_SteamFriends_v018", "SteamAPI_SteamFriends_v017",
+    "SteamAPI_SteamUtils_v010", "SteamAPI_SteamUtils_v009",
+    "SteamAPI_SteamRemoteStorage_v016", "SteamAPI_SteamRemoteStorage_v014",
+    "SteamAPI_SteamUserStats_v012", "SteamAPI_SteamUserStats_v011",
+    "SteamAPI_SteamMatchmaking_v009", "SteamAPI_SteamMatchmakingServers_v002",
+    "SteamAPI_SteamNetworking_v006", "SteamAPI_SteamNetworkingSockets_v012",
+    "SteamAPI_SteamNetworkingSockets_v009", "SteamAPI_SteamNetworkingUtils_v004",
+    "SteamAPI_SteamNetworkingMessages_v002",
+    "SteamAPI_SteamUGC_v021", "SteamAPI_SteamUGC_v020",
+    "SteamAPI_SteamInput_v006", "SteamAPI_SteamInventory_v003",
+    "SteamAPI_SteamGameServer_v015", "SteamAPI_SteamGameServer_v014",
+    "SteamAPI_SteamGameServerStats_v001", "SteamAPI_SteamScreenshots_v003",
+    "SteamAPI_SteamMusic_v001", "SteamAPI_SteamVideo_v004",
+    "SteamAPI_SteamHTMLSurface_v005", "SteamAPI_SteamController_v008",
+    "SteamAPI_SteamParties_v002", "SteamAPI_SteamTimeline_v002",
+    "SteamAPI_SteamRemotePlay_v001", "SteamAPI_SteamParentalSettings_v001",
+    "SteamAPI_SteamAppList_v001", "SteamAPI_SteamNetworkingSocketsSerialized_v005",
+]
+
+_STUB_CORE = r'''#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <mach-o/dyld.h>
+
+#define VIS(v) __attribute__((visibility("default"))) v __attribute__((used))
+
+static char g_vtbl[256 * 8];
+static uint64_t g_appid;
+
+typedef uint64_t (*slot_fn)(void);
+static uint64_t slot_zero(void) { return 0; }
+
+static const char *stub_exe_dir(void)
+{
+    static char buf[4096];
+    static int ready;
+    if (!ready) {
+        uint32_t sz = (uint32_t)sizeof(buf);
+        if (_NSGetExecutablePath(buf, &sz) == 0) {
+            char *slash = strrchr(buf, '/');
+            if (slash)
+                *slash = 0;
+        } else {
+            buf[0] = 0;
+        }
+        ready = 1;
+    }
+    return buf;
+}
+
+static uint64_t stub_read_appid(void)
+{
+    if (g_appid)
+        return g_appid;
+    const char *env = getenv("SteamAppId");
+    if (!env)
+        env = getenv("SteamGameId");
+    if (env)
+        g_appid = strtoull(env, NULL, 10);
+    if (g_appid)
+        return g_appid;
+
+    char path[8200];
+    const char *dir = stub_exe_dir();
+    if (dir && dir[0]) {
+        snprintf(path, sizeof(path), "%s/steam_appid.txt", dir);
+        FILE *fh = fopen(path, "r");
+        if (fh) {
+            unsigned long long v = 0;
+            if (fscanf(fh, "%llu", &v) == 1)
+                g_appid = v;
+            fclose(fh);
+        }
+    }
+    if (g_appid)
+        return g_appid;
+    FILE *fh = fopen("steam_appid.txt", "r");
+    if (fh) {
+        unsigned long long v = 0;
+        if (fscanf(fh, "%llu", &v) == 1)
+            g_appid = v;
+        fclose(fh);
+    }
+    return g_appid;
+}
+
+static void *stub_object(void)
+{
+    static int filled;
+    if (!filled) {
+        for (int i = 0; i < 256; i++)
+            ((slot_fn *)g_vtbl)[i] = slot_zero;
+        filled = 1;
+    }
+    return g_vtbl;
+}
+
+VIS(int) SteamAPI_Init(void) { stub_read_appid(); return 1; }
+VIS(int) SteamAPI_InitFlat(char *err) { (void)err; return SteamAPI_Init(); }
+VIS(int) SteamAPI_InitSafe(void) { return SteamAPI_Init(); }
+VIS(void) SteamAPI_Shutdown(void) { }
+VIS(int) SteamAPI_IsSteamRunning(void) { return 1; }
+VIS(int) SteamAPI_RestartAppIfNecessary(uint32_t appid) { (void)appid; return 0; }
+VIS(void) SteamAPI_RunCallbacks(void) { }
+VIS(void) SteamAPI_ManualDispatch_RunFrame(int pipe) { (void)pipe; }
+VIS(int) SteamAPI_ManualDispatch_GetNextCallback(int pipe, void *msg) { (void)pipe; (void)msg; return 0; }
+VIS(void) SteamAPI_ManualDispatch_FreeLastCallback(int pipe) { (void)pipe; }
+VIS(void) SteamAPI_RegisterCallback(void *cb, int id) { (void)cb; (void)id; }
+VIS(void) SteamAPI_UnregisterCallback(void *cb) { (void)cb; }
+VIS(void) SteamAPI_RegisterCallResult(void *cb, uint64_t handle) { (void)cb; (void)handle; }
+VIS(void) SteamAPI_UnregisterCallResult(void *cb, uint64_t handle) { (void)cb; (void)handle; }
+VIS(const char *) SteamAPI_GetSteamInstallPath(void) { return "/tmp"; }
+VIS(uint32_t) SteamAPI_GetHSteamUser(void) { return 1; }
+VIS(uint32_t) SteamAPI_GetHSteamPipe(void) { return 1; }
+VIS(void) SteamAPI_SetTryCatchCallbacks(int v) { (void)v; }
+VIS(void *) SteamInternal_CreateInterface(const char *ver) { (void)ver; return stub_object(); }
+VIS(int) SteamInternal_SteamAPI_Init(const char *p, char *err) { (void)p; (void)err; return SteamAPI_Init(); }
+VIS(void *) SteamInternal_FindOrCreateUserInterface(unsigned u, const char *v) { (void)u; (void)v; return stub_object(); }
+VIS(void *) SteamInternal_FindOrCreateGameServerInterface(unsigned u, const char *v) { (void)u; (void)v; return stub_object(); }
+VIS(void *) SteamInternal_ContextInit(void *ctx) { (void)ctx; return stub_object(); }
+VIS(void) SteamAPI_UseBreakpadCrashHandler(const char *a, const char *b, const char *c, int d, void *e, void *f) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; }
+VIS(void) SteamAPI_SetBreakpadAppID(uint32_t appid) { (void)appid; }
+VIS(void) SteamAPI_SetMiniDumpComment(const char *c) { (void)c; }
+'''
+
+_STUB_CORE_NAMES = {
+    "SteamAPI_Init", "SteamAPI_InitFlat", "SteamAPI_InitSafe", "SteamAPI_Shutdown",
+    "SteamAPI_IsSteamRunning", "SteamAPI_RestartAppIfNecessary", "SteamAPI_RunCallbacks",
+    "SteamAPI_ManualDispatch_RunFrame", "SteamAPI_ManualDispatch_GetNextCallback",
+    "SteamAPI_ManualDispatch_FreeLastCallback", "SteamAPI_RegisterCallback",
+    "SteamAPI_UnregisterCallback", "SteamAPI_RegisterCallResult",
+    "SteamAPI_UnregisterCallResult", "SteamAPI_GetSteamInstallPath",
+    "SteamAPI_GetHSteamUser", "SteamAPI_GetHSteamPipe", "SteamAPI_SetTryCatchCallbacks",
+    "SteamInternal_CreateInterface", "SteamInternal_SteamAPI_Init",
+    "SteamInternal_FindOrCreateUserInterface", "SteamInternal_FindOrCreateGameServerInterface",
+    "SteamInternal_ContextInit", "SteamAPI_UseBreakpadCrashHandler",
+    "SteamAPI_SetBreakpadAppID", "SteamAPI_SetMiniDumpComment",
+}
+
+_STUB_ACCESSOR = "VIS(void *) {name}(void) {{ return stub_object(); }}\n"
+_STUB_APPID_FN = "VIS(uint64_t) {name}(void *self) {{ (void)self; return stub_read_appid(); }}\n"
+_STUB_STEAMID_FN = ("VIS(uint64_t) {name}(void *self) {{ (void)self; "
+                    "return 76561198000000000ULL + stub_read_appid(); }}\n")
+_STUB_YES_FN = "VIS(int) {name}(void *self) {{ (void)self; return 1; }}\n"
+_STUB_NO_FN = "VIS(uint64_t) {name}(void *self) {{ (void)self; return 1; }}\n"
+_STUB_FLOAT_FN = "VIS(double) {name}(void *self) {{ (void)self; return 1.0; }}\n"
+
+
+def _stub_kind(name):
+    if name.endswith("_GetAppID") or name.endswith("_GetAppID_") or "GetAppID" in name:
+        return "appid"
+    if name.endswith("_GetSteamID") or name.endswith("_GetCSteamID"):
+        return "steamid"
+    if name.endswith("_GetStatFloat") or name.endswith("_GetStat"):
+        return "float"
+    if any(name.endswith(sfx) for sfx in (
+            "_BIsSubscribed", "_BIsSubscribedApp", "_BLoggedOn", "_BLoggedOn_",
+            "_BIsDlcInstalled", "_BIsAppInstalled", "_BGetDLCDataByIndex",
+            "_BIsTimedTrial", "_BIsVACBanned", "_BAnon", "_BGetAchievement",
+            "_BGetStat", "_BIsOverlayEnabled", "_BIsSteamRunning",
+            "_BIsGameOverlayActive")):
+        return "yes"
+    return "ptr"
+
+
+def _stub_source(symbols, appid):
+    out = [_STUB_CORE, f"\nstatic const unsigned long long k_appid = {int(appid)}ULL;\n"]
+    out.append("VIS(uint64_t) stub_appid_under_test(void) { return k_appid; }\n")
+    seen = set()
+    for name in list(_STUB_ACCESSORS) + list(symbols):
+        if not name or name in seen or not name.startswith("Steam"):
+            continue
+        seen.add(name)
+        if name in _STUB_CORE_NAMES:
+            continue
+        if name.startswith("SteamAPI_Steam"):
+            out.append(_STUB_ACCESSOR.format(name=name))
+            continue
+        kind = _stub_kind(name)
+        if kind == "appid":
+            out.append(_STUB_APPID_FN.format(name=name))
+        elif kind == "steamid":
+            out.append(_STUB_STEAMID_FN.format(name=name))
+        elif kind == "float":
+            out.append(_STUB_FLOAT_FN.format(name=name))
+        elif kind == "yes":
+            out.append(_STUB_YES_FN.format(name=name))
+        else:
+            out.append(_STUB_NO_FN.format(name=name))
+    return "".join(out)
+
+
+def _bundle_executable(bundle):
+    info = bundle / "Contents" / "Info.plist"
+    if info.is_file():
+        res = _run_quiet(["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleExecutable",
+                          str(info)], timeout=20)
+        if res is not None and res.returncode == 0 and res.stdout.strip():
+            exe = bundle / "Contents" / "MacOS" / res.stdout.strip()
+            if exe.is_file():
+                return exe
+    macos = bundle / "Contents" / "MacOS"
+    if macos.is_dir():
+        for p in sorted(macos.iterdir()):
+            try:
+                if p.is_file() and os.access(p, os.X_OK):
+                    return p
+            except OSError:
+                continue
+    return None
+
+
+def _undefined_steam_symbols(binary):
+    res = _run_quiet(["nm", "-u", str(binary)], timeout=120)
+    if res is None or res.returncode != 0:
+        return []
+    found = set()
+    for line in res.stdout.splitlines():
+        bits = line.split()
+        if not bits:
+            continue
+        sym = bits[-1]
+        if sym.startswith("_Steam"):
+            found.add(sym[1:])
+    return sorted(found)
+
+
+def _app_bundles(root):
+    return sorted(p for p in Path(root).rglob("*.app")
+                  if p.is_dir() and (p / "Contents").is_dir())
+
+
+def _game_binary(root):
+    for bundle in _app_bundles(root):
+        exe = _bundle_executable(bundle)
+        if exe is not None:
+            return exe
+    cands = []
+    for p in sorted(Path(root).rglob("*")):
+        try:
+            if p.is_file() and os.access(p, os.X_OK) and p.stat().st_size > 65536:
+                if p.suffix.lower() in (".dylib", ".so", ".txt", ".json", ".png",
+                                        ".dll", ".dat", ".pak", ".bundle"):
+                    continue
+                cands.append(p)
+        except OSError:
+            continue
+    return cands[0] if cands else None
+
+
+def _build_stub(source, out_path):
+    work = Path(source).parent
+    for arches in (["-arch", "arm64", "-arch", "x86_64"], []):
+        argv = ["clang", "-dynamiclib", "-O2", "-fvisibility=hidden",
+                "-install_name", "@rpath/" + STUB_NAME] + arches + \
+               ["-o", str(out_path), str(source)]
+        res = _run_quiet(argv, timeout=300)
+        if res is not None and res.returncode == 0 and Path(out_path).is_file():
+            _run_quiet(["codesign", "-f", "-s", "-", str(out_path)], timeout=120)
+            lipo = _run_quiet(["lipo", "-info", str(out_path)], timeout=30)
+            arch = (lipo.stdout.strip() if lipo is not None and lipo.returncode == 0
+                    else "native")
+            return {"ok": True, "dylib": str(out_path), "arch": arch,
+                    "bytes": Path(out_path).stat().st_size, "work": str(work)}
+    last = _run_quiet(["clang", "--version"], timeout=30)
+    hint = "install Xcode Command Line Tools: xcode-select --install"
+    if last is not None and last.returncode == 0:
+        hint = "clang refused to build the stand-in library"
+    return {"ok": False, "error": hint}
+
+
+def _appid_file_dirs(target, exe):
+    dirs = [Path(target)]
+    if exe is not None:
+        dirs.append(exe.parent)
+    out = []
+    for d in dirs:
+        if d not in out:
+            out.append(d)
+    return out
+
+
+def drm_skip(target, appid, progress=None):
+    root = Path(target)
+    if not root.is_dir():
+        return {"ok": False, "error": f"install folder missing: {root}"}
+    exe = _game_binary(root)
+    symbols = _undefined_steam_symbols(exe) if exe is not None else []
+    libs = sorted(p for p in root.rglob(STUB_NAME) if p.is_file())
+    if not libs:
+        return {"ok": True, "skipped": True, "dylibs": [],
+                "reason": "this game does not ship " + STUB_NAME}
+    if progress:
+        progress(f"game imports {len(symbols)} steam symbol(s), "
+                 f"{len(libs)} librar(y/ies) to match")
+    work = Path.home() / ".licensetools" / "stub" / str(int(appid))
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    src = work / "steam_stub.c"
+    try:
+        src.write_text(_stub_source(symbols, appid), encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    built = _build_stub(src, work / STUB_NAME)
+    if not built.get("ok"):
+        return {"ok": False, "error": built.get("error"), "symbols": len(symbols)}
+    report = {"ok": True, "symbols": len(symbols), "arch": built.get("arch"),
+              "patched": [], "backups": [], "errors": []}
+    for lib in libs:
+        backup = lib.with_name(lib.name + ".orig")
+        try:
+            if not backup.is_file():
+                shutil.copy2(lib, backup)
+                report["backups"].append(str(backup))
+            shutil.copy2(work / STUB_NAME, lib)
+            _run_quiet(["codesign", "-f", "-s", "-", str(lib)], timeout=120)
+            (lib.parent / (lib.name + STUB_MARK)).write_text(str(int(appid)),
+                                                             encoding="utf-8")
+            report["patched"].append(str(lib))
+        except OSError as exc:
+            report["errors"].append(f"{lib}: {exc}")
+    for d in _appid_file_dirs(root, exe):
+        try:
+            (d / STUB_APPID_FILE).write_text(str(int(appid)), encoding="utf-8")
+            report.setdefault("appid_files", []).append(str(d / STUB_APPID_FILE))
+        except OSError as exc:
+            report["errors"].append(f"{d / STUB_APPID_FILE}: {exc}")
+    for bundle in _app_bundles(root):
+        _run_quiet(["codesign", "-f", "-s", "-", str(bundle)], timeout=180)
+    report["ok"] = not report["errors"]
+    return report
+
+
+def drm_restore(target):
+    root = Path(target)
+    if not root.is_dir():
+        return {"ok": False, "error": f"install folder missing: {root}"}
+    undone, errors = [], []
+    for backup in sorted(root.rglob(STUB_NAME + ".orig")):
+        live = backup.with_name(backup.name[: -len(".orig")])
+        try:
+            shutil.copy2(backup, live)
+            backup.unlink()
+            _run_quiet(["codesign", "-f", "-s", "-", str(live)], timeout=120)
+            undone.append(str(live))
+        except OSError as exc:
+            errors.append(f"{live}: {exc}")
+    for marker in sorted(root.rglob(STUB_NAME + STUB_MARK)):
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+    for f in sorted(root.rglob(STUB_APPID_FILE)):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    for bundle in _app_bundles(root):
+        _run_quiet(["codesign", "-f", "-s", "-", str(bundle)], timeout=180)
+    return {"ok": not errors, "restored": undone, "errors": errors}
+
+
+def drm_status(target):
+    root = Path(target) if target else None
+    if root is None or not root.is_dir():
+        return {"ok": False, "error": "install folder not found"}
+    libs = sorted(p for p in root.rglob(STUB_NAME) if p.is_file())
+    rows = []
+    for lib in libs:
+        marker = lib.parent / (lib.name + STUB_MARK)
+        rows.append({"dylib": str(lib), "ours": marker.is_file(),
+                     "backup": lib.with_name(lib.name + ".orig").is_file()})
+    return {"ok": True, "dylibs": rows, "count": len(rows),
+            "patched": sum(1 for r in rows if r["ours"])}
+
 
 def repair_install_state(appid):
     sa = steam_apps_dir()
     if sa is None:
         return {"ok": False, "error": "steam library not found"}
-    acf = read_appmanifest(appid)
+    acf_file = find_app_acf(appid)
+    acf = parse_acf(acf_file) if acf_file is not None else None
+    if acf_file is not None:
+        sa = acf_file.parent
     installdir = (acf or {}).get("installdir", "")
-    common = sa / "common" / installdir if installdir else None
+    rel = clean_installdir(installdir) if installdir else None
+    common = sa / "common" / rel if rel else None
     files = 0
     if common and common.is_dir():
         files = sum(1 for p in common.rglob("*") if p.is_file())
     stale = bool(acf) and files == 0
-    if stale:
-        f = sa / f"appmanifest_{int(appid)}.acf"
+    if stale and acf_file is not None:
         try:
-            f.unlink()
+            acf_file.unlink()
         except OSError:
             pass
     restaged = {"ok": False, "staged": [], "missing": []}
@@ -1875,7 +3189,7 @@ def uninstall_game(appid, delete_files=True):
 def uninstall_loader():
     if sys.platform != "darwin":
         return {"ok": False, "error": "macOS only"}
-    steam_app = Path("/Applications/Steam.app")
+    steam_app = steam_app_path()
     if not steam_app.is_dir():
         alt = Path.home() / "Applications" / "Steam.app"
         if alt.is_dir():
@@ -1976,7 +3290,7 @@ def _plistbuddy(args, plist):
         return None
 
 def macsteam_status():
-    steam_app = Path("/Applications/Steam.app")
+    steam_app = steam_app_path()
     dylib = steam_app / "Contents" / "MacOS" / "macsteam.dylib"
     insert = None
     if sys.platform == "darwin":
@@ -2028,7 +3342,7 @@ def _fetch_repo_signatures(repo, dest):
 def macsteam_inject(dylib_src, sig_roots):
     if sys.platform != "darwin":
         return {"ok": False, "error": "macsteam injection runs on macOS only"}
-    steam_app = Path("/Applications/Steam.app")
+    steam_app = steam_app_path()
     exe = steam_app / "Contents" / "MacOS" / "steam_osx"
     plist = steam_app / "Contents" / "Info.plist"
     if not steam_app.is_dir():
@@ -2815,9 +4129,6 @@ class Api:
                 if st.get("missing"):
                     LOGS.add("manifest missing for depot(s): " +
                              ", ".join(str(d) for d in st["missing"]))
-            LOGS.add("steam restarting - game will show in your library")
-            restart_steam()
-            steps.append({"step": "restart", "ok": True})
             rep = repair_install_state(int(aid))
             if rep.get("stale_removed"):
                 LOGS.add("cleared a stale install record with no files on disk")
@@ -2828,6 +4139,11 @@ class Api:
                 steps.append({"step": "grant", "ok": extra.get("ok"),
                               "dest": extra.get("dest"), "depots": extra.get("depots"),
                               "error": extra.get("error")})
+            LOGS.add("restarting steam so it picks up the new config")
+            rs = restart_steam()
+            steps.append({"step": "restart", **rs})
+            if not rs.get("ok"):
+                LOGS.add("steam restart: " + str(rs.get("error") or "failed"))
             return {"ok": True, "appid": aid, "steps": steps,
                     "hint": "in your library now - press Download files to put the game on disk"}
         res = self.grant(aid, branch, want_os, True)
@@ -2837,50 +4153,50 @@ class Api:
         if not res.get("ok"):
             return {"ok": False, "stage": "grant", "error": res.get("error"),
                     "steps": steps}
-        LOGS.add("steam restarting - game will show in your library")
-        restart_steam()
-        steps.append({"step": "restart", "ok": True})
+        LOGS.add("restarting steam so it picks up the new config")
+        rs = restart_steam()
+        steps.append({"step": "restart", **rs})
+        if not rs.get("ok"):
+            LOGS.add("steam restart: " + str(rs.get("error") or "failed"))
         return {"ok": True, "appid": aid, "steps": steps,
                 "hint": "game should appear in your library now"}
 
-    def install(self, appid, user="", password=""):
+    def install(self, appid, user="", password="", update=False):
         aid = str(appid or "").strip()
         if not aid.isdigit():
             return {"ok": False, "error": "appid must be numeric"}
         if not _FETCH_LOCK.acquire(blocking=False):
             return {"ok": False, "error": "a download is already running"}
-        u, p = (user or "").strip(), (password or "").strip()
+        mode = bool(update)
 
         def worker():
             try:
-                LOGS.add(f"install {aid} - downloading game content into the steam library...")
+                FETCH_RESULT["install"] = None
+                LOGS.add(f"install {aid} - pulling the depots straight from the Steam CDN")
                 rep = repair_install_state(int(aid))
                 if rep.get("stale_removed"):
                     LOGS.add("cleared a stale install record with no files")
-                res = install_to_library(int(aid), "public", "mac", u, p,
-                                         progress=lambda m: LOGS.add(str(m)))
+                res = install_to_library(int(aid), "public", "mac", progress=lambda m: LOGS.add(str(m)),
+                                         update=mode)
                 if res.get("ok"):
-                    if res.get("mode") == "steam":
-                        mans = (res.get("manifests") or {})
-                        staged = mans.get("staged") or []
-                        if staged:
-                            LOGS.add("manifests ready for depot(s): " +
-                                     ", ".join(str(d) for d in staged))
-                        LOGS.add("steam is downloading the depots itself - watch the downloads page")
-                        if res.get("missing_keys"):
-                            LOGS.add("no key for: " + ", ".join(str(d) for d in res["missing_keys"]))
-                    else:
-                        LOGS.add(f"install {aid} done - {res.get('files_bytes', 0)} bytes "
-                                 f"in {res.get('dir')}")
-                        LOGS.add("restarting steam so the play button uses the new files")
-                        restart_steam()
+                    LOGS.add(f"install {aid} done - {res.get('files', 0)} file(s), "
+                             f"{res.get('files_bytes', 0) // (1024 * 1024)} MB")
+                    if res.get("skipped"):
+                        LOGS.add(f"{res['skipped']} file(s) were already up to date")
+                    drm = res.get("drm") or {}
+                    if drm.get("patched"):
+                        LOGS.add("steam library replaced - the game will not ask for a check")
+                    elif drm.get("skipped"):
+                        LOGS.add("no steam library in this game - nothing to replace")
+                    elif drm.get("error"):
+                        LOGS.add("library replace failed: " + str(drm.get("error")))
                 else:
-                    LOGS.add("install failed: " + str(res.get("error")))
+                    LOGS.add("install failed at " + str(res.get("stage")) + ": " +
+                             str(res.get("error")))
                     if res.get("hint"):
                         LOGS.add("hint: " + str(res.get("hint")))
-                    fb = steam_install_url(int(aid))
-                    if fb.get("ok"):
-                        LOGS.add("asked steam to download it instead")
+                    if res.get("detail"):
+                        LOGS.add("detail: " + str(res.get("detail")))
                 FETCH_RESULT["install"] = res
             except Exception as exc:
                 LOGS.add("install crashed: " + str(exc))
@@ -2889,7 +4205,10 @@ class Api:
                 _FETCH_LOCK.release()
 
         threading.Thread(target=worker, daemon=True).start()
-        return {"ok": True, "queued": True, "appid": aid}
+        return {"ok": True, "queued": True, "appid": aid, "update": mode}
+
+    def update(self, appid):
+        return self.install(appid, "", "", True)
 
     def install_status(self):
         return FETCH_RESULT.get("install") or {"ok": None, "running": _FETCH_LOCK.locked()}
@@ -2936,15 +4255,58 @@ class Api:
         return picked[0] if isinstance(picked, (list, tuple)) else str(picked)
 
     def import_lua(self, path=""):
-        p = str(path or "").strip()
+        p = self._pick_lua()
         if not p:
-            p = self._pick_lua()
-            if not p:
-                return {"ok": False, "cancelled": True}
+            return {"ok": False, "cancelled": True}
         res = import_lua_file(p)
         LOGS.add(("lua " + str(res.get("appid")) + " imported")
                  if res.get("ok") else ("lua import failed: " + str(res.get("error"))))
         return res
+
+    def drm_patch(self, appid):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        acf = read_appmanifest(int(aid))
+        installdir = clean_installdir((acf or {}).get("installdir", "") or "")
+        sa = steam_apps_dir()
+        if acf is None or installdir is None or sa is None:
+            return {"ok": False, "error": "install the game first"}
+        target = sa / "common" / installdir
+        LOGS.add("replacing the steam library in " + str(target))
+        res = drm_skip(target, int(aid), lambda m: LOGS.add(str(m)))
+        if res.get("skipped"):
+            LOGS.add("this game has no " + STUB_NAME + " - nothing to replace")
+        elif res.get("ok"):
+            LOGS.add(f"patched {len(res.get('patched') or [])} librar(y/ies), "
+                     f"{res.get('symbols', 0)} symbol(s) matched")
+        else:
+            LOGS.add("patch failed: " + str(res.get("error")))
+        return res
+
+    def drm_restore(self, appid):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        acf = read_appmanifest(int(aid))
+        installdir = clean_installdir((acf or {}).get("installdir", "") or "")
+        sa = steam_apps_dir()
+        if acf is None or installdir is None or sa is None:
+            return {"ok": False, "error": "install the game first"}
+        res = drm_restore(sa / "common" / installdir)
+        LOGS.add(f"restored {len(res.get('restored') or [])} original librar(y/ies)")
+        return res
+
+    def drm_status(self, appid):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        acf = read_appmanifest(int(aid))
+        installdir = clean_installdir((acf or {}).get("installdir", "") or "")
+        sa = steam_apps_dir()
+        if acf is None or installdir is None or sa is None:
+            return {"ok": False, "error": "not installed"}
+        return drm_status(sa / "common" / installdir)
 
     def repair(self, appid):
         aid = str(appid or "").strip()
@@ -3009,12 +4371,17 @@ class Api:
         if not aid.isdigit():
             return {"ok": False, "error": "appid must be numeric"}
         LOGS.add(f"uninstall {aid}")
+        quit_info = steam_quit()
+        if not quit_info.get("ok"):
+            LOGS.add("steam is still open - close it and try again")
+            return {"ok": False, "error": quit_info.get("error") or "steam still running"}
         res = uninstall_game(int(aid), True)
         if res.get("ok"):
             LOGS.add("removed: " + (", ".join(res.get("removed") or []) or "nothing on disk"))
-            restart_steam()
+            steam_launch()
         else:
             LOGS.add("uninstall failed: " + str(res.get("error")))
+            steam_launch()
         return res
 
     def remove_loader(self):
@@ -3040,7 +4407,10 @@ class Api:
     def restart(self):
         LOGS.add("restarting steam...")
         res = restart_steam()
-        LOGS.add("steam restarted")
+        if res.get("ok"):
+            LOGS.add("steam closed and reopened")
+        else:
+            LOGS.add("steam restart failed: " + str(res.get("error") or "still running"))
         return res
 
     def loader(self):
@@ -3162,12 +4532,10 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
     <button id="b-install" class="pri">Download files</button>
   </div>
   <div class="toolbar">
-    <span class="muted">depot content:</span>
-    <input id="f-user" placeholder="steam user" style="width:160px">
-    <input id="f-pass" placeholder="password" type="password" style="width:160px">
+    <span class="muted">content:</span>
     <button id="b-fetch">Fetch Content</button>
     <button id="b-lua">Import .lua</button>
-    <span class="muted">Download files writes the depot keys and lets Steam install it; add a login to pull with DepotDownloader instead</span>
+    <span class="muted">Download files pulls the depots from the Steam CDN and verifies every file - no account, no code</span>
   </div>
   <div id="hits" class="muted"></div>
   <div id="probeout"></div>
@@ -3199,7 +4567,12 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
   <div class="toolbar">
     <button id="b-m-paths">Show Steam paths</button>
     <button id="b-m-manifests">Stage manifests</button>
+    <button id="b-m-update" class="pri">Update game</button>
     <button id="b-m-keys">Refresh depot keys</button>
+  </div>
+  <div class="toolbar">
+    <button id="b-m-drm" class="pri">Skip Steam DRM</button>
+    <button id="b-m-drmoff">Restore DRM files</button>
     <button id="b-m-unloader">Remove loader from Steam</button>
     <span class="muted">Removes the injected dylib, the plist entry, and the macsteam config - Steam goes back to a clean install</span>
   </div>
@@ -3214,7 +4587,7 @@ let api=null,logIdx=0;
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const say=t=>{$("#status").textContent=t};
-function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-lua","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths","#b-m-manifests"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
+function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-lua","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths","#b-m-manifests","#b-m-update","#b-m-drm","#b-m-drmoff"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
 async function call(fn,...args){if(!api)throw new Error("bridge not ready");return api[fn](...args)}
 document.querySelectorAll("button.tab").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("button.tab").forEach(x=>x.classList.toggle("pri",x===b));
@@ -3285,19 +4658,36 @@ async function doInstall(){
   }
   busy(true);
   try{
-    const r=await call("install",id,$("#f-user").value,$("#f-pass").value);
+    const r=await call("install",id);
     if(!r.ok)return say("download failed to start: "+(r.error||""));
-    say("downloading "+id+" into steamapps/common - watch the log");
-    await new Promise(res=>setTimeout(res,1200));
+    say("pulling "+id+" from the Steam CDN - progress in the log...");
+    await watchInstall();
   }catch(e){say("download failed: "+e)}
   finally{busy(false)}
+}
+async function watchInstall(){
+  let r={ok:null};
+  for(let i=0;i<3600;i++){
+    await new Promise(z=>setTimeout(z,1500));
+    r=await call("install_status");
+    if(r&&r.ok!==null&&r.ok!==undefined)break;
+  }
+  if(!r||r.ok==null)return say("download still running - check the log");
+  if(r.ok){
+    say("installed: "+r.files+" file(s), "+Math.round((r.files_bytes||0)/1048576)+" MB - press Play");
+    await refreshInstalled();
+    try{renderPaths(await call("paths"))}catch(_){}
+  }else{
+    say("install failed at "+(r.stage||"?")+": "+(r.error||""));
+  }
+  return r;
 }
 async function doFetch(){
   const id=$("#appid").value.trim();
   if(!/^\d+$/.test(id))return say("appid must be numeric");
   busy(true);say("fetch "+id+" queued - progress shows in the log...");
   try{
-    const r=await call("fetch",id,$("#f-user").value,$("#f-pass").value);
+    const r=await call("fetch",id,"","");
     if(!r.ok)say("fetch failed: "+(r.error||""));
   }catch(e){say("fetch failed: "+e)}
   busy(false);
@@ -3350,8 +4740,8 @@ async function doProbe(){
     say(`${r.rows.length} depots - build ${r.buildid||"?"} - branch ${r.branch}`);
     $("#probeout").innerHTML=
       `<table><thead><tr><th>Depot</th><th>OS</th><th>Manifest</th><th>Size</th></tr></thead><tbody>`+
-      r.rows.map(x=>`<tr><td class="mono">${x.depot}</td><td>${x.os}</td>`+
-        `<td class="mono">${x.manifest||"-"}</td><td class="muted">${x.size||"-"}</td></tr>`).join("")+
+      r.rows.map(x=>`<tr><td class="mono">${esc(x.depot)}</td><td>${esc(x.os)}</td>`+
+        `<td class="mono">${esc(x.manifest||"-")}</td><td class="muted">${esc(x.size||"-")}</td></tr>`).join("")+
       `</tbody></table>`;
   }catch(e){say("probe failed: "+e)}
   busy(false);
@@ -3447,8 +4837,18 @@ $("#b-m-manifests").onclick=async()=>{
   }catch(e){say("manifest stage failed: "+e)}
   finally{busy(false)}
 };
-$("#b-m-common").onclick=async()=>{
+$("#b-m-update").onclick=async()=>{
+  const id=$("#m-appid").value.trim();
+  if(!/^\d+$/.test(id))return say("appid must be numeric");
+  busy(true);say("checking "+id+" - only changed files get re-pulled...");
   try{
+    const r=await call("update",id);
+    if(!r.ok)return say("update failed to start: "+(r.error||""));
+    await watchInstall();
+  }catch(e){say("update failed: "+e)}
+  finally{busy(false)}
+};
+$("#b-m-common").onclick=async()=>{  try{
     const r=await call("open_folder","common");
     say(r.ok?("opened "+r.path):("open failed: "+(r.error||"")));
   }catch(e){say("open failed: "+e)}
@@ -3460,6 +4860,26 @@ $("#b-m-keys").onclick=async()=>{
     if(r.ok)say("depot key table: "+r.keys+" keys"+(r.status&&r.status.path?(" - "+r.status.path):""));
     else say("refresh failed: "+(r.error||"")+(r.status&&r.status.path?(" ["+r.status.path+"]"):""));
   }catch(e){say("refresh failed: "+e)}
+  busy(false);
+};
+$("#b-m-drm").onclick=async()=>{
+  const id=maintId();if(!id)return;
+  busy(true);say("matching the steam library in "+id+" against what the game imports...");
+  try{
+    const r=await call("drm_patch",id);
+    if(r.skipped)say("this game ships no libsteam_api.dylib - nothing to replace");
+    else if(r.ok)say("patched "+(r.patched||[]).length+" librar(y/ies) with "+(r.symbols||0)+" matched symbol(s)");
+    else say("patch failed: "+(r.error||""));
+  }catch(e){say("patch failed: "+e)}
+  busy(false);
+};
+$("#b-m-drmoff").onclick=async()=>{
+  const id=maintId();if(!id)return;
+  busy(true);say("putting the original steam library back...");
+  try{
+    const r=await call("drm_restore",id);
+    say(r.ok?("restored "+(r.restored||[]).length+" file(s)"):("restore failed: "+((r.errors||[]).join(" | ")||r.error||"")));
+  }catch(e){say("restore failed: "+e)}
   busy(false);
 };
 function maintId(){
