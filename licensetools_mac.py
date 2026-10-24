@@ -44,7 +44,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -1284,9 +1284,11 @@ FIXTURE = '''"480"
 
 def selftest():
     checks = []
+    failed = []
 
     def check(name, cond, detail=""):
         if not cond:
+            failed.append(name)
             print(json.dumps({"ok": False, "check": name, "detail": detail}))
             return False
         checks.append(name)
@@ -1382,7 +1384,15 @@ def selftest():
     check("stub is brace balanced", stub_src.count("{") == stub_src.count("}"),
           f"{stub_src.count('{')}/{stub_src.count('}')}")
 
-    print(json.dumps({"ok": True, "checks": checks}, indent=2))
+    native = _cc_crypt(_CC_OP_DECRYPT, _CC_OPT_ECB, key, b"\x00" * 16, block)
+    check("native aes path agrees with the pure one",
+          native is None or native == plain, repr(native))
+
+    print(json.dumps({"ok": not failed, "checks": checks,
+                      "failed": failed}, indent=2))
+    if failed:
+        print("selftest failed")
+        return 1
     print("selftest ok")
     return 0
 
@@ -1955,8 +1965,16 @@ def _pure_ecb_decrypt_nopad(key, data):
     return bytes(out)
 
 _CC = {"tried": False, "lib": None}
+_CC_OP_DECRYPT = 1
+_CC_ALG_AES128 = 0
+_CC_OPT_PKCS7 = 0x0001
+_CC_OPT_ECB = 0x0002
 
 def _common_crypto():
+    # CCCrypt(CCOperation, CCAlgorithm, CCOptions, const void *key, size_t keyLength,
+    #         const void *iv, const void *dataIn, size_t dataInLength,
+    #         void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved)
+    # exactly eleven parameters - one extra entry here shifts every register on arm64.
     if _CC["tried"]:
         return _CC["lib"]
     _CC["tried"] = True
@@ -1965,13 +1983,15 @@ def _common_crypto():
     try:
         import ctypes
         import ctypes.util
-        lib = ctypes.CDLL(ctypes.util.find_library("System") or "/usr/lib/libSystem.B.dylib")
+        path = ctypes.util.find_library("System") or "/usr/lib/libSystem.B.dylib"
+        lib = ctypes.CDLL(path)
         fn = lib.CCCrypt
         fn.restype = ctypes.c_int32
         fn.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
-                       ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t,
-                       ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t,
                        ctypes.c_char_p, ctypes.c_size_t,
+                       ctypes.c_char_p,
+                       ctypes.c_char_p, ctypes.c_size_t,
+                       ctypes.c_void_p, ctypes.c_size_t,
                        ctypes.POINTER(ctypes.c_size_t)]
         _CC["lib"] = fn
     except Exception:
@@ -1983,18 +2003,56 @@ def _cc_crypt(op, options, key, iv, data):
     if fn is None:
         return None
     import ctypes
+    key = bytes(key)
+    iv = bytes(iv)[:16]
+    if len(iv) != 16:
+        return None
+    data = bytes(data)
+    if not data:
+        return b""
+    if len(key) not in (16, 24, 32):
+        return None
     out = ctypes.create_string_buffer(len(data) + 32)
     moved = ctypes.c_size_t(0)
-    status = fn(op, 2, 0, options, key, len(key), iv, data, len(data),
-                out, len(out), ctypes.byref(moved))
+    try:
+        status = fn(op, _CC_ALG_AES128, options, key, len(key), iv,
+                    data, len(data),
+                    ctypes.cast(out, ctypes.c_void_p), ctypes.c_size_t(len(out)),
+                    ctypes.byref(moved))
+    except Exception:
+        _CC["lib"] = None
+        return None
     if status != 0:
         return None
-    return out.raw[:moved.value]
+    if moved.value > len(data) + 32:
+        return None
+    got = out.raw[:moved.value]
+    if _CC.get("verified", "unset") == "unset":
+        _CC["verified"] = "probing"
+        try:
+            if options & _CC_OPT_ECB:
+                probe = _pure_ecb_decrypt_nopad(bytes(range(32)),
+                                                bytes.fromhex("8ea2b7ca516745bfeafc49904b496089"))
+            else:
+                probe = _pure_cbc_decrypt(bytes(range(32)), b"\x00" * 16,
+                                          bytes.fromhex("8ea2b7ca516745bfeafc49904b496089"))
+            check = _cc_crypt(_CC_OP_DECRYPT, options, bytes(range(32)),
+                              b"\x00" * 16,
+                              bytes.fromhex("8ea2b7ca516745bfeafc49904b496089"))
+            _CC["verified"] = bool(check is not None and check == probe)
+        except Exception:
+            _CC["verified"] = False
+        if _CC["verified"] is not True:
+            _CC["lib"] = None
+            return None
+    elif _CC["verified"] is False:
+        return None
+    return got
 
 def _aes_cbc_decrypt(key, iv, data):
     if len(data) % 16:
         data = data[:len(data) - len(data) % 16]
-    res = _cc_crypt(1, 0x0001, key, iv, data)
+    res = _cc_crypt(_CC_OP_DECRYPT, _CC_OPT_PKCS7, key, iv, data)
     if res is not None:
         return res
     try:
@@ -2005,7 +2063,7 @@ def _aes_cbc_decrypt(key, iv, data):
     return _pure_cbc_decrypt(key, iv, data)
 
 def _aes_ecb_decrypt_nopad(key, data):
-    res = _cc_crypt(1, 0x0002, key, b"\x00" * 16, data)
+    res = _cc_crypt(_CC_OP_DECRYPT, _CC_OPT_ECB, key, b"\x00" * 16, data)
     if res is not None:
         return res
     try:
@@ -2079,10 +2137,16 @@ def _vzstd_decompress(buf):
         lib = ctypes.CDLL(name) if name else None
         if lib is None:
             raise OSError("no libzstd")
-        out = ctypes.create_string_buffer(size)
-        got = lib.ZSTD_decompress(out, ctypes.c_size_t(size),
+        lib.ZSTD_decompress.restype = ctypes.c_size_t
+        lib.ZSTD_decompress.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                        ctypes.c_char_p, ctypes.c_size_t]
+        lib.ZSTD_isError.restype = ctypes.c_uint
+        lib.ZSTD_isError.argtypes = [ctypes.c_size_t]
+        out = ctypes.create_string_buffer(max(size, 1))
+        got = lib.ZSTD_decompress(ctypes.cast(out, ctypes.c_void_p),
+                                  ctypes.c_size_t(size),
                                   payload, ctypes.c_size_t(len(payload)))
-        if got > size:
+        if lib.ZSTD_isError(got) or got > size:
             raise OSError("zstd failed")
         return out.raw[:got]
     except Exception as exc:

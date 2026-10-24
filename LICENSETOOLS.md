@@ -94,6 +94,18 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time) and `pycryptodome` for the AES fast path. steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
 
+### What changed in 1.5.1
+
+- **Fixed a hard crash on launch and on `--selftest`.** The CommonCrypto binding declared twelve argument types for an eleven-parameter function, so on Apple silicon the key pointer landed in the wrong register and the process died with `SIGSEGV` (exit 139) before printing anything. The declaration now matches `CCCrypt` exactly, every call is bounds-checked, and the first result is verified against the pure-Python AES before the native path is trusted — a binding that answers wrong is dropped for the rest of the session.
+- **`libzstd` is bound properly too** (`c_size_t` return plus `ZSTD_isError`), so a `VSZa` chunk can no longer return a truncated length.
+- **`--selftest` now exits non-zero when a check fails.** It used to print `ok: false` and still return success, which is why a red run looked green in the build log.
+
+### ما الجديد في 1.5.1
+
+- **انهيار كامل عند التشغيل وعند `--selftest` انتصلح.** ربط CommonCrypto كان يعرّف اثني عشر نوع وسيط لدالة ذات أحد عشر، فعلى معالجات Apple كان مؤشر المفتاح يوصل بمكان غلط والعملية تموت بـ `SIGSEGV` (exit 139) قبل ما تطبع أي شي. التعريف صار مطابق لـ `CCCrypt` بالضبط، وكل نداء متحقَّق من حدوده، وأول نتيجة بتتقارن مع الـ AES المكتوب ببايثون قبل ما يُوثق بالمسار الأصلي — وربط بيرجّع نتيجة غلط بينشال لبقية الجلسة.
+- **`libzstd` صار مربوط صح كمان** (`c_size_t` للنتيجة مع `ZSTD_isError`)، فحزمة `VSZa` ما عادت تقدر ترجّع طول مقطوع.
+- **`--selftest` صار يخرج بكود فشل لما يطلع في check فاشل.** قبل كان يطبع `ok: false` ويرجّع نجاح، ولهذا كان الـ run الأحمر يبان أخضر بسجل البناء.
+
 ### What changed in 1.5.0
 
 1.5.0 is the release where Play actually launches, and where Steam stops fighting the app over the library.
