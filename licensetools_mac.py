@@ -46,7 +46,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.9.2"
 APP_REPO = "Whoismelv/Lua-Macos"
 APP_ASSET_NAMES = ("LicenseTools.dmg", "LuaToolsMac.dmg")
 STEAMCMD_URLS = {
@@ -2018,6 +2018,14 @@ def selftest():
               len(list(sig_dir.glob("*.json"))) >= 1)
         check("signature names are steam build ids",
               all(p.stem.isdigit() for p in sig_dir.glob("*.json")))
+
+    if getattr(sys, "frozen", False):
+        check("the frozen app finds its own loader payload", payload_root is not None,
+              "the app carries a dylib but the lookup missed it")
+        frozen_pay = macsteam_payload()
+        check("the frozen app can read the payload it ships",
+              frozen_pay["present"] and frozen_pay["signatures"] >= 1,
+              json.dumps(frozen_pay))
 
     with tempfile.TemporaryDirectory() as td:
         bundle = Path(td) / "Fake.app" / "Contents"
