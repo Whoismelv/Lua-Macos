@@ -11,3 +11,14 @@ depotkeys.json.part
 .swiftpm/
 xcuserdata/
 ci-smoke.log
+
+# vendored loader: source and signatures are tracked, build output is not
+vendor/macsteam/macsteam.dylib
+vendor/macsteam/macsteam.dylib.version
+vendor/macsteam-src/build/
+vendor/macsteam-src/out/
+vendor/macsteam-src/vendor/dobby/
+vendor/dd/
+vendor/stub/*.dylib
+vendor/stub/*.c
+DepotDownloader

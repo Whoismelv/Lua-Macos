@@ -37,51 +37,73 @@ find vendor/dd -type f -name 'DepotDownloader*' -exec chmod +x {} \;
 test -x vendor/dd/DepotDownloader || { echo "vendor: DepotDownloader missing" >&2; exit 1; }
 
 echo "== vendor: macSteam loader =="
-rm -rf vendor/macsteam && mkdir -p vendor/macsteam
-set +e
-MS_JSON="$(curl -fsSL --retry 3 --max-time 60 \
-  -H 'Accept: application/vnd.github+json' \
-  -H 'User-Agent: licensetools' \
-  https://api.github.com/repos/crghofficial/macsteam/releases/latest 2>/dev/null)"
-MS_URL="$(printf '%s' "$MS_JSON" | python3 -c '
-import sys, json
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-a = [x for x in d.get("assets", []) if x["name"].lower().endswith((".dmg", ".zip"))]
-print(a[0]["browser_download_url"] if a else "")
-' 2>/dev/null)"
-if [ -n "$MS_URL" ]; then
-  MS_TMP="/tmp/macsteam-lic.${MS_URL##*.}"
-  curl -fsSL --retry 3 --max-time 300 -o "$MS_TMP" "$MS_URL" || true
-  if [ -s "$MS_TMP" ]; then
-    MS_MNT="$(mktemp -d /tmp/msmnt.XXXXXX)"
-    case "$MS_TMP" in
-      *.dmg) hdiutil attach -nobrowse -readonly -mountpoint "$MS_MNT" "$MS_TMP" >/dev/null 2>&1 || true ;;
-      *.zip) unzip -q -o "$MS_TMP" -d "$MS_MNT" >/dev/null 2>&1 || true ;;
-    esac
-    MS_DYLIB="$(find "$MS_MNT" -name 'macsteam.dylib' -type f 2>/dev/null | head -n1)"
-    MS_SIG="$(find "$MS_MNT" -type d -name signatures 2>/dev/null | head -n1)"
-    if [ -n "$MS_DYLIB" ]; then
-      cp "$MS_DYLIB" vendor/macsteam/macsteam.dylib
-      if [ -n "$MS_SIG" ]; then
-        mkdir -p vendor/macsteam/signatures
-        cp -R "$MS_SIG"/. vendor/macsteam/signatures/
-      fi
-      echo "vendored: macsteam.dylib + $(find vendor/macsteam/signatures -name '*.json' 2>/dev/null | wc -l | tr -d ' ') signature files"
-    else
-      echo "vendor: payload had no macsteam.dylib (runtime network fallback stays active)"
-    fi
-    hdiutil detach "$MS_MNT" -quiet >/dev/null 2>&1 || true
-    rm -rf "$MS_MNT" "$MS_TMP"
-  else
-    echo "vendor: download failed (runtime network fallback stays active)"
+mkdir -p vendor/macsteam/signatures/macos.arm64
+MS_DYLIB="vendor/macsteam/macsteam.dylib"
+
+if [ -s "$MS_DYLIB" ]; then
+  echo "payload: already vendored ($(wc -c < "$MS_DYLIB" | tr -d ' ') bytes)"
+elif [ -f vendor/macsteam-src/Makefile ]; then
+  echo "payload: building from vendor/macsteam-src"
+  if ! command -v clang >/dev/null 2>&1; then
+    echo "build failed: clang is missing on this runner" >&2
+    exit 1
   fi
+  if ! make -C vendor/macsteam-src MIN_VER=14.0 -j"$(sysctl -n hw.ncpu)" \
+       > /tmp/macsteam-build.log 2>&1; then
+    tail -n 40 /tmp/macsteam-build.log >&2
+    echo "build failed: the vendored loader did not compile" >&2
+    exit 1
+  fi
+  cp vendor/macsteam-src/out/macsteam.dylib "$MS_DYLIB"
+  echo "payload: built $(wc -c < "$MS_DYLIB" | tr -d ' ') bytes"
+  rm -rf vendor/macsteam-src/build vendor/macsteam-src/out vendor/macsteam-src/vendor/dobby
 else
-  echo "vendor: release lookup failed (runtime network fallback stays active)"
+  echo "payload: source missing - falling back to the upstream release"
+  rm -f "$MS_DYLIB"
+  mkdir -p vendor/macsteam/signatures/macos.arm64
+  MS_URL="$(curl -fsSL --retry 3 --max-time 60 \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'User-Agent: licensetools' \
+    https://api.github.com/repos/crghofficial/macsteam/releases/latest 2>/dev/null \
+    | sed -n 's/.*"browser_download_url": *"\([^"]*\.dmg\)".*/\1/p' | head -n1)"
+  if [ -n "$MS_URL" ]; then
+    MS_TMP="/tmp/macsteam-lic.dmg"
+    MS_MNT="$(mktemp -d /tmp/msmnt.XXXXXX)"
+    if curl -fsSL --retry 3 --max-time 300 -o "$MS_TMP" "$MS_URL" \
+       && hdiutil attach -nobrowse -readonly -mountpoint "$MS_MNT" "$MS_TMP" >/dev/null 2>&1; then
+      MS_DYLIB_SRC="$(find "$MS_MNT" -name 'macsteam.dylib' -type f 2>/dev/null | head -n1)"
+      if [ -n "$MS_DYLIB_SRC" ]; then
+        cp "$MS_DYLIB_SRC" "$MS_DYLIB"
+      fi
+      hdiutil detach "$MS_MNT" -quiet >/dev/null 2>&1 || true
+    fi
+    rm -rf "$MS_MNT" "$MS_TMP"
+  fi
+  if [ ! -s "$MS_DYLIB" ]; then
+    echo "build failed: no loader payload, and none could be fetched" >&2
+    exit 1
+  fi
 fi
-set -e
+
+MS_SIGS="$(find vendor/macsteam/signatures -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$MS_SIGS" -lt 1 ]; then
+  echo "build failed: no signature json under vendor/macsteam/signatures" >&2
+  exit 1
+fi
+echo "signatures: $MS_SIGS file(s)"
+lipo -info "$MS_DYLIB" 2>/dev/null || true
+
+MS_VER="$(sed -n 's/.*MACSTEAM_VERSION[[:space:]]*"\([^"]*\)".*/\1/p' \
+  vendor/macsteam-src/src/version.h 2>/dev/null | head -n1)"
+if [ -n "$MS_VER" ]; then
+  printf '%s\n' "$MS_VER" > vendor/macsteam/macsteam.dylib.version
+  echo "payload version: $MS_VER"
+fi
+MS_BYTES="$(wc -c < "$MS_DYLIB" | tr -d ' ')"
+if [ "$MS_BYTES" -lt 4096 ]; then
+  echo "build failed: the loader payload is suspiciously small ($MS_BYTES bytes)" >&2
+  exit 1
+fi
 
 echo "== vendor: stand-in library (prebuilt, so no clang is needed on the user's mac) =="
 rm -rf vendor/stub && mkdir -p vendor/stub
@@ -161,6 +183,19 @@ if [ ! -f "$STUB_IN_APP" ]; then
 fi
 echo "stand-in inside the bundle:"
 lipo -info "$STUB_IN_APP" || true
+
+MS_IN_APP="$APP/Contents/Resources/vendor/macsteam/macsteam.dylib"
+if [ ! -s "$MS_IN_APP" ]; then
+  echo "build failed: the loader payload is not inside the bundle" >&2
+  exit 1
+fi
+MS_SIG_IN_APP="$(find "$APP/Contents/Resources/vendor/macsteam" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$MS_SIG_IN_APP" -lt 1 ]; then
+  echo "build failed: no signature json inside the bundle" >&2
+  exit 1
+fi
+echo "loader inside the bundle: $(lipo -archs "$MS_IN_APP" 2>/dev/null || echo '?') + $MS_SIG_IN_APP signature file(s)"
+ls -lh "$MS_IN_APP"
 
 echo "== selftest (frozen) =="
 "$APP/Contents/MacOS/$BUNDLE" --selftest

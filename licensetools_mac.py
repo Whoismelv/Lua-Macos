@@ -46,7 +46,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 APP_REPO = "Whoismelv/Lua-Macos"
 APP_ASSET_NAMES = ("LicenseTools.dmg", "LuaToolsMac.dmg")
 STEAMCMD_URLS = {
@@ -2003,6 +2003,76 @@ def selftest():
         check("the retired core is kept for inspection", CORE_BAD.is_file())
         globals()["CORE_DIR"], globals()["CORE_FILE"] = real_core[0], real_core[1]
         globals()["CORE_BAD"], globals()["CORE_MARK"] = real_core[2], real_core[3]
+
+    payload_root = bundled_macsteam()
+    sig_dir = None
+    for root in (payload_root, Path(__file__).resolve().parent / "vendor" / "macsteam"):
+        if root is None:
+            continue
+        cand = root / "signatures" / "macos.arm64"
+        if cand.is_dir() and any(cand.glob("*.json")):
+            sig_dir = cand
+            break
+    if sig_dir is not None:
+        check("the loader signatures ship with the app",
+              len(list(sig_dir.glob("*.json"))) >= 1)
+        check("signature names are steam build ids",
+              all(p.stem.isdigit() for p in sig_dir.glob("*.json")))
+
+    with tempfile.TemporaryDirectory() as td:
+        bundle = Path(td) / "Fake.app" / "Contents"
+        deep = bundle / "Resources" / "vendor" / "macsteam"
+        deep.mkdir(parents=True)
+        (deep / "macsteam.dylib").write_bytes(b"\xcf\xfa\xed\xfe" + b"\0" * 60000)
+        (bundle / "Frameworks").mkdir()
+        (bundle / "MacOS").mkdir()
+        had = hasattr(sys, "_MEIPASS")
+        old = getattr(sys, "_MEIPASS", None)
+        sys._MEIPASS = str(bundle / "Frameworks")
+        del _BUNDLED_CACHE[:]
+        found = bundled_macsteam()
+        del _BUNDLED_CACHE[:]
+        if had:
+            sys._MEIPASS = old
+        else:
+            del sys._MEIPASS
+        check("the loader is found in a frozen Contents/Resources layout",
+              found == deep, str(found))
+
+    with tempfile.TemporaryDirectory() as td:
+        fake = Path(td) / "vendor" / "macsteam"
+        (fake / "signatures" / "macos.arm64").mkdir(parents=True)
+        (fake / "macsteam.dylib").write_bytes(b"\xcf\xfa\xed\xfe" + b"\0" * 60000)
+        (fake / "macsteam.dylib.version").write_text("0.8.2", encoding="utf-8")
+        src_sig = (next(iter(sorted(sig_dir.glob("*.json"))), None)
+                   if sig_dir is not None else None)
+        if src_sig is not None:
+            shutil.copy2(src_sig, fake / "signatures" / "macos.arm64" / src_sig.name)
+        real_bundled, real_http = bundled_macsteam, http_get
+        globals()["bundled_macsteam"] = lambda: fake
+
+        def _no_net(*a, **k):
+            raise AssertionError("the bundled payload reached for the network")
+
+        globals()["http_get"] = _no_net
+        pay = macsteam_payload()
+        check("payload reports its version", pay["version"] == "0.8.2", json.dumps(pay))
+        check("payload reports a digest", len(pay["sha256"]) == 64, pay["sha256"])
+        check("payload counts the signatures", pay["signatures"] == 1, pay["signatures"])
+        check("payload lists the build ids", pay["builds"] == [src_sig.stem]
+              if src_sig is not None else False, json.dumps(pay))
+        off = loader_install_macsteam()
+        check("a bundled loader installs offline",
+              off.get("source") == "bundled" and off.get("network") is False,
+              json.dumps(off))
+        check("the bundled path names its signatures",
+              off.get("signatures") == 1, json.dumps(off))
+        globals()["bundled_macsteam"] = lambda: None
+        ref = loader_install_macsteam(allow_network=False)
+        check("no payload and no network is refused cleanly",
+              ref.get("ok") is False and "network" in str(ref.get("error")),
+              json.dumps(ref))
+        globals()["bundled_macsteam"], globals()["http_get"] = real_bundled, real_http
 
     check("gui has the cloud buttons",
           'id="b-m-cloudoff"' in GUI_HTML and 'id="b-m-cloudon"' in GUI_HTML)
@@ -4538,17 +4608,74 @@ MACSTEAM_REPOS = (
 )
 STEAMTOOLS_SITE = "https://steamtools.net/"
 
+def _loader_dylib_ok(d):
+    try:
+        return d.is_file() and d.stat().st_size > 4096
+    except OSError:
+        return False
+
+
+_BUNDLED_CACHE = []
+
+
 def bundled_macsteam():
-    roots = []
+    """Locate the loader the app carries. Frozen bundles move vendor/ around,
+    so every plausible root is tried before giving up."""
+    if _BUNDLED_CACHE:
+        return _BUNDLED_CACHE[0]
+    here = Path(__file__).resolve().parent
+    exe = Path(sys.executable).resolve().parent
+    cands = []
     base = getattr(sys, "_MEIPASS", "")
     if base:
-        roots.append(Path(base) / "vendor" / "macsteam")
-    roots.append(Path(__file__).resolve().parent / "vendor" / "macsteam")
-    for r in roots:
-        d = r / "macsteam.dylib"
-        if d.is_file():
+        b = Path(base)
+        cands += [b / "vendor" / "macsteam",
+                  b.parent / "Resources" / "vendor" / "macsteam",
+                  b.parent / "MacOS" / "vendor" / "macsteam"]
+    cands += [here / "vendor" / "macsteam",
+              here.parent / "Resources" / "vendor" / "macsteam",
+              exe / "vendor" / "macsteam",
+              exe.parent / "Resources" / "vendor" / "macsteam"]
+    for r in cands:
+        if _loader_dylib_ok(r / "macsteam.dylib"):
+            _BUNDLED_CACHE.append(r)
             return r
+    for parent in [Path(sys.executable).resolve()] + list(Path(sys.executable).resolve().parents):
+        if parent.name == "Contents" and parent.is_dir():
+            hits = [p for p in parent.rglob("macsteam.dylib") if _loader_dylib_ok(p)]
+            if hits:
+                _BUNDLED_CACHE.append(hits[0].parent)
+                return hits[0].parent
+            break
     return None
+
+
+def macsteam_payload():
+    """What the app carries inside itself - no network, no release lookup."""
+    root = bundled_macsteam()
+    if root is None:
+        return {"present": False, "root": None, "dylib": None, "bytes": 0,
+                "sha256": "", "version": "", "signatures": 0, "builds": []}
+    dylib = root / "macsteam.dylib"
+    try:
+        raw = dylib.read_bytes()
+    except OSError:
+        raw = b""
+    sigs = [p for p in root.rglob("*.json") if p.is_file()]
+    builds = sorted({p.stem for p in sigs if p.stem.isdigit()}, key=int)
+    version = ""
+    for side in (root / "macsteam.dylib.version", root / "version.txt"):
+        if side.is_file():
+            try:
+                version = side.read_text(encoding="utf-8").strip()
+            except OSError:
+                version = ""
+            break
+    return {"present": bool(raw), "root": str(root), "dylib": str(dylib),
+            "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest() if raw else "",
+            "version": version, "signatures": len(sigs), "builds": builds}
+
 
 def loader_report():
     ctx = SteamCtx()
@@ -4574,6 +4701,7 @@ def loader_report():
         })
     return {"ok": True, "steam_root": str(root) if root else None,
             "platform": sys.platform, "families": families,
+            "payload": macsteam_payload(),
             "hint": None if families else
             "no loader detected - run: loader install --from macsteam (mac arm64) "
             "or --from steamtools"}
@@ -4988,29 +5116,34 @@ def _stage_macsteam_app(archive, dest):
                            capture_output=True)
     return None
 
-def loader_install_macsteam():
+def loader_install_macsteam(allow_network=True):
+    """Install the loader. The copy inside the app wins and never touches the net."""
     bundled = bundled_macsteam()
     if bundled is not None:
         dylib = bundled / "macsteam.dylib"
-        sig_roots = [p for p in bundled.rglob("signatures") if p.is_dir()]
-        res = {"ok": True, "repo": "bundled", "version": "vendored",
-               "asset": "inside app", "staged": str(bundled),
-               "dylib_src": str(dylib), "signatures": 0}
-        if sys.platform == "darwin":
-            fresh = _fetch_repo_signatures(MACSTEAM_REPOS[0],
-                                           TOOLS_DIR / "loader" / "macsteam"
-                                           / "signatures" / "macos.arm64")
-            if fresh:
-                sig_roots.append(TOOLS_DIR / "loader" / "macsteam" / "signatures")
-            inj = macsteam_inject(dylib, sig_roots)
-            res.update({k: inj.get(k) for k in
-                        ("ok", "error", "hint", "dylib", "signatures", "config_dir")})
-            res["injected"] = bool(inj.get("ok"))
-            res["next"] = ("loader ready - press Fetch in the app"
-                           if inj.get("ok") else "injection failed - see error")
+        info = macsteam_payload()
+        res = {"ok": True, "repo": "bundled", "source": "bundled", "network": False,
+               "version": info["version"] or "vendored", "asset": "inside app",
+               "staged": str(bundled), "dylib_src": str(dylib),
+               "signatures": info["signatures"], "builds": info["builds"],
+               "sha256": info["sha256"], "bytes": info["bytes"]}
+        if not info["signatures"]:
+            return {"ok": False, "source": "bundled", "network": False,
+                    "error": "the app carries no signature json",
+                    "hint": "vendor/macsteam/signatures/macos.arm64/*.json"}
+        if sys.platform != "darwin":
+            res["next"] = "bundled payload present (injection happens on macOS)"
             return res
-        res["next"] = "bundled payload present (injection happens on macOS)"
+        inj = macsteam_inject(dylib, [bundled])
+        res.update({k: inj.get(k) for k in
+                    ("ok", "error", "hint", "dylib", "signatures", "config_dir")})
+        res["injected"] = bool(inj.get("ok"))
+        res["next"] = ("loader ready - press Fetch in the app"
+                       if inj.get("ok") else "injection failed - see error")
         return res
+    if not allow_network:
+        return {"ok": False, "network": False,
+                "error": "no payload inside the app and network use is disabled"}
     tried = []
     for repo in MACSTEAM_REPOS:
         api = f"https://api.github.com/repos/{repo}/releases/latest"
@@ -5427,7 +5560,13 @@ class Api:
                 inst = loader_install_macsteam()
                 steps.append({"step": "loader", "ok": inst.get("ok"),
                               "repo": inst.get("repo"), "version": inst.get("version"),
+                              "source": inst.get("source"),
+                              "network": inst.get("network"),
                               "error": inst.get("error")})
+                if inst.get("source") == "bundled":
+                    LOGS.add(f"loader came from inside the app "
+                             f"({inst.get('signatures', 0)} signature file(s), "
+                             f"{inst.get('bytes', 0) // 1024} KB) - nothing downloaded")
                 for line in inst.get("tried", []):
                     LOGS.add("  " + line)
                 if not inst.get("ok"):
@@ -5808,17 +5947,30 @@ class Api:
         fams = rep.get("families", [])
         LOGS.add("loader check: " + (", ".join(f["family"] for f in fams)
                                      if fams else "none detected"))
+        pay = rep.get("payload") or {}
+        if pay.get("present"):
+            LOGS.add(f"payload inside the app: {pay['bytes'] // 1024} KB, "
+                     f"sha256 {pay['sha256'][:16]}..., "
+                     f"{pay['signatures']} signature file(s)"
+                     + (f" for build(s) {', '.join(pay['builds'])}" if pay["builds"] else ""))
+        else:
+            LOGS.add("payload inside the app: missing")
         return rep
 
     def loader_install(self, family):
         family = (family or "macsteam").strip()
-        LOGS.add(f"loader install --from {family} (auto download)...")
+        pay = macsteam_payload()
+        if pay["present"]:
+            LOGS.add(f"payload inside the app: {pay['bytes'] // 1024} KB, "
+                     f"{pay['signatures']} signature file(s)"
+                     + (f" for build(s) {', '.join(pay['builds'])}" if pay["builds"] else ""))
+        LOGS.add(f"loader install --from {family}...")
         if family == "steamtools":
             res = loader_install_steamtools()
         else:
             res = loader_install_macsteam()
         if res.get("ok"):
-            LOGS.add(f"loader ready - {res.get('repo') or 'steamtools'} "
+            LOGS.add(f"loader ready - {res.get('source') or res.get('repo') or 'steamtools'} "
                      f"{res.get('version', '')} -> {res.get('config_app') or res.get('staged', '')}")
         else:
             LOGS.add("loader install failed: " + str(res.get("error", "")))
