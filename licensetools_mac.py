@@ -46,7 +46,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 APP_REPO = "Whoismelv/Lua-Macos"
 APP_ASSET_NAMES = ("LicenseTools.dmg", "LuaToolsMac.dmg")
 STEAMCMD_URLS = {
@@ -1663,6 +1663,96 @@ def selftest():
         check("pick takes the only app", _pick_app([other]).name == "Other.app")
         check("pick survives an empty dmg", _pick_app([]) is None)
 
+        fake_userdata = root / "userdata" / "12345678"
+        (fake_userdata / "config").mkdir(parents=True)
+        shared = fake_userdata / "config" / "sharedconfig.vdf"
+        shared.write_text(
+            '"UserRoamingConfigStore"\n{\n'
+            '\t"Software"\n\t{\n\t\t"Valve"\n\t\t{\n\t\t\t"Steam"\n\t\t\t{\n'
+            '\t\t\t\t"apps"\n\t\t\t\t{\n'
+            '\t\t\t\t\t"413150"\n\t\t\t\t\t{\n\t\t\t\t\t\t"cloudenabled"\t\t"1"\n'
+            '\t\t\t\t\t}\n'
+            '\t\t\t\t\t"440"\n\t\t\t\t\t{\n\t\t\t\t\t\t"cloudenabled"\t\t"0"\n'
+            '\t\t\t\t\t}\n'
+            '\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n}\n', encoding="utf-8")
+        parsed = kv_parse(shared.read_text(encoding="utf-8"))
+        check("vdf keeps the store root", parsed[0][0] == "UserRoamingConfigStore",
+              parsed[0][0] if parsed else "empty")
+        tree = _kv_root(parsed)
+        app_path = ["Software", "Valve", "Steam", "apps", "413150", "cloudenabled"]
+        check("vdf reads a nested value", kv_get(tree, app_path) == "1",
+              kv_get(tree, app_path))
+        check("vdf reads a sibling app",
+              kv_get(tree, ["Software", "Valve", "Steam", "apps", "440", "cloudenabled"]) == "0")
+        check("vdf misses an absent key", kv_get(tree, app_path + ["nope"]) is None)
+        again = kv_parse("\n".join(kv_dump(parsed)))
+        check("vdf dump round trips", again == parsed, again)
+        kv_set(tree, ["Software", "Valve", "Steam", "apps", "999", "cloudenabled"], "0")
+        check("vdf creates a missing app block",
+              kv_get(tree, ["Software", "Valve", "Steam", "apps", "999", "cloudenabled"]) == "0")
+        check("vdf keeps quotes and slashes",
+              kv_parse('"a"{"b" "x\\\\y \\"q\\""}')[0][1][0][1] == 'x\\y "q"',
+              kv_parse('"a"{"b" "x\\\\y \\"q\\""}'))
+
+        fake_userdata = root / "userdata" / "12345678"
+        (fake_userdata / "config").mkdir(parents=True, exist_ok=True)
+        local = fake_userdata / "config" / "localconfig.vdf"
+        local.write_text('"UserLocalConfigStore"\n{\n\t"Software"\n\t{\n'
+                         '\t\t"Valve"\n\t\t{\n\t\t\t"Steam"\n\t\t\t{\n'
+                         '\t\t\t\t"apps"\n\t\t\t\t{\n\t\t\t\t\t"413150"\n\t\t\t\t\t{\n'
+                         '\t\t\t\t\t\t"LastPlayed"\t\t"1700000000"\n'
+                         '\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n}\n',
+                         encoding="utf-8")
+        real_userdata = userdata_dirs
+        globals()["userdata_dirs"] = lambda: [fake_userdata]
+        st = cloud_status(413150)
+        check("cloud status lists the account", st.get("ok") is True and len(st["accounts"]) == 1,
+              json.dumps(st))
+        check("cloud status reads the existing switch",
+              st["accounts"][0]["enabled"] is True,
+              json.dumps(st["accounts"][0]))
+        fake_saves = root / "saves"
+        real_save_dirs = _CLOUD_SAVE_DIRS.get(413150)
+        _CLOUD_SAVE_DIRS[413150] = [str(fake_saves)]
+        off = cloud_set(413150, False)
+        check("cloud off writes both stores",
+              off.get("ok") is True and len(off["files"]) == 2, json.dumps(off))
+        check("cloud off creates the save folder", fake_saves.is_dir(), str(fake_saves))
+        check("cloudenabled is 0 in sharedconfig",
+              kv_get(_kv_root(kv_parse(
+                  (fake_userdata / "config" / "sharedconfig.vdf").read_text(encoding="utf-8"))),
+                  ["Software", "Valve", "Steam", "apps", "413150", "cloudenabled"]) == "0")
+        check("cloud off keeps a backup",
+              (fake_userdata / "config" / "localconfig.vdf.licensetools.bak").is_file())
+        check("cloud off preserves the rest of the store",
+              "1700000000" in (fake_userdata / "config" / "localconfig.vdf")
+              .read_text(encoding="utf-8"))
+        st2 = cloud_status(413150)
+        check("cloud status reads back off", st2["accounts"][0]["enabled"] is False,
+              json.dumps(st2["accounts"][0]))
+        on = cloud_set(413150, True, make_dirs=False)
+        check("cloud on writes 1 back",
+              on.get("ok") is True
+              and kv_get(_kv_root(kv_parse(
+                  (fake_userdata / "config" / "sharedconfig.vdf").read_text(encoding="utf-8"))),
+                  ["Software", "Valve", "Steam", "apps", "413150", "cloudenabled"]) == "1",
+              json.dumps(on))
+        twice = cloud_set(413150, True, make_dirs=False)
+        check("cloud on is idempotent",
+              twice.get("ok") is True and twice.get("changed") == 0, json.dumps(twice))
+        globals()["userdata_dirs"] = lambda: []
+        check("cloud on a mac with no account says so",
+              cloud_set(413150, False).get("ok") is False)
+        globals()["userdata_dirs"] = real_userdata
+        _CLOUD_SAVE_DIRS[413150] = real_save_dirs
+
+    check("gui has the cloud buttons",
+          'id="b-m-cloudoff"' in GUI_HTML and 'id="b-m-cloudon"' in GUI_HTML)
+    check("gui calls the cloud entry points",
+          'call("cloud_off"' in GUI_HTML and 'call("cloud_on"' in GUI_HTML)
+    check("gui disables the cloud buttons while busy",
+          '"#b-m-cloudoff","#b-m-cloudon"' in GUI_HTML)
+
     print(json.dumps({"ok": not failed, "checks": checks,
                       "failed": failed}, indent=2))
     if failed:
@@ -2861,6 +2951,259 @@ def current_steamid():
 
 def _vdf_quote(value):
     return str(value if value is not None else "").replace("\\", "\\\\").replace('"', '\\"')
+
+# ---------- steam cloud ----------
+# Steam keeps the per-app "Enable Steam Cloud synchronization" switch in its own
+# KeyValues stores. A stand-in library session has no cloud entitlement, so Steam
+# tries a sync that can never finish and drops "Unable to Sync" in front of the
+# game. Flipping the documented per-app key off is the supported way to stop it.
+
+_KV_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[{}]|[^\s{}"]+')
+_KV_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"'}
+
+
+def _kv_unescape(text):
+    if "\\" not in text:
+        return text
+    out, i = [], 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            out.append(_KV_ESCAPES.get(nxt, nxt))
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _kv_escape(value):
+    return (str(value).replace("\\", "\\\\").replace('"', '\\"')
+            .replace("\n", "\\n").replace("\t", "\\t").replace("\r", ""))
+
+
+def kv_parse(text):
+    """KeyValues text -> list of (key, value); value is str or a nested list."""
+    tokens = _KV_TOKEN.findall(text or "")
+    pos = 0
+
+    def block():
+        nonlocal pos
+        out = []
+        while pos < len(tokens):
+            tok = tokens[pos]
+            if tok == "}":
+                pos += 1
+                return out
+            if tok == "{":
+                pos += 1
+                continue
+            key = _kv_unescape(tok[1:-1]) if tok.startswith('"') else tok
+            pos += 1
+            if pos >= len(tokens):
+                out.append((key, ""))
+                break
+            nxt = tokens[pos]
+            if nxt == "{":
+                pos += 1
+                out.append((key, block()))
+            elif nxt == "}":
+                out.append((key, ""))
+            else:
+                out.append((key, _kv_unescape(nxt[1:-1]) if nxt.startswith('"') else nxt))
+                pos += 1
+        return out
+
+    return block()
+
+
+def kv_dump(nodes, depth=0):
+    pad = "\t" * depth
+    lines = []
+    for key, value in nodes:
+        label = '"' + _kv_escape(key) + '"'
+        if isinstance(value, list):
+            lines.append(pad + label)
+            lines.append(pad + "{")
+            lines.extend(kv_dump(value, depth + 1))
+            lines.append(pad + "}")
+        else:
+            lines.append(pad + label + '\t\t"' + _kv_escape(value) + '"')
+    return lines
+
+
+def kv_get(nodes, path):
+    cur = nodes
+    for part in path:
+        if not isinstance(cur, list):
+            return None
+        found = None
+        for key, value in cur:
+            if key.lower() == part.lower():
+                found = value
+                break
+        if found is None:
+            return None
+        cur = found
+    return cur
+
+
+def kv_set(nodes, path, value):
+    cur = nodes
+    for part in path[:-1]:
+        if not isinstance(cur, list):
+            return False
+        nxt, idx = None, None
+        for i, (key, val) in enumerate(cur):
+            if key.lower() == part.lower():
+                nxt, idx = val, i
+                break
+        if nxt is None:
+            nxt = []
+            cur.append((part, nxt))
+        elif not isinstance(nxt, list):
+            nxt = []
+            cur[idx] = (cur[idx][0], nxt)
+        cur = nxt
+    leaf = path[-1]
+    for i, (key, _val) in enumerate(cur):
+        if key.lower() == leaf.lower():
+            cur[i] = (key, value)
+            return True
+    cur.append((leaf, value))
+    return True
+
+
+def _kv_root(nodes):
+    """The single top-level store block, e.g. UserLocalConfigStore."""
+    if len(nodes) == 1 and isinstance(nodes[0][1], list):
+        return nodes[0][1]
+    return nodes
+
+
+_CLOUD_SAVE_DIRS = {
+    413150: ["~/.config/StardewValley/Saves"],
+}
+
+
+def userdata_dirs():
+    root = SteamCtx().root()
+    if root is None:
+        return []
+    try:
+        return sorted((p for p in (root / "userdata").iterdir()
+                       if p.is_dir() and p.name.isdigit()), key=lambda p: p.name)
+    except OSError:
+        return []
+
+
+def cloud_config_files():
+    out = []
+    for ud in userdata_dirs():
+        cfg = ud / "config"
+        out.append((ud.name, cfg / "sharedconfig.vdf", cfg / "localconfig.vdf"))
+    return out
+
+
+def _cloud_read(path, aid):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    tree = kv_parse(text)
+    val = kv_get(_kv_root(tree), ["Software", "Valve", "Steam", "apps", aid, "cloudenabled"])
+    if val is None:
+        return None
+    return str(val).strip() == "1"
+
+
+def cloud_status(appid):
+    aid = str(int(appid))
+    accounts = []
+    for name, shared, local in cloud_config_files():
+        state = _cloud_read(shared, aid)
+        if state is None:
+            state = _cloud_read(local, aid)
+        accounts.append({"account": name, "enabled": state,
+                         "sharedconfig": str(shared), "localconfig": str(local)})
+    return {"ok": bool(accounts), "appid": aid, "accounts": accounts,
+            "enabled": any(a["enabled"] for a in accounts) if accounts else None,
+            "save_dirs": [str(Path(p).expanduser()) for p in _CLOUD_SAVE_DIRS.get(int(aid), [])]}
+
+
+def _kv_read_text(path):
+    """Read a Steam store without ever guessing at the bytes."""
+    raw = path.read_bytes()
+    for enc in ("utf-8-sig", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _kv_write_key(path, aid, key, value):
+    """Set one per-app key, verify the round trip, and keep a backup first."""
+    try:
+        original = _kv_read_text(path)
+    except OSError as exc:
+        return {"ok": False, "path": str(path), "error": str(exc)}
+    if original is None or "\ufffd" in original:
+        return {"ok": False, "path": str(path), "error": "config is not readable text"}
+    tree = kv_parse(original)
+    if not tree or not isinstance(tree[0][1], list):
+        return {"ok": False, "path": str(path), "error": "unreadable config"}
+    if "configstore" not in str(tree[0][0]).lower():
+        return {"ok": False, "path": str(path), "error": "unexpected config shape"}
+    root = _kv_root(tree)
+    before = kv_get(root, ["Software", "Valve", "Steam", "apps", aid, key])
+    if before is not None and str(before) == value:
+        return {"ok": True, "path": str(path), "changed": False, "value": value}
+    kv_set(root, ["Software", "Valve", "Steam", "apps", aid, key], value)
+    text = "\n".join(kv_dump(tree)) + "\n"
+    check = kv_get(_kv_root(kv_parse(text)), ["Software", "Valve", "Steam", "apps", aid, key])
+    if str(check) != value:
+        return {"ok": False, "path": str(path), "error": "rewrite did not verify"}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        backup = path.with_name(path.name + ".licensetools.bak")
+        if path.is_file() and not backup.exists():
+            shutil.copy2(path, backup)
+        tmp = path.with_name(path.name + ".licensetools.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        return {"ok": False, "path": str(path), "error": str(exc)}
+    return {"ok": True, "path": str(path), "changed": True, "value": value}
+
+
+def cloud_set(appid, enabled, make_dirs=True):
+    """Turn the per-app cloud switch on or off for every account on this mac."""
+    aid = str(int(appid))
+    value = "1" if enabled else "0"
+    files, errors, created = [], [], []
+    for name, shared, local in cloud_config_files():
+        for path in (shared, local):
+            if not path.is_file():
+                continue
+            res = _kv_write_key(path, aid, "cloudenabled", value)
+            (files if res.get("ok") else errors).append(res)
+    if not files and not errors:
+        return {"ok": False, "appid": aid,
+                "error": "no Steam account data found - open Steam once, then try again"}
+    if make_dirs and not enabled:
+        for raw in _CLOUD_SAVE_DIRS.get(int(aid), []):
+            target = Path(raw).expanduser()
+            try:
+                if not target.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    created.append(str(target))
+            except OSError as exc:
+                errors.append({"ok": False, "path": str(target), "error": str(exc)})
+    return {"ok": not errors, "appid": aid, "enabled": bool(enabled),
+            "files": files, "created": created, "errors": errors,
+            "changed": sum(1 for f in files if f.get("changed"))}
 
 def write_pending_appmanifest(appid, name, installdir, buildid, rows, total, download):
     sa = steam_apps_dir()
@@ -4634,6 +4977,18 @@ def cmd_app_update(a):
     return 1
 
 
+def cmd_cloud(a):
+    aid = _appid(a.appid)
+    if a.on:
+        res = cloud_set(aid, True, make_dirs=False)
+    elif a.off:
+        res = cloud_set(aid, False)
+    else:
+        res = cloud_status(aid)
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("ok") else 1
+
+
 def cmd_selftest(_a):
     return selftest()
 
@@ -5008,6 +5363,43 @@ class Api:
             return {"ok": False, "error": "not installed"}
         return drm_status(sa / "common" / installdir)
 
+    def cloud_check(self, appid):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        return cloud_status(int(aid))
+
+    def cloud_off(self, appid):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        LOGS.add(f"turning Steam Cloud off for {aid}")
+        res = cloud_set(int(aid), False)
+        for item in res.get("files") or []:
+            LOGS.add(("set " if item.get("changed") else "already set - ") + item["path"])
+        for item in res.get("created") or []:
+            LOGS.add("created save folder " + item)
+        for item in res.get("errors") or []:
+            LOGS.add("cloud switch failed on " + str(item.get("path")) + ": "
+                     + str(item.get("error")))
+        if res.get("ok"):
+            LOGS.add("Steam Cloud is off for this app - the \"Unable to Sync\" dialog is gone")
+            LOGS.add("restart Steam so it re-reads the config")
+        return res
+
+    def cloud_on(self, appid):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        LOGS.add(f"turning Steam Cloud back on for {aid}")
+        res = cloud_set(int(aid), True, make_dirs=False)
+        for item in res.get("files") or []:
+            LOGS.add(("set " if item.get("changed") else "already set - ") + item["path"])
+        for item in res.get("errors") or []:
+            LOGS.add("cloud switch failed on " + str(item.get("path")) + ": "
+                     + str(item.get("error")))
+        return res
+
     def repair(self, appid):
         aid = str(appid or "").strip()
         if not aid.isdigit():
@@ -5279,6 +5671,11 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
     <span class="muted">Removes the injected dylib, the plist entry, and the macsteam config - Steam goes back to a clean install</span>
   </div>
   <div class="toolbar">
+    <button id="b-m-cloudoff" class="pri">Fix Steam Cloud sync</button>
+    <button id="b-m-cloudon">Put Steam Cloud back</button>
+    <span class="muted">Turns off Steam Cloud for this appid in the Steam config, so the "Unable to Sync" dialog stops blocking the game, and creates the save folder the game expects</span>
+  </div>
+  <div class="toolbar">
     <button id="b-app-update" class="pri">Update this app</button>
     <span id="m-ver" class="muted mono">v{{VER}}</span>
     <span class="muted">Checks GitHub, downloads the new build, swaps the app in place, and reopens it - no deleting, no dragging</span>
@@ -5294,7 +5691,7 @@ let api=null,logIdx=0;
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const say=t=>{$("#status").textContent=t};
-function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-lua","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths","#b-m-manifests","#b-m-update","#b-m-drm","#b-m-drmoff","#b-app-update","#h-new"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
+function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-lua","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths","#b-m-manifests","#b-m-update","#b-m-drm","#b-m-drmoff","#b-m-cloudoff","#b-m-cloudon","#b-app-update","#h-new"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
 async function call(fn,...args){if(!api)throw new Error("bridge not ready");return api[fn](...args)}
 document.querySelectorAll("button.tab").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("button.tab").forEach(x=>x.classList.toggle("pri",x===b));
@@ -5591,6 +5988,28 @@ $("#b-m-drmoff").onclick=async()=>{
   }catch(e){say("restore failed: "+e)}
   busy(false);
 };
+$("#b-m-cloudoff").onclick=async()=>{
+  const id=maintId();if(!id)return;
+  busy(true);say("turning Steam Cloud off for "+id+"...");
+  try{
+    const r=await call("cloud_off",id);
+    if(!r.ok)return say("cloud fix failed: "+((r.errors||[]).map(e=>e.path+": "+e.error).join(" | ")||r.error||""));
+    say("Steam Cloud is off for "+id+" - restarting steam so it re-reads the config");
+    try{await call("restart")}catch(_){}
+    say("done - launch the game again, the sync dialog is gone");
+  }catch(e){say("cloud fix failed: "+e)}
+  busy(false);
+};
+$("#b-m-cloudon").onclick=async()=>{
+  const id=maintId();if(!id)return;
+  busy(true);say("putting Steam Cloud back for "+id+"...");
+  try{
+    const r=await call("cloud_on",id);
+    if(!r.ok)return say("cloud restore failed: "+((r.errors||[]).map(e=>e.path+": "+e.error).join(" | ")||r.error||""));
+    say("Steam Cloud back on for "+id+" - restart steam to apply it");
+  }catch(e){say("cloud restore failed: "+e)}
+  busy(false);
+};
 function maintId(){
   const raw=($("#m-appid").value||$("#appid").value||"").trim();
   if(!/^\d+$/.test(raw)){say("type the appid first");return null}
@@ -5796,6 +6215,12 @@ def build_argparser():
     p.add_argument("--apply", action="store_true",
                    help="download the newest build, swap the running app, and reopen it")
     p.set_defaults(fn=cmd_app_update)
+
+    p = sub.add_parser("cloud", help="read or flip the per-app Steam Cloud switch")
+    p.add_argument("appid")
+    p.add_argument("--off", action="store_true", help="disable cloud sync for the app")
+    p.add_argument("--on", action="store_true", help="put the switch back to enabled")
+    p.set_defaults(fn=cmd_cloud)
 
     return ap
 

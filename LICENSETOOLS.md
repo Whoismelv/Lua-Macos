@@ -94,6 +94,22 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time) and `pycryptodome` for the AES fast path. steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
 
+### What changed in 1.7.0
+
+- **"Fix Steam Cloud sync" in Maintenance.** The `Unable to Sync` dialog is Steam's own cloud pass, and it can never finish for an app the signed-in account does not own, so it sits in front of the game every launch. The new button writes the per-app switch Steam keeps for the Properties window — `Software/Valve/Steam/apps/<appid>/cloudenabled` — into every account's `sharedconfig.vdf` and `localconfig.vdf`, then restarts Steam so it re-reads them. Saves stay on disk and the game runs normally.
+- **It also creates the save folder the game expects.** A missing `~/.config/StardewValley/Saves` is a known cause of the same dialog on macOS; the tool creates it for the appids it knows.
+- **The config rewrite is guarded.** The KeyValues editor keeps duplicates and order, reads the file as UTF-8 or Latin-1 without ever substituting bytes, refuses anything that is not a `*ConfigStore` tree, verifies the rewritten file re-parses to the value it wrote, writes through a temp file, and leaves a `.licensetools.bak` next to the original the first time it touches it.
+- **"Put Steam Cloud back"** flips the switch to `1` again whenever you want the account default.
+- **`cloud <appid>` on the command line**, with `--off`, `--on`, or no flag for the current state.
+
+### ما الجديد في 1.7.0
+
+- **زر "Fix Steam Cloud sync" في Maintenance.** رسالة `Unable to Sync` بتيجي من Steam نفسه، ومستحيل تخلص لتطبيق الحساب مش مالكه، فبتقعد قدام اللعبة كل تشغيل. الزر بيكتب المفتاح اللي Steam بيحفظه لخانة الخصائص — `Software/Valve/Steam/apps/<appid>/cloudenabled` — في `sharedconfig.vdf` و`localconfig.vdf` لكل حساب على الجهاز، وبعدها بيعيد تشغيل Steam عشان يقرأهم من جديد. الحفظ بيفضل على الديسك واللعبة بتشتغل عادي.
+- **وبينشئ مجلد الحفظ اللي اللعبة بتدور عليه.** غياب `~/.config/StardewValley/Saves` سبب معروف لنفس الرسالة على ماك، والأداة بتنشئه للتطبيقات اللي بتعرفها.
+- **تعديل ملف الإعدادات محمي.** محرر KeyValues بيحافظ على الترتيب والمفاتيح المكررة، بيقرأ الملف UTF-8 أو Latin-1 من غير أي تعويض بايتات، بيرفض أي ملف مش شجرة `*ConfigStore`، بيتأكد إن الملف بعد الكتابة بيرجع يقرأ نفس القيمة، بيكتب عبر ملف مؤقت، وبيسيب `.licensetools.bak` جنب الأصل أول مرة يلمسه.
+- **زر "Put Steam Cloud back"** بيرجّع المفتاح لـ `1` وقت ما تحب.
+- **`cloud <appid>` في الكوماند لاين**، مع `--off` أو `--on` أو من غير فلاج للحالة الحالية.
+
 ### What changed in 1.6.1
 
 - **The frozen build now runs the offline tests cleanly.** The "refuses to run from source" check forced the bundle lookup to return nothing instead of inheriting whatever the running process happened to be, so `--selftest` inside `LicenseTools.app` no longer reaches the network and no longer fails during the packaging step.
