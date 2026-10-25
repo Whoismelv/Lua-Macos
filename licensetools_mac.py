@@ -10,7 +10,9 @@ import io
 import json
 import lzma
 import os
+import plistlib
 import re
+import shlex
 import shutil
 import ssl
 import struct
@@ -44,7 +46,9 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.6.0"
+APP_REPO = "Whoismelv/Lua-Macos"
+APP_ASSET_NAMES = ("LicenseTools.dmg", "LuaToolsMac.dmg")
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -121,6 +125,207 @@ def _ssl_context():
     except Exception:
         pass
     return ssl.create_default_context()
+
+# ---------- self update ----------
+
+def _vtuple(text):
+    nums = re.findall(r"\d+", str(text or ""))
+    return tuple(int(n) for n in nums[:4]) or (0,)
+
+
+def _app_bundle_path():
+    """The .app this process is running out of, or None when run from source."""
+    if not getattr(sys, "frozen", False):
+        return None
+    exe = Path(sys.executable).resolve()
+    for p in exe.parents:
+        if p.suffix == ".app" and p.is_dir():
+            return p
+    return None
+
+
+def app_update_check(timeout=30):
+    url = f"https://api.github.com/repos/{APP_REPO}/releases/latest"
+    try:
+        data = json.loads(http_get(url, headers={"Accept": "application/vnd.github+json"},
+                                   timeout=timeout))
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "current": APP_VERSION}
+    latest = str(data.get("tag_name") or "").lstrip("vV")
+    assets = {a.get("name"): a for a in (data.get("assets") or []) if a.get("name")}
+    picked = next((assets[n] for n in APP_ASSET_NAMES if n in assets), None)
+    return {
+        "ok": True, "current": APP_VERSION, "latest": latest or APP_VERSION,
+        "newer": bool(latest) and _vtuple(latest) > _vtuple(APP_VERSION),
+        "asset": ({"name": picked["name"], "bytes": int(picked.get("size") or 0),
+                   "url": picked["browser_download_url"]} if picked else None),
+        "page": data.get("html_url"), "published": data.get("published_at"),
+        "notes": (data.get("body") or "")[:2000],
+    }
+
+
+def _download_to(url, dest, progress=None, expect=0):
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    got = 0
+    with urllib.request.urlopen(req, timeout=180, context=_ssl_context()) as r, \
+            open(part, "wb") as fh:
+        total = int(r.headers.get("Content-Length") or 0) or int(expect or 0)
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            fh.write(chunk)
+            got += len(chunk)
+            if progress and total and got % (4 << 20) < (1 << 16):
+                progress(f"downloaded {got * 100 // total}%")
+    if expect and got != int(expect):
+        part.unlink(missing_ok=True)
+        raise RuntimeError(f"size mismatch: got {got} byte(s), expected {int(expect)}")
+    os.replace(part, dest)
+    return got
+
+
+def _bundle_id(path):
+    """CFBundleIdentifier of an .app, or "" when it cannot be read."""
+    try:
+        with open(Path(path) / "Contents" / "Info.plist", "rb") as fh:
+            return str(plistlib.load(fh).get("CFBundleIdentifier") or "")
+    except Exception:
+        return ""
+
+
+def _pick_app(apps, wanted_name="", wanted_id=""):
+    """Choose the bundle to install: same name first, then same bundle id, then the first."""
+    apps = [p for p in apps if p.suffix == ".app"]
+    if wanted_name:
+        for p in apps:
+            if p.name == wanted_name:
+                return p
+    if wanted_id:
+        for p in apps:
+            if _bundle_id(p) == wanted_id:
+                return p
+    return apps[0] if apps else None
+
+
+def _swap_script(new_bundle, dest, pid):
+    """A detached shard that waits for this process to die, then swaps and reopens.
+
+    The running bundle cannot replace itself, and macOS will not let a live process
+    overwrite its own executable. So the swap runs outside, after the pid is gone.
+    """
+    return f"""#!/bin/sh
+pid={int(pid)}
+new={shlex.quote(str(new_bundle))}
+dest={shlex.quote(str(dest))}
+i=0
+while kill -0 "$pid" 2>/dev/null; do
+  sleep 0.3
+  i=$((i+1))
+  [ "$i" -gt 400 ] && break
+done
+sleep 0.6
+rm -rf "$dest.old"
+if [ -e "$dest" ]; then mv "$dest" "$dest.old"; fi
+if ditto "$new" "$dest"; then
+  xattr -dr com.apple.quarantine "$dest" >/dev/null 2>&1 || true
+  rm -rf "$dest.old"
+  open "$dest"
+else
+  rm -rf "$dest"
+  mv "$dest.old" "$dest"
+  open "$dest"
+fi
+rm -rf "$new"
+rm -f "$0"
+"""
+
+
+def _exit_soon(delay=1.6):
+    time.sleep(delay)
+    os._exit(0)
+
+
+def app_update_apply(progress=None):
+    say = progress or (lambda m: None)
+    dest = _app_bundle_path()
+    if dest is None:
+        return {"ok": False, "error": "running from source - update with git pull"}
+    if sys.platform != "darwin":
+        return {"ok": False, "error": "the in-app update runs on macOS only"}
+    if "AppTranslocation" in str(dest):
+        return {"ok": False, "error": "macOS is running a translated copy of the app - "
+                                      "move it to /Applications and open it from there"}
+    info = app_update_check()
+    if not info.get("ok"):
+        return info
+    if not info.get("newer"):
+        return {"ok": True, "up_to_date": True, "current": info["current"],
+                "latest": info["latest"], "page": info.get("page")}
+    asset = info.get("asset")
+    if not asset:
+        return {"ok": False, "error": "the latest release has no dmg",
+                "page": info.get("page")}
+    work = CACHE_DIR / "update"
+    dmg = work / asset["name"]
+    try:
+        say(f"downloading {asset['name']} ({asset['bytes'] // (1024 * 1024)} MB)")
+        _download_to(asset["url"], dmg, progress, expect=asset.get("bytes") or 0)
+    except Exception as exc:
+        return {"ok": False, "error": f"download failed: {exc}"}
+    mount = work / "mnt"
+    staging = work / "stage"
+    shutil.rmtree(staging, ignore_errors=True)
+    shutil.rmtree(mount, ignore_errors=True)
+    try:
+        mount.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    res = _run_quiet(["hdiutil", "attach", "-nobrowse", "-noverify", "-readonly",
+                      "-mountpoint", str(mount), str(dmg)], timeout=300)
+    if res is None or res.returncode != 0:
+        detail = (getattr(res, "stderr", "") or "").strip() if res is not None else ""
+        return {"ok": False, "error": ("could not open the dmg: " + detail).strip()}
+    try:
+        apps = [p for p in mount.iterdir() if p.suffix == ".app" and p.is_dir()]
+        if not apps:
+            return {"ok": False, "error": "no .app inside the dmg"}
+        pick = _pick_app(apps, dest.name, _bundle_id(dest))
+        if pick is None:
+            return {"ok": False, "error": "no .app inside the dmg"}
+        say("staging the new build")
+        staging.mkdir(parents=True, exist_ok=True)
+        copy = _run_quiet(["ditto", str(pick), str(staging / dest.name)], timeout=600)
+        if copy is None or copy.returncode != 0:
+            return {"ok": False, "error": "copy out of the dmg failed"}
+    finally:
+        _run_quiet(["hdiutil", "detach", str(mount), "-force"], timeout=120)
+    new = staging / dest.name
+    if not (new / "Contents" / "Info.plist").is_file():
+        return {"ok": False, "error": "the dmg did not contain a usable app"}
+    wanted_id = _bundle_id(dest)
+    if wanted_id and _bundle_id(new) != wanted_id:
+        return {"ok": False, "error": "the dmg holds a different app - refusing to swap"}
+    if not os.access(dest.parent, os.W_OK):
+        _run_quiet(["open", str(dmg)], timeout=60)
+        return {"ok": False, "staged": str(new), "dmg": str(dmg),
+                "error": f"{dest.parent} is not writable - the dmg was opened, drag the app to "
+                         f"where you want it"}
+    script = work / "swap.sh"
+    try:
+        script.write_text(_swap_script(new, dest, os.getpid()), encoding="utf-8")
+        script.chmod(0o755)
+        subprocess.Popen(["/bin/sh", str(script)], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        return {"ok": False, "error": f"could not start the swap: {exc}"}
+    threading.Thread(target=_exit_soon, daemon=True).start()
+    return {"ok": True, "relaunching": True, "from": info["current"],
+            "to": info["latest"], "staged": str(new), "dmg": str(dmg)}
+
 
 # ---------- steam discovery ----------
 
@@ -1389,6 +1594,71 @@ def selftest():
           native is None or native == plain, repr(native))
     check("bundled stand-in lookup does not raise", _bundled_stub() is None
           or _bundled_stub().is_file())
+
+    check("version compare is numeric",
+          _vtuple("1.5.10") > _vtuple("1.5.9") and _vtuple("1.5.3") < _vtuple("2.0"),
+          f"{_vtuple('1.5.10')} vs {_vtuple('1.5.9')}")
+    fake_release = {"tag_name": "v9.9.9", "html_url": "https://example.invalid/rel",
+                    "published_at": "2026-01-01T00:00:00Z", "body": "notes",
+                    "assets": [{"name": "LuaToolsMac.dmg", "size": 10,
+                                "browser_download_url": "https://example.invalid/a"},
+                               {"name": "LicenseTools.dmg", "size": 20,
+                                "browser_download_url": "https://example.invalid/b"}]}
+    real_http = http_get
+    globals()["http_get"] = lambda *a, **k: json.dumps(fake_release).encode("utf-8")
+    up = app_update_check()
+    check("update check sees a newer tag",
+          up.get("ok") is True and up.get("newer") is True and up.get("latest") == "9.9.9",
+          json.dumps(up))
+    check("update check prefers the licensetools dmg",
+          (up.get("asset") or {}).get("name") == "LicenseTools.dmg",
+          json.dumps(up.get("asset")))
+    globals()["http_get"] = lambda *a, **k: json.dumps(
+        dict(fake_release, tag_name="v" + APP_VERSION)).encode("utf-8")
+    same = app_update_check()
+    check("same version is not an update",
+          same.get("ok") is True and same.get("newer") is False, json.dumps(same))
+    globals()["http_get"] = real_http
+
+    from_source = app_update_apply()
+    check("self update refuses to run from source",
+          from_source.get("ok") is False and "source" in str(from_source.get("error")),
+          json.dumps(from_source))
+    swap = _swap_script("/tmp/new/LicenseTools.app", "/Applications/License Tools.app", 4242)
+    check("swap waits for the running pid", 'kill -0 "$pid"' in swap and "pid=4242" in swap)
+    check("swap quotes a path with a space",
+          "'/Applications/License Tools.app'" in swap, swap.splitlines()[2])
+    check("swap copies, reopens, and has a rollback",
+          "ditto \"$new\" \"$dest\"" in swap and "open \"$dest\"" in swap
+          and "mv \"$dest.old\" \"$dest\"" in swap)
+    check("gui has the app update button", 'id="b-app-update"' in GUI_HTML)
+    check("gui has the header update chip", 'id="h-new"' in GUI_HTML)
+    check("gui calls the update entry points",
+          'call("app_update"' in GUI_HTML and 'call("app_update_install"' in GUI_HTML)
+    check("gui disables the update buttons while busy",
+          '"#b-app-update","#h-new"' in GUI_HTML)
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        def _fake_app(name, bundle_id):
+            p = root / name
+            (p / "Contents").mkdir(parents=True)
+            with open(p / "Contents" / "Info.plist", "wb") as fh:
+                plistlib.dump({"CFBundleIdentifier": bundle_id}, fh)
+            return p
+
+        other = _fake_app("Other.app", "com.example.other")
+        ours = _fake_app("LicenseTools.app", "com.whoismelv.licensetools")
+        check("bundle id reads back",
+              _bundle_id(ours) == "com.whoismelv.licensetools", _bundle_id(ours))
+        check("pick prefers the matching name",
+              _pick_app([other, ours], "LicenseTools.app").name == "LicenseTools.app")
+        check("pick falls back to the bundle id",
+              _pick_app([other, ours], "Renamed.app",
+                        "com.whoismelv.licensetools").name == "LicenseTools.app")
+        check("pick takes the only app", _pick_app([other]).name == "Other.app")
+        check("pick survives an empty dmg", _pick_app([]) is None)
 
     print(json.dumps({"ok": not failed, "checks": checks,
                       "failed": failed}, indent=2))
@@ -4335,6 +4605,32 @@ def cmd_keys(a):
                      indent=2, ensure_ascii=False))
     return 0
 
+def cmd_app_update(a):
+    if not getattr(a, "apply", False):
+        info = app_update_check()
+        if not info.get("ok"):
+            print("check failed:", info.get("error"))
+            return 1
+        print(f"current {info['current']}")
+        print(f"latest  {info['latest']}")
+        print("update available" if info.get("newer") else "up to date")
+        if info.get("asset"):
+            print("asset   ", info["asset"]["name"],
+                  f"({info['asset']['bytes'] // (1024 * 1024)} MB)")
+        if info.get("page"):
+            print("page    ", info["page"])
+        return 0
+    res = app_update_apply(lambda m: print(m, flush=True))
+    if res.get("relaunching"):
+        print(f"staged {res.get('from')} -> {res.get('to')}, reopening")
+        return 0
+    if res.get("up_to_date"):
+        print("already on the newest build")
+        return 0
+    print("update failed:", res.get("error"))
+    return 1
+
+
 def cmd_selftest(_a):
     return selftest()
 
@@ -4639,6 +4935,27 @@ class Api:
                  if res.get("ok") else ("lua import failed: " + str(res.get("error"))))
         return res
 
+    def app_update(self):
+        res = app_update_check()
+        if res.get("ok"):
+            LOGS.add(f"app {res['current']} - newest is {res.get('latest')}"
+                     + (" - update available" if res.get("newer") else " - up to date"))
+        else:
+            LOGS.add("update check failed: " + str(res.get("error")))
+        return res
+
+    def app_update_install(self):
+        LOGS.add("checking for a newer build of the app itself")
+        res = app_update_apply(lambda m: LOGS.add(str(m)))
+        if res.get("relaunching"):
+            LOGS.add(f"new build staged: {res.get('from')} -> {res.get('to')}")
+            LOGS.add("the app closes now and reopens from the new bundle")
+        elif res.get("up_to_date"):
+            LOGS.add("already on the newest build")
+        else:
+            LOGS.add("update failed: " + str(res.get("error")))
+        return res
+
     def drm_patch(self, appid):
         aid = str(appid or "").strip()
         if not aid.isdigit():
@@ -4858,6 +5175,8 @@ body{margin:0;background:var(--bg);color:var(--txt);font:13px/1.45 -apple-system
 header{display:flex;gap:14px;align-items:baseline;padding:14px 18px;border-bottom:1px solid var(--line)}
 header b{font-size:15px;letter-spacing:.06em}
 header span{color:var(--dim);font-size:12px}
+#h-new{margin-left:auto;display:none;background:#14202b;color:#7FC4FF;border:1px solid #26455C;border-radius:999px;padding:4px 12px;font-size:12px;cursor:pointer}
+#h-new:hover{border-color:#3E6D8E;color:#A9DAFF}
 nav{display:flex;gap:8px;padding:10px 18px;border-bottom:1px solid var(--line);align-items:center}
 nav .sp{flex:1}
 button{background:var(--panel);color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 12px;font:inherit;cursor:pointer}
@@ -4883,7 +5202,7 @@ th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;lett
 #probeout{margin-top:14px}
 label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
 </style></head><body>
-<header><b>LICENSETOOLS</b><span id="h-ver" class="mono" style="color:#7C8797">v{{VER}}</span><span id="h-root">detecting...</span><span id="h-loader"></span></header>
+<header><b>LICENSETOOLS</b><span id="h-ver" class="mono" style="color:#7C8797">v{{VER}}</span><span id="h-root">detecting...</span><span id="h-loader"></span><button id="h-new" class="mono" style="display:none">update</button></header>
 <nav>
   <button class="tab pri" data-t="grant">Grant</button>
   <button class="tab" data-t="library">Library</button>
@@ -4956,6 +5275,11 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
     <button id="b-m-unloader">Remove loader from Steam</button>
     <span class="muted">Removes the injected dylib, the plist entry, and the macsteam config - Steam goes back to a clean install</span>
   </div>
+  <div class="toolbar">
+    <button id="b-app-update" class="pri">Update this app</button>
+    <span id="m-ver" class="muted mono">v{{VER}}</span>
+    <span class="muted">Checks GitHub, downloads the new build, swaps the app in place, and reopens it - no deleting, no dragging</span>
+  </div>
   <div id="pathsout"></div>
   <div class="muted" style="margin-top:8px">Delete game removes the install record, the game folder, the staging folder, the library cache entry, and the license line.</div>
 </section>
@@ -4967,7 +5291,7 @@ let api=null,logIdx=0;
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const say=t=>{$("#status").textContent=t};
-function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-lua","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths","#b-m-manifests","#b-m-update","#b-m-drm","#b-m-drmoff"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
+function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-lua","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths","#b-m-manifests","#b-m-update","#b-m-drm","#b-m-drmoff","#b-app-update","#h-new"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
 async function call(fn,...args){if(!api)throw new Error("bridge not ready");return api[fn](...args)}
 document.querySelectorAll("button.tab").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("button.tab").forEach(x=>x.classList.toggle("pri",x===b));
@@ -5091,6 +5415,7 @@ async function boot(){
     renderLib(d.library);
     renderInstalled(d.installed);
     await ldRefresh();
+    checkAppUpdate();
   }catch(e){say("bootstrap failed: "+e)}
 }
 async function doSearch(){
@@ -5297,6 +5622,29 @@ $("#b-m-unloader").onclick=async()=>{
   busy(false);
   await ldRefresh();
 };
+async function checkAppUpdate(){
+  try{
+    const u=await call("app_update");
+    if(!u||!u.ok||!u.newer)return;
+    const el=$("#h-new");
+    el.textContent="v"+u.latest+" available";
+    el.style.display="inline-block";
+    el.onclick=installAppUpdate;
+    say("a newer build is out: v"+u.latest+" - Maintenance, then Update this app");
+  }catch(e){}
+}
+async function installAppUpdate(){
+  busy(true);say("checking for a newer build of this app...");
+  try{
+    const r=await call("app_update_install");
+    if(r.relaunching){say("new build staged ("+r.from+" to "+r.to+") - the app reopens in a second");return}
+    if(r.up_to_date){say("already on the newest build (v"+r.current+")")}
+    else{say("update failed: "+(r.error||"unknown"))}
+  }catch(e){say("update failed: "+e)}
+  busy(false);
+}
+$("#b-app-update").onclick=installAppUpdate;
+$("#h-new").onclick=installAppUpdate;
 async function pollLogs(){
   if(!api)return;
   try{
@@ -5354,6 +5702,7 @@ def build_argparser():
         prog="licensetools",
         description="Steam license kit for macOS: probe appinfo, grant stplug-in lua, pin manifests")
     ap.add_argument("--selftest", action="store_true", help="run offline fixture checks and exit")
+    ap.add_argument("--version", action="version", version="licensetools " + APP_VERSION)
     ap.add_argument("--emit-stub", metavar="PATH",
                     help="write the stand-in library source to PATH and exit")
     sub = ap.add_subparsers(dest="cmd")
@@ -5439,6 +5788,11 @@ def build_argparser():
     p.add_argument("--steam-path", default=None)
     p.add_argument("--token", default="")
     p.set_defaults(fn=cmd_settings)
+
+    p = sub.add_parser("app-update", help="check for or install a newer build of this app")
+    p.add_argument("--apply", action="store_true",
+                   help="download the newest build, swap the running app, and reopen it")
+    p.set_defaults(fn=cmd_app_update)
 
     return ap
 

@@ -94,6 +94,22 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time) and `pycryptodome` for the AES fast path. steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
 
+### What changed in 1.6.0
+
+- **The app updates itself.** Header chip and `Maintenance → Update this app` check `releases/latest` on GitHub, download the dmg, verify the byte count, mount it read-only, copy the new `.app` out, confirm it is the same bundle (`CFBundleIdentifier`), then hand the swap to a detached `/bin/sh` that waits for the running pid to die, `mv`s the old bundle to `.old`, `ditto`s the new one in, strips the quarantine flag, and `open`s it. If the copy fails it puts the old bundle back and opens that instead. No deleting, no dragging, no admin.
+- **The version check is numeric**, so `1.5.10` is correctly newer than `1.5.9` and the current build is never offered to itself.
+- **A dmg that holds a different app is refused** before anything is renamed, and a size mismatch aborts the download before anything is mounted.
+- **`app-update` on the command line** (`--apply` to install) and `--version` for scripts.
+- **`--emit-stub`, `--selftest`, and the bundled stand-in from 1.5.3** are unchanged and still verified on every build.
+
+### ما الجديد في 1.6.0
+
+- **البرنامج بيحدّث نفسه.** شريحة بالترويسة وزر `Maintenance → Update this app` بيفحصوا `releases/latest` على GitHub، بينزّلوا الـ dmg، بيتأكدوا من عدد البايتات، بيفتحوه للقراءة بس، بينسخوا الـ `.app` الجديد، بيتأكدوا إنه نفس التطبيق (`CFBundleIdentifier`)، وبعدها بيسلّموا التبديل لـ `/bin/sh` منفصل بيستنى العملية الحالية تموت، بينقل الباندل القديم لـ `.old`، بينسخ الجديد بـ `ditto`، بيشيل علامة الحجر، وبيعيد الفتح. وإذا النسخ فشل بيرجّع القديم ويفتحه. بدون مسح، بدون سحب، بدون أدمين.
+- **مقارنة النسخ رقمية**، فـ `1.5.10` أحدث من `1.5.9` صح، والنسخة الحالية ما بتنعرض على نفسها.
+- **أي dmg فيه تطبيق تاني بينرفض** قبل أي إعادة تسمية، واختلاف الحجم بيوقف التنزيل قبل أي فتح للـ dmg.
+- **`app-update` بالكوماند لاين** (`--apply` للتثبيت) و`--version` للسكربتات.
+- **`--emit-stub` و`--selftest` والمكتبة المرفقة من 1.5.3** ما تغيّروا، وبيتأكدوا مع كل بناء.
+
 ### What changed in 1.5.3
 
 - **The stand-in library now ships inside the app.** `build_licensetools.sh` compiles `libsteam_api.dylib` at build time as a fat `arm64 + x86_64` binary, ad-hoc signs it, and bundles it under `vendor/stub`. On a Mac without `clang` the app copies that prebuilt library instead of reporting a missing tool, so the patch still lands and no Xcode install is needed.
