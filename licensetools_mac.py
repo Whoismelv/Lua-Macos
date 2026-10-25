@@ -2021,7 +2021,9 @@ def selftest():
 
     if getattr(sys, "frozen", False):
         check("the frozen app finds its own loader payload", payload_root is not None,
-              "the app carries a dylib but the lookup missed it")
+              "meipass=" + str(getattr(sys, "_MEIPASS", "")) +
+              " exe=" + sys.executable +
+              " file=" + str(Path(__file__).resolve()))
         frozen_pay = macsteam_payload()
         check("the frozen app can read the payload it ships",
               frozen_pay["present"] and frozen_pay["signatures"] >= 1,

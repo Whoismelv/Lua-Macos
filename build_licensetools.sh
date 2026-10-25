@@ -205,7 +205,24 @@ echo "loader inside the bundle: $(lipo -archs "$MS_IN_APP" 2>/dev/null || echo '
 ls -lh "$MS_IN_APP"
 
 echo "== selftest (frozen) =="
-"$APP/Contents/MacOS/$BUNDLE" --selftest
+"$APP/Contents/MacOS/$BUNDLE" loader status > /tmp/lic-payload.json 2>&1 || true
+python3 - <<'PY'
+import json, pathlib
+raw = pathlib.Path("/tmp/lic-payload.json").read_text(errors="replace")
+try:
+    pay = (json.loads(raw) or {}).get("payload") or {}
+except Exception:
+    print("payload probe: not json ->", raw[:300].replace("\n", " "))
+else:
+    print("payload probe:", {k: pay.get(k) for k in
+                             ("present", "root", "dylib", "bytes",
+                              "version", "signatures", "builds")})
+PY
+if ! "$APP/Contents/MacOS/$BUNDLE" --selftest > /tmp/lic-frozen.json 2>&1; then
+  tail -n 40 /tmp/lic-frozen.json >&2
+  fail "frozen selftest: $(tr -d '\n' < /tmp/lic-frozen.json | tr -s ' ' | tail -c 900)"
+fi
+tail -n 4 /tmp/lic-frozen.json
 
 echo "== ad-hoc sign =="
 codesign --force --deep --sign - "$APP" || echo "codesign skipped"
