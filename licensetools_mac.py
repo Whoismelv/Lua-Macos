@@ -44,7 +44,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -2727,9 +2727,14 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
             progress("matching the steam library the game links against...")
         drm = drm_skip(target, aid, progress)
         if progress:
-            progress("drm layer: " + ("patched " + ", ".join(drm.get("patched") or [])
-                                      if drm.get("ok") else
-                                      str(drm.get("error") or "no dylib in this game")))
+            if drm.get("needs_tools"):
+                progress("drm layer: left untouched, no build tools on this mac")
+            elif drm.get("ok") and not drm.get("skipped"):
+                progress("drm layer: patched " + ", ".join(drm.get("patched") or []))
+            elif drm.get("skipped"):
+                progress("drm layer: no dylib in this game")
+            else:
+                progress("drm layer: " + str(drm.get("error") or "unavailable"))
     launch_info = steam_launch()
     if progress:
         progress("steam: " + ("opened - check your library" if launch_info.get("ok")
@@ -2782,6 +2787,7 @@ _STUB_CORE = r'''#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <mach-o/dyld.h>
 
 #define VIS(v) __attribute__((visibility("default"))) v __attribute__((used))
@@ -2857,6 +2863,193 @@ static void *stub_object(void)
     return g_vtbl;
 }
 
+/* local file store - gives the game somewhere real to write its saves */
+static const char *stub_savedir(void)
+{
+    static char buf[4096];
+    static int ready;
+    if (!ready) {
+        const char *home = getenv("HOME");
+        if (!home)
+            home = "/tmp";
+        snprintf(buf, sizeof(buf), "%s/Library/Application Support/LicenseTools/%llu/remote",
+                 home, (unsigned long long)stub_read_appid());
+        for (char *p = buf + 1; *p; p++) {
+            if (*p == '/') {
+                *p = 0;
+                mkdir(buf, 0700);
+                *p = '/';
+            }
+        }
+        mkdir(buf, 0700);
+        ready = 1;
+    }
+    return buf;
+}
+
+static const char *stub_savepath(const char *name)
+{
+    static char buf[8192];
+    snprintf(buf, sizeof(buf), "%s/%s", stub_savedir(), (name && *name) ? name : "unnamed");
+    return buf;
+}
+
+VIS(int) SteamAPI_ISteamRemoteStorage_FileWrite(void *s, const char *name,
+                                               const void *data, int cb)
+{
+    (void)s;
+    if (!name || !data || cb < 0)
+        return 0;
+    FILE *fh = fopen(stub_savepath(name), "wb");
+    if (!fh)
+        return 0;
+    size_t put = fwrite(data, 1, (size_t)cb, fh);
+    fclose(fh);
+    return (int)put;
+}
+
+VIS(int) SteamAPI_ISteamRemoteStorage_FileRead(void *s, const char *name,
+                                               void *buf, int cb)
+{
+    (void)s;
+    if (!name || !buf || cb < 0)
+        return 0;
+    FILE *fh = fopen(stub_savepath(name), "rb");
+    if (!fh)
+        return 0;
+    size_t got = fread(buf, 1, (size_t)cb, fh);
+    fclose(fh);
+    return (int)got;
+}
+
+VIS(int) SteamAPI_ISteamRemoteStorage_FileExists(void *s, const char *name)
+{
+    (void)s;
+    FILE *fh = name ? fopen(stub_savepath(name), "rb") : NULL;
+    if (!fh)
+        return 0;
+    fclose(fh);
+    return 1;
+}
+
+VIS(int) SteamAPI_ISteamRemoteStorage_FilePersisted(void *s, const char *name)
+{
+    return SteamAPI_ISteamRemoteStorage_FileExists(s, name);
+}
+
+VIS(int) SteamAPI_ISteamRemoteStorage_FileDelete(void *s, const char *name)
+{
+    (void)s;
+    return name && remove(stub_savepath(name)) == 0;
+}
+
+VIS(int) SteamAPI_ISteamRemoteStorage_FileForget(void *s, const char *name)
+{
+    return SteamAPI_ISteamRemoteStorage_FileDelete(s, name);
+}
+
+VIS(int32_t) SteamAPI_ISteamRemoteStorage_GetFileSize(void *s, const char *name)
+{
+    (void)s;
+    if (!name)
+        return 0;
+    FILE *fh = fopen(stub_savepath(name), "rb");
+    if (!fh)
+        return 0;
+    fseek(fh, 0, SEEK_END);
+    long n = ftell(fh);
+    fclose(fh);
+    return (int32_t)n;
+}
+
+VIS(int) SteamAPI_ISteamRemoteStorage_GetQuota(void *s, uint64_t *total,
+                                               uint64_t *avail)
+{
+    (void)s;
+    if (total)
+        *total = 1073741824ULL;
+    if (avail)
+        *avail = 1073741824ULL;
+    return 1;
+}
+
+VIS(int) SteamAPI_ISteamRemoteStorage_GetFileCount(void *s) { (void)s; return 0; }
+
+VIS(const char *) SteamAPI_ISteamRemoteStorage_GetFileNameAndSize(void *s, int i,
+                                                                  int32_t *size)
+{
+    (void)s;
+    (void)i;
+    if (size)
+        *size = 0;
+    return "";
+}
+
+VIS(uint64_t) SteamAPI_ISteamRemoteStorage_GetFileTimestamp(void *s, const char *name)
+{
+    (void)s;
+    (void)name;
+    return 0;
+}
+
+VIS(uint32_t) SteamAPI_ISteamRemoteStorage_GetSyncPlatforms(void *s, const char *name)
+{
+    (void)s;
+    (void)name;
+    return 1;
+}
+
+VIS(int) SteamAPI_ISteamRemoteStorage_SetSyncPlatforms(void *s, const char *name,
+                                                       uint32_t platforms)
+{
+    (void)s;
+    (void)name;
+    (void)platforms;
+    return 1;
+}
+
+VIS(int) SteamAPI_ISteamRemoteStorage_GetLocalFileChangeCount(void *s)
+{
+    (void)s;
+    return 0;
+}
+
+VIS(int) SteamAPI_ISteamRemoteStorage_GetLocalFileChange(void *s, int i, int *kind,
+                                                         int *flags)
+{
+    (void)s;
+    (void)i;
+    if (kind)
+        *kind = 0;
+    if (flags)
+        *flags = 0;
+    return 0;
+}
+
+VIS(const char *) SteamAPI_ISteamRemoteStorage_GetCStringFromError(void *s, int e)
+{
+    (void)s;
+    (void)e;
+    return "";
+}
+
+VIS(int) SteamAPI_ISteamApps_GetAppInstallDir(void *s, uint32_t appid, char *dir,
+                                              uint32_t cb)
+{
+    (void)s;
+    (void)appid;
+    const char *src = stub_exe_dir();
+    if (!dir || cb == 0)
+        return 0;
+    uint32_t i = 0;
+    while (src[i] && i + 1 < cb) {
+        dir[i] = src[i];
+        i++;
+    }
+    dir[i] = 0;
+    return (int)i;
+}
+
 VIS(int) SteamAPI_Init(void) { stub_read_appid(); return 1; }
 VIS(int) SteamAPI_InitFlat(char *err) { (void)err; return SteamAPI_Init(); }
 VIS(int) SteamAPI_InitSafe(void) { return SteamAPI_Init(); }
@@ -2897,6 +3090,19 @@ _STUB_CORE_NAMES = {
     "SteamInternal_FindOrCreateUserInterface", "SteamInternal_FindOrCreateGameServerInterface",
     "SteamInternal_ContextInit", "SteamAPI_UseBreakpadCrashHandler",
     "SteamAPI_SetBreakpadAppID", "SteamAPI_SetMiniDumpComment",
+    "SteamAPI_ISteamRemoteStorage_FileWrite", "SteamAPI_ISteamRemoteStorage_FileRead",
+    "SteamAPI_ISteamRemoteStorage_FileExists", "SteamAPI_ISteamRemoteStorage_FilePersisted",
+    "SteamAPI_ISteamRemoteStorage_FileDelete", "SteamAPI_ISteamRemoteStorage_FileForget",
+    "SteamAPI_ISteamRemoteStorage_GetFileSize", "SteamAPI_ISteamRemoteStorage_GetQuota",
+    "SteamAPI_ISteamRemoteStorage_GetFileCount",
+    "SteamAPI_ISteamRemoteStorage_GetFileNameAndSize",
+    "SteamAPI_ISteamRemoteStorage_GetFileTimestamp",
+    "SteamAPI_ISteamRemoteStorage_GetSyncPlatforms",
+    "SteamAPI_ISteamRemoteStorage_SetSyncPlatforms",
+    "SteamAPI_ISteamRemoteStorage_GetLocalFileChangeCount",
+    "SteamAPI_ISteamRemoteStorage_GetLocalFileChange",
+    "SteamAPI_ISteamRemoteStorage_GetCStringFromError",
+    "SteamAPI_ISteamApps_GetAppInstallDir",
 }
 
 _STUB_ACCESSOR = "VIS(void *) {name}(void) {{ return stub_object(); }}\n"
@@ -2906,6 +3112,7 @@ _STUB_STEAMID_FN = ("VIS(uint64_t) {name}(void *self) {{ (void)self; "
 _STUB_YES_FN = "VIS(int) {name}(void *self) {{ (void)self; return 1; }}\n"
 _STUB_NO_FN = "VIS(uint64_t) {name}(void *self) {{ (void)self; return 1; }}\n"
 _STUB_FLOAT_FN = "VIS(double) {name}(void *self) {{ (void)self; return 1.0; }}\n"
+_STUB_STR_FN = 'VIS(const char *) {name}(void *self) {{ (void)self; return ""; }}\n'
 
 
 def _stub_kind(name):
@@ -2916,11 +3123,21 @@ def _stub_kind(name):
     if name.endswith("_GetStatFloat") or name.endswith("_GetStat"):
         return "float"
     if any(name.endswith(sfx) for sfx in (
+            "_GetPersonaName", "_GetPlayerNickname", "_GetSteamUILanguage",
+            "_GetCurrentGameLanguage", "_GetAvailableGameLanguages",
+            "_GetCurrentBetaName", "_GetFriendPersonaName", "_GetClanName",
+            "_GetAchievementName", "_GetAchievementDisplayAttribute",
+            "_GetAppInstallDir", "_GetAppOwner", "_GetGameLanguage",
+            "_GetSavedGameName")):
+        return "str"
+    if any(name.endswith(sfx) for sfx in (
             "_BIsSubscribed", "_BIsSubscribedApp", "_BLoggedOn", "_BLoggedOn_",
             "_BIsDlcInstalled", "_BIsAppInstalled", "_BGetDLCDataByIndex",
             "_BIsTimedTrial", "_BIsVACBanned", "_BAnon", "_BGetAchievement",
             "_BGetStat", "_BIsOverlayEnabled", "_BIsSteamRunning",
-            "_BIsGameOverlayActive")):
+            "_BIsGameOverlayActive", "_StoreStats", "_RequestCurrentStats",
+            "_BSetAchievement", "_BUpdateAvgRateStat", "_BActivateGameOverlay",
+            "_BCommit")):
         return "yes"
     return "ptr"
 
@@ -2947,6 +3164,8 @@ def _stub_source(symbols, appid):
             out.append(_STUB_FLOAT_FN.format(name=name))
         elif kind == "yes":
             out.append(_STUB_YES_FN.format(name=name))
+        elif kind == "str":
+            out.append(_STUB_STR_FN.format(name=name))
         else:
             out.append(_STUB_NO_FN.format(name=name))
     return "".join(out)
@@ -3042,6 +3261,56 @@ def _appid_file_dirs(target, exe):
     return out
 
 
+def _entitlements(path):
+    """The entitlements blob already on disk, as raw plist bytes."""
+    res = _run_quiet(["codesign", "-d", "--entitlements", ":-", str(path)], timeout=60)
+    if res is None or res.returncode != 0 or not res.stdout.strip():
+        return b""
+    blob = res.stdout.encode("utf-8", "replace")
+    if b"<?xml" not in blob:
+        return b""
+    return blob
+
+
+def _resign(path, work):
+    """Re-sign ad hoc, keeping the entitlements and dropping the runtime flag.
+
+    The vendor signature dies the moment a library inside the bundle changes.
+    Keeping the entitlements matters (sandbox, JIT, camera). Dropping the
+    hardened runtime matters more: library validation refuses to load a dylib
+    that is not signed by the same team, and an ad hoc stub has no team.
+    """
+    inner = Path(str(path))
+    is_bundle = inner.is_dir()
+    ent = _entitlements(inner)
+    argv = ["codesign", "--force", "--sign", "-"]
+    if ent:
+        ent_file = Path(work) / ("entitlements-" + inner.name.replace(" ", "_") + ".plist")
+        try:
+            ent_file.write_bytes(ent)
+            argv += ["--entitlements", str(ent_file)]
+        except OSError:
+            pass
+    argv.append(str(inner))
+    res = _run_quiet(argv, timeout=300)
+    return {"ok": res is not None and res.returncode == 0,
+            "entitlements": bool(ent), "bundle": is_bundle,
+            "error": None if res is None else (res.stderr or "").strip()[:200]}
+
+
+def _sign_tree(root, exe, work):
+    """Sign the innermost code first, then the bundles that contain it."""
+    out = []
+    targets = []
+    if exe is not None:
+        targets.append(exe)
+    for bundle in _app_bundles(root):
+        targets.append(bundle)
+    for t in targets:
+        out.append({"path": str(t), **_resign(t, work)})
+    return out
+
+
 def drm_skip(target, appid, progress=None):
     root = Path(target)
     if not root.is_dir():
@@ -3067,6 +3336,13 @@ def drm_skip(target, appid, progress=None):
         return {"ok": False, "error": str(exc)}
     built = _build_stub(src, work / STUB_NAME)
     if not built.get("ok"):
+        missing = _run_quiet(["clang", "--version"], timeout=30)
+        if missing is None or missing.returncode != 0:
+            return {"ok": True, "skipped": True, "needs_tools": True,
+                    "symbols": len(symbols), "dylibs": [str(p) for p in libs],
+                    "hint": "nothing was changed - the game keeps its original library. "
+                            "Only install the tools if a game refuses to start: "
+                            "xcode-select --install"}
         return {"ok": False, "error": built.get("error"), "symbols": len(symbols)}
     report = {"ok": True, "symbols": len(symbols), "arch": built.get("arch"),
               "patched": [], "backups": [], "errors": []}
@@ -3089,8 +3365,9 @@ def drm_skip(target, appid, progress=None):
             report.setdefault("appid_files", []).append(str(d / STUB_APPID_FILE))
         except OSError as exc:
             report["errors"].append(f"{d / STUB_APPID_FILE}: {exc}")
-    for bundle in _app_bundles(root):
-        _run_quiet(["codesign", "-f", "-s", "-", str(bundle)], timeout=180)
+    signs = _sign_tree(root, exe, work)
+    report["signed"] = [s for s in signs if s.get("ok")]
+    report["kept_entitlements"] = sum(1 for s in signs if s.get("entitlements"))
     report["ok"] = not report["errors"]
     return report
 
@@ -3105,7 +3382,6 @@ def drm_restore(target):
         try:
             shutil.copy2(backup, live)
             backup.unlink()
-            _run_quiet(["codesign", "-f", "-s", "-", str(live)], timeout=120)
             undone.append(str(live))
         except OSError as exc:
             errors.append(f"{live}: {exc}")
@@ -3119,8 +3395,13 @@ def drm_restore(target):
             f.unlink()
         except OSError:
             pass
-    for bundle in _app_bundles(root):
-        _run_quiet(["codesign", "-f", "-s", "-", str(bundle)], timeout=180)
+    work = Path.home() / ".licensetools" / "stub" / "restore"
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    if undone:
+        _sign_tree(root, _game_binary(root), work)
     return {"ok": not errors, "restored": undone, "errors": errors}
 
 
@@ -4250,6 +4531,9 @@ class Api:
                     drm = res.get("drm") or {}
                     if drm.get("patched"):
                         LOGS.add("steam library replaced - the game will not ask for a check")
+                    elif drm.get("needs_tools"):
+                        LOGS.add("library left untouched: no build tools on this mac - "
+                                 "the game was not changed")
                     elif drm.get("skipped"):
                         LOGS.add("no steam library in this game - nothing to replace")
                     elif drm.get("error"):
@@ -4339,7 +4623,11 @@ class Api:
         target = sa / "common" / installdir
         LOGS.add("replacing the steam library in " + str(target))
         res = drm_skip(target, int(aid), lambda m: LOGS.add(str(m)))
-        if res.get("skipped"):
+        if res.get("needs_tools"):
+            LOGS.add("nothing was changed - this mac has no build tools")
+            LOGS.add("the game keeps its original library and still runs")
+            LOGS.add("only install them if a game refuses to start: xcode-select --install")
+        elif res.get("skipped"):
             LOGS.add("this game has no " + STUB_NAME + " - nothing to replace")
         elif res.get("ok"):
             LOGS.add(f"patched {len(res.get('patched') or [])} librar(y/ies), "
@@ -4931,7 +5219,8 @@ $("#b-m-drm").onclick=async()=>{
   busy(true);say("matching the steam library in "+id+" against what the game imports...");
   try{
     const r=await call("drm_patch",id);
-    if(r.skipped)say("this game ships no libsteam_api.dylib - nothing to replace");
+    if(r.needs_tools)say("nothing changed - no build tools on this mac. the game still runs as it is; install them only if a game refuses to start");
+    else if(r.skipped)say("this game ships no libsteam_api.dylib - nothing to replace");
     else if(r.ok)say("patched "+(r.patched||[]).length+" librar(y/ies) with "+(r.symbols||0)+" matched symbol(s)");
     else say("patch failed: "+(r.error||""));
   }catch(e){say("patch failed: "+e)}

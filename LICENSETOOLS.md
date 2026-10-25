@@ -94,6 +94,22 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time) and `pycryptodome` for the AES fast path. steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
 
+### What changed in 1.5.2
+
+- **The stand-in library now keeps saves on disk.** `FileWrite` / `FileRead` / `FileExists` / `FileDelete` / `GetFileSize` / `GetQuota` used to return a bare zero, which is why games threw a cloud error on exit: they tried to write a save, got "failed", and reported it. They now read and write real files under `~/Library/Application Support/LicenseTools/<appid>/remote/`, so saves persist and the error stops.
+- **`GetAppInstallDir` returns the real install path** instead of an empty string, and the string-returning getters (`GetPersonaName`, `GetCurrentGameLanguage`, `GetAchievementName`, …) return `""` instead of the number 1, which used to be an invalid pointer.
+- **`StoreStats` / `RequestCurrentStats` / `SetAchievement` answer success** so a failed stats flush no longer shows up as a cloud failure.
+- **Missing build tools is no longer a failure.** If `clang` is not installed the step now reports `nothing changed, the game keeps its original library` and the install stays green — the game is untouched and still runs. The message names `xcode-select --install` only as an optional hint.
+- **Re-signing keeps entitlements.** `codesign` is now called with `--preserve`-style handling of the existing entitlements (sandbox, JIT) and without re-applying the hardened runtime flag, because library validation refuses an ad-hoc dylib from another team. The game executable is re-signed too, not just the `.app` wrapper.
+
+### ما الجديد في 1.5.2
+
+- **المكتبة البديلة صارت تحفظ الملفات على القرص.** `FileWrite` / `FileRead` / `FileExists` / `FileDelete` / `GetFileSize` / `GetQuota` كانوا يرجّعوا صفر، ولهذا كانت اللعبة تطلع بخطأ كلاود عند الخروج: بتحاول تكتب الحفظ، بتفشل، وبتشتكي. هلق بيقرأوا ويكتبوا ملفات حقيقية تحت `~/Library/Application Support/LicenseTools/<appid>/remote/`، فالحفظ بيضل والخطأ بيروح.
+- **`GetAppInstallDir` صار يرجّع مسار التثبيت الحقيقي** بدل نص فاضي، ودوال النصوص (`GetPersonaName`، `GetCurrentGameLanguage`، `GetAchievementName`، …) صارت ترجّع `""` بدل الرقم 1 اللي كان مؤشر غير صالح.
+- **`StoreStats` / `RequestCurrentStats` / `SetAchievement` صاروا يرجّعوا نجاح**، ففشل رفع الإحصائيات ما عاد يظهر كخطأ كلاود.
+- **انعدام أدوات البناء ما عاد فشل.** إذا `clang` مش منصّب، الخطوة بتقول `nothing changed, the game keeps its original library` والتثبيت بيضل أخضر — اللعبة ما انلمست وبتشتغل. ورسالة `xcode-select --install` صارت اختيارية بس.
+- **إعادة التوقيع بتحفظ الـ entitlements.** `codesign` صار يحافظ على الـ entitlements الموجودة (sandbox، JIT) وبدون ما يعيد تفعيل hardened runtime، لأن library validation بيرفض dylib موقّع ad-hoc من فريق تاني. والملف التنفيذي للعبة صار يتوقّع كمان، مش بس غلاف `.app`.
+
 ### What changed in 1.5.1
 
 - **Fixed a hard crash on launch and on `--selftest`.** The CommonCrypto binding declared twelve argument types for an eleven-parameter function, so on Apple silicon the key pointer landed in the wrong register and the process died with `SIGSEGV` (exit 139) before printing anything. The declaration now matches `CCCrypt` exactly, every call is bounds-checked, and the first result is verified against the pure-Python AES before the native path is trusted — a binding that answers wrong is dropped for the rest of the session.
