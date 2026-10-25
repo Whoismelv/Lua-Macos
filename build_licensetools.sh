@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 # Build "LicenseTools.app" and "LicenseTools.dmg" on macOS.
 # usage: bash build_licensetools.sh
+#        LT_STAGE=loader bash build_licensetools.sh   # only the loader payload
 set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME="LicenseTools"
 BUNDLE="LicenseTools"
 PY="${PYTHON:-python3}"
+STAGE="${LT_STAGE:-all}"
+
+fail() {
+  echo "build failed: $*" >&2
+  echo "::error::build failed: $*"
+  exit 1
+}
 
 if ! command -v "$PY" >/dev/null 2>&1; then
   echo "python3 not found — install with: brew install python@3.12" >&2
   exit 1
 fi
 
+if [ "$STAGE" != "loader" ]; then
 echo "== venv =="
 if [ ! -x .build-venv/bin/python ]; then
   "$PY" -m venv .build-venv
@@ -21,7 +30,9 @@ fi
 source .build-venv/bin/activate
 python -m pip install --quiet --upgrade pip
 python -m pip install --quiet pyinstaller "pywebview>=5.0" certifi pycryptodome zstandard
+fi
 
+if [ "$STAGE" != "loader" ]; then
 echo "== vendor: DepotDownloader =="
 ARCH="$(uname -m)"
 if [ "$ARCH" = "arm64" ]; then
@@ -35,6 +46,7 @@ curl -fsSL --retry 3 -o /tmp/dd-lic.zip \
 unzip -q -o /tmp/dd-lic.zip -d vendor/dd
 find vendor/dd -type f -name 'DepotDownloader*' -exec chmod +x {} \;
 test -x vendor/dd/DepotDownloader || { echo "vendor: DepotDownloader missing" >&2; exit 1; }
+fi
 
 echo "== vendor: macSteam loader =="
 mkdir -p vendor/macsteam/signatures/macos.arm64
@@ -45,14 +57,13 @@ if [ -s "$MS_DYLIB" ]; then
 elif [ -f vendor/macsteam-src/Makefile ]; then
   echo "payload: building from vendor/macsteam-src"
   if ! command -v clang >/dev/null 2>&1; then
-    echo "build failed: clang is missing on this runner" >&2
-    exit 1
+    fail "clang is missing on this runner"
   fi
   if ! make -C vendor/macsteam-src MIN_VER=14.0 -j"$(sysctl -n hw.ncpu)" \
        > /tmp/macsteam-build.log 2>&1; then
     tail -n 40 /tmp/macsteam-build.log >&2
-    echo "build failed: the vendored loader did not compile" >&2
-    exit 1
+    echo "::error::loader build failed: $(tail -n 4 /tmp/macsteam-build.log | tr '\n' ' ' | tr -s ' ' | cut -c1-400)"
+    fail "the vendored loader did not compile"
   fi
   cp vendor/macsteam-src/out/macsteam.dylib "$MS_DYLIB"
   echo "payload: built $(wc -c < "$MS_DYLIB" | tr -d ' ') bytes"
@@ -80,15 +91,13 @@ else
     rm -rf "$MS_MNT" "$MS_TMP"
   fi
   if [ ! -s "$MS_DYLIB" ]; then
-    echo "build failed: no loader payload, and none could be fetched" >&2
-    exit 1
+    fail "no loader payload, and none could be fetched"
   fi
 fi
 
 MS_SIGS="$(find vendor/macsteam/signatures -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$MS_SIGS" -lt 1 ]; then
-  echo "build failed: no signature json under vendor/macsteam/signatures" >&2
-  exit 1
+  fail "no signature json under vendor/macsteam/signatures"
 fi
 echo "signatures: $MS_SIGS file(s)"
 lipo -info "$MS_DYLIB" 2>/dev/null || true
@@ -101,8 +110,7 @@ if [ -n "$MS_VER" ]; then
 fi
 MS_BYTES="$(wc -c < "$MS_DYLIB" | tr -d ' ')"
 if [ "$MS_BYTES" -lt 4096 ]; then
-  echo "build failed: the loader payload is suspiciously small ($MS_BYTES bytes)" >&2
-  exit 1
+  fail "the loader payload is suspiciously small ($MS_BYTES bytes)"
 fi
 
 echo "== vendor: stand-in library (prebuilt, so no clang is needed on the user's mac) =="
@@ -118,12 +126,16 @@ if command -v clang >/dev/null 2>&1; then
     lipo -info vendor/stub/libsteam_api.dylib || true
     ls -lh vendor/stub/libsteam_api.dylib
   else
-    echo "build failed: the prebuilt stand-in did not compile" >&2
-    exit 1
+    fail "the prebuilt stand-in did not compile"
   fi
   rm -f vendor/stub/steam_stub.c
 else
   echo "vendor: clang missing on the runner (runtime build path stays active)"
+fi
+
+if [ "$STAGE" = "loader" ]; then
+  echo "== loader stage done: $(wc -c < "$MS_DYLIB" | tr -d ' ') byte payload, $MS_SIGS signature file(s) =="
+  exit 0
 fi
 
 echo "== offline selftest =="
@@ -167,32 +179,27 @@ pyinstaller \
 
 APP="dist-lic/$BUNDLE.app"
 if [ ! -d "$APP" ]; then
-  echo "build failed: $APP missing" >&2
-  exit 1
+  fail "$APP missing"
 fi
 
 if [ ! -x "$APP/Contents/Resources/vendor/dd/DepotDownloader" ]; then
-  echo "build failed: bundled DepotDownloader missing from the bundle" >&2
-  exit 1
+  fail "bundled DepotDownloader missing from the bundle"
 fi
 
 STUB_IN_APP="$APP/Contents/Resources/vendor/stub/libsteam_api.dylib"
 if [ ! -f "$STUB_IN_APP" ]; then
-  echo "build failed: the prebuilt stand-in is not inside the bundle" >&2
-  exit 1
+  fail "the prebuilt stand-in is not inside the bundle"
 fi
 echo "stand-in inside the bundle:"
 lipo -info "$STUB_IN_APP" || true
 
 MS_IN_APP="$APP/Contents/Resources/vendor/macsteam/macsteam.dylib"
 if [ ! -s "$MS_IN_APP" ]; then
-  echo "build failed: the loader payload is not inside the bundle" >&2
-  exit 1
+  fail "the loader payload is not inside the bundle"
 fi
 MS_SIG_IN_APP="$(find "$APP/Contents/Resources/vendor/macsteam" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$MS_SIG_IN_APP" -lt 1 ]; then
-  echo "build failed: no signature json inside the bundle" >&2
-  exit 1
+  fail "no signature json inside the bundle"
 fi
 echo "loader inside the bundle: $(lipo -archs "$MS_IN_APP" 2>/dev/null || echo '?') + $MS_SIG_IN_APP signature file(s)"
 ls -lh "$MS_IN_APP"

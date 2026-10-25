@@ -94,22 +94,26 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time) and `pycryptodome` for the AES fast path. steamcmd is fetched on first use into `~/.licensetools/tools/`; the loader is not fetched at all — it is compiled into the app.
 
-### What changed in 1.9.0
+### What changed in 1.9.1
 
 - **The loader ships inside the app.** `build_licensetools.sh` now compiles `macsteam.dylib` from the vendored upstream source at `vendor/macsteam-src/` on the macOS runner and puts it in `Contents/Resources/vendor/macsteam/`, next to three signature databases. Pressing Fetch injects that copy — the loader path makes zero network calls, so a fresh mac does not need GitHub to reach a working client. The dmg is what puts it there; an app that took the ~250 KB patch keeps its loader working — from the copy inside its own bundle when it has one, from the old fetch path when it does not — and switches to the offline payload on the next dmg.
 - **Build order is prebuilt → vendored source → upstream release**, and it fails loudly if all three come up empty. A prebuilt dylib already sitting in the tree still wins, so a hotfix can be dropped in by hand.
 - **A broken payload cannot ship.** The build refuses a dylib under 4 KB and refuses a bundle with no signature JSON in it, then asserts both are really inside `LicenseTools.app` after packaging.
 - **The app reports what it carries.** `loader status` and the Loader tab print the payload size, its SHA-256, the loader version from `src/version.h`, and the Steam build ids it can hook (`1788652215`, `1791918634`, `1792618285`).
 - **The payload is found wherever the packager put it.** Frozen bundles differ on macOS (`Contents/Resources`, `Contents/Frameworks`, `MacOS`), so the lookup tries every plausible root and then sweeps the `.app` before giving up.
+- **The loader report no longer loses its own facts.** Injection returns only the keys it actually has; merging every key wrote `None` over the payload size and signature count, so a mac with no `Steam.app` yet reported `signatures: null` and the build's own selftest failed. Only real values are merged now, in both the bundled and the network path, and a failed injection keeps the payload facts and says `injected: false`.
+- **CI names the stage that broke.** `LT_STAGE=loader bash build_licensetools.sh` builds the payload and stops, so the workflow shows the loader build and the app build as separate steps; the selftest now pins `sys.platform` while it exercises the darwin branch, so the bundled path is tested the same way on every host.
 - **Source stays in the repo.** `vendor/macsteam-src/` is the AGPL-3.0 upstream, trimmed to what builds the dylib, and `vendor/macsteam/signatures/macos.arm64/` holds the signature data — the part that actually goes stale when Valve ships a new client.
 
-### ما الجديد في 1.9.0
+### ما الجديد في 1.9.1
 
 - **الـ loader بقى جوّه البرنامج.** `build_licensetools.sh` بيبني `macsteam.dylib` من السورس المرفق في `vendor/macsteam-src/` على رَنَّر الماك، وبيحطّه في `Contents/Resources/vendor/macsteam/` جنب ثلاث قواعد توقيعات. زر Fetch بيحقن النسخة دي — مسار الـ loader ما بيعملش ولا نداء شبكة، فجهاز ماك جديد مش محتاج GitHub عشان يشتغل. الـ dmg هو اللي بيوصّلها جوّه؛ التطبيق اللي خد الـ patch (حوالي 250 كيلو) بيكمّل شغّال — من النسخة اللي جوّه باندله لو موجودة، ومن مسار التنزيل القديم لو مش موجودة — وبيتحوّل للأوفلاين مع أول dmg جديد.
 - **ترتيب البناء: جاهز → السورس المرفق → إصدار upstream**، وبيفشل بصوت عالي لو الثلاثة فاضيين. أي dylib جاهز موجود في الشجرة بيكسب، فتقدر تحط hotfix بإيدك.
 - **الـ payload البايظ مستحيل يتشحن.** البناء بيرفض dylib أقل من 4 كيلو، وبيرفض باندل مافيهوش ولا ملف توقيع، وبعد التغليف بيتأكد إن الاتنين فعلاً جوّه `LicenseTools.app`.
 - **البرنامج بيقول شايل إيه.** `loader status` وتبويب Loader بيطبعوا حجم الـ payload، والـ SHA-256، وإصدار الـ loader من `src/version.h`، وأرقام بيلدات ستيم اللي يقدر يهوكها (`1788652215`، `1791918634`، `1792618285`).
 - **الـ payload بيتلاقى في أي مكان التغليف حطّه فيه.** باندلات الماك بتختلف (`Contents/Resources`، `Contents/Frameworks`، `MacOS`)، فالبحث بيجرّب كل جذر محتمل وبعدين بيمسح الـ `.app` قبل ما يستسلم.
+- **تقرير الـ loader ما بقى يضيّع بياناته.** الحقن بيرجّع المفاتيح اللي عنده بس؛ الدمج كان بيكتب `None` فوق حجم الـ payload وعدد التوقيعات، فجهاز ماك لسه مافيهوش `Steam.app` كان بيطلّع `signatures: null` واختبار البناء نفسه بيفشل. دلوقتي بيتدمج القيم الحقيقية بس، في مسار الباندل ومسار الشبكة، والحقن الفاشل بيسيب بيانات الـ payload ويقول `injected: false`.
+- **الـ CI بيسمّي المرحلة اللي وقعت.** `LT_STAGE=loader bash build_licensetools.sh` بيبني الـ payload ويقف، فالوركفلو بيوريّك بناء الـ loader وبناء التطبيق كخطوتين منفصلتين؛ والـ selftest بقى يثبّت `sys.platform` وهو بيجرّب فرع الدارون، فمسار الباندل بيتجرّب بنفس الطريقة على أي جهاز.
 - **السورس قاعد في الريبو.** `vendor/macsteam-src/` هو سورس upstream بـ AGPL-3.0، مقصوص على اللي بيبني الـ dylib، و`vendor/macsteam/signatures/macos.arm64/` فيه بيانات التوقيعات — الجزء اللي بيقدم فعلاً لما Valve تنزّل كلاينت جديد.
 
 ### What changed in 1.8.0

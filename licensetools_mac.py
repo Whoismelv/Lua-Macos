@@ -46,7 +46,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 APP_REPO = "Whoismelv/Lua-Macos"
 APP_ASSET_NAMES = ("LicenseTools.dmg", "LuaToolsMac.dmg")
 STEAMCMD_URLS = {
@@ -2049,7 +2049,12 @@ def selftest():
         if src_sig is not None:
             shutil.copy2(src_sig, fake / "signatures" / "macos.arm64" / src_sig.name)
         real_bundled, real_http = bundled_macsteam, http_get
+        real_inject = macsteam_inject
+        real_platform = sys.platform
+        sys.platform = "darwin"
         globals()["bundled_macsteam"] = lambda: fake
+        globals()["macsteam_inject"] = lambda d, r: {
+            "ok": True, "dylib": str(d), "signatures": 1, "config_dir": "sim"}
 
         def _no_net(*a, **k):
             raise AssertionError("the bundled payload reached for the network")
@@ -2067,12 +2072,21 @@ def selftest():
               json.dumps(off))
         check("the bundled path names its signatures",
               off.get("signatures") == 1, json.dumps(off))
+        check("the bundled path keeps its digest after injecting",
+              off.get("sha256") == pay["sha256"], json.dumps(off))
+        globals()["macsteam_inject"] = lambda d, r: {"ok": False, "error": "sim failure"}
+        bad = loader_install_macsteam()
+        check("a failed injection keeps the payload facts",
+              bad.get("ok") is False and bad.get("signatures") == 1
+              and bad.get("injected") is False, json.dumps(bad))
+        globals()["macsteam_inject"] = real_inject
         globals()["bundled_macsteam"] = lambda: None
         ref = loader_install_macsteam(allow_network=False)
         check("no payload and no network is refused cleanly",
               ref.get("ok") is False and "network" in str(ref.get("error")),
               json.dumps(ref))
         globals()["bundled_macsteam"], globals()["http_get"] = real_bundled, real_http
+        sys.platform = real_platform
 
     check("gui has the cloud buttons",
           'id="b-m-cloudoff"' in GUI_HTML and 'id="b-m-cloudon"' in GUI_HTML)
@@ -5135,8 +5149,9 @@ def loader_install_macsteam(allow_network=True):
             res["next"] = "bundled payload present (injection happens on macOS)"
             return res
         inj = macsteam_inject(dylib, [bundled])
-        res.update({k: inj.get(k) for k in
-                    ("ok", "error", "hint", "dylib", "signatures", "config_dir")})
+        for key in ("ok", "error", "hint", "dylib", "signatures", "config_dir"):
+            if inj.get(key) is not None:
+                res[key] = inj[key]
         res["injected"] = bool(inj.get("ok"))
         res["next"] = ("loader ready - press Fetch in the app"
                        if inj.get("ok") else "injection failed - see error")
@@ -5203,8 +5218,9 @@ def loader_install_macsteam(allow_network=True):
                   "signatures": len(fresh)}
         if sys.platform == "darwin":
             inj = macsteam_inject(dylib, sig_roots)
-            result.update({k: inj.get(k) for k in
-                           ("ok", "error", "hint", "dylib", "signatures", "config_dir")})
+            for key in ("ok", "error", "hint", "dylib", "signatures", "config_dir"):
+                if inj.get(key) is not None:
+                    result[key] = inj[key]
             result["injected"] = bool(inj.get("ok"))
             if not inj.get("ok"):
                 result["next"] = "injection failed - see error above"

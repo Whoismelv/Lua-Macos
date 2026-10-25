@@ -27,6 +27,8 @@ jobs:
         run: |
           rm -rf build dmg-stage* dist/*.app build-lic .build-venv "$HOME/.cache/pip"
           df -h /
+      - name: build the loader payload
+        run: LT_STAGE=loader bash build_licensetools.sh
       - name: build licensetools dmg
         run: bash build_licensetools.sh
       - name: publish
