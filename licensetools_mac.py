@@ -44,7 +44,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 STEAMCMD_URLS = {
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
     "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
@@ -1387,6 +1387,8 @@ def selftest():
     native = _cc_crypt(_CC_OP_DECRYPT, _CC_OPT_ECB, key, b"\x00" * 16, block)
     check("native aes path agrees with the pure one",
           native is None or native == plain, repr(native))
+    check("bundled stand-in lookup does not raise", _bundled_stub() is None
+          or _bundled_stub().is_file())
 
     print(json.dumps({"ok": not failed, "checks": checks,
                       "failed": failed}, indent=2))
@@ -2792,7 +2794,7 @@ _STUB_CORE = r'''#include <stdint.h>
 
 #define VIS(v) __attribute__((visibility("default"))) v __attribute__((used))
 
-static char g_vtbl[256 * 8];
+static char g_vtbl[256 * 8] __attribute__((aligned(16)));
 static uint64_t g_appid;
 
 typedef uint64_t (*slot_fn)(void);
@@ -3272,6 +3274,20 @@ def _entitlements(path):
     return blob
 
 
+def _bundled_stub():
+    """A stand-in compiled at build time, for Macs without clang."""
+    roots = []
+    base = getattr(sys, "_MEIPASS", "")
+    if base:
+        roots.append(Path(base) / "vendor" / "stub")
+    roots.append(Path(__file__).resolve().parent / "vendor" / "stub")
+    for r in roots:
+        p = r / STUB_NAME
+        if p.is_file() and p.stat().st_size > 1024:
+            return p
+    return None
+
+
 def _resign(path, work):
     """Re-sign ad hoc, keeping the entitlements and dropping the runtime flag.
 
@@ -3335,6 +3351,18 @@ def drm_skip(target, appid, progress=None):
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
     built = _build_stub(src, work / STUB_NAME)
+    if not built.get("ok"):
+        bundled = _bundled_stub()
+        if bundled is not None:
+            try:
+                shutil.copy2(bundled, work / STUB_NAME)
+                built = {"ok": True, "dylib": str(work / STUB_NAME),
+                         "arch": "bundled", "prebuilt": True,
+                         "bytes": (work / STUB_NAME).stat().st_size}
+                if progress:
+                    progress("using the stand-in that ships inside the app")
+            except OSError:
+                built = {"ok": False, "error": "bundled stand-in could not be copied"}
     if not built.get("ok"):
         missing = _run_quiet(["clang", "--version"], timeout=30)
         if missing is None or missing.returncode != 0:
@@ -5326,6 +5354,8 @@ def build_argparser():
         prog="licensetools",
         description="Steam license kit for macOS: probe appinfo, grant stplug-in lua, pin manifests")
     ap.add_argument("--selftest", action="store_true", help="run offline fixture checks and exit")
+    ap.add_argument("--emit-stub", metavar="PATH",
+                    help="write the stand-in library source to PATH and exit")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("detect").set_defaults(fn=cmd_detect)
     sub.add_parser("list").set_defaults(fn=cmd_list)
@@ -5422,6 +5452,10 @@ def main():
     args = ap.parse_args()
     if args.selftest:
         sys.exit(selftest())
+    if args.emit_stub:
+        Path(args.emit_stub).write_text(_stub_source([], 0), encoding="utf-8")
+        print(args.emit_stub)
+        return
     fn = getattr(args, "fn", None)
     if fn is None:
         if getattr(sys, "frozen", False):

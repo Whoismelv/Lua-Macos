@@ -83,6 +83,27 @@ else
 fi
 set -e
 
+echo "== vendor: stand-in library (prebuilt, so no clang is needed on the user's mac) =="
+rm -rf vendor/stub && mkdir -p vendor/stub
+touch vendor/stub/.keep
+if command -v clang >/dev/null 2>&1; then
+  python licensetools_mac.py --emit-stub vendor/stub/steam_stub.c >/dev/null
+  if clang -dynamiclib -O2 -fvisibility=hidden \
+      -install_name "@rpath/libsteam_api.dylib" \
+      -arch arm64 -arch x86_64 \
+      -o vendor/stub/libsteam_api.dylib vendor/stub/steam_stub.c; then
+    codesign -f -s - vendor/stub/libsteam_api.dylib || true
+    lipo -info vendor/stub/libsteam_api.dylib || true
+    ls -lh vendor/stub/libsteam_api.dylib
+  else
+    echo "build failed: the prebuilt stand-in did not compile" >&2
+    exit 1
+  fi
+  rm -f vendor/stub/steam_stub.c
+else
+  echo "vendor: clang missing on the runner (runtime build path stays active)"
+fi
+
 echo "== offline selftest =="
 python licensetools_mac.py --selftest
 
@@ -111,6 +132,7 @@ pyinstaller \
   --icon icon.icns \
   --add-data "vendor/dd:vendor/dd" \
   --add-data "vendor/macsteam:vendor/macsteam" \
+  --add-data "vendor/stub:vendor/stub" \
   "${KEYDB_ARG[@]}" \
   --collect-data certifi \
   --hidden-import webview.platforms.cocoa \
@@ -131,6 +153,14 @@ if [ ! -x "$APP/Contents/Resources/vendor/dd/DepotDownloader" ]; then
   echo "build failed: bundled DepotDownloader missing from the bundle" >&2
   exit 1
 fi
+
+STUB_IN_APP="$APP/Contents/Resources/vendor/stub/libsteam_api.dylib"
+if [ ! -f "$STUB_IN_APP" ]; then
+  echo "build failed: the prebuilt stand-in is not inside the bundle" >&2
+  exit 1
+fi
+echo "stand-in inside the bundle:"
+lipo -info "$STUB_IN_APP" || true
 
 echo "== selftest (frozen) =="
 "$APP/Contents/MacOS/$BUNDLE" --selftest

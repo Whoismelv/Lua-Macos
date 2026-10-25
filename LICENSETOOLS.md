@@ -94,6 +94,20 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time) and `pycryptodome` for the AES fast path. steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
 
+### What changed in 1.5.3
+
+- **The stand-in library now ships inside the app.** `build_licensetools.sh` compiles `libsteam_api.dylib` at build time as a fat `arm64 + x86_64` binary, ad-hoc signs it, and bundles it under `vendor/stub`. On a Mac without `clang` the app copies that prebuilt library instead of reporting a missing tool, so the patch still lands and no Xcode install is needed.
+- **The bundled copy is only a base.** It exports the built-in Steam symbol set (user, apps, friends, utils, remote storage, stats, matchmaking, networking, UGC, input, screenshots). When `nm` and `clang` are both present the app still generates a per-game library that exports *exactly* the symbols that game imports, which is the stronger form.
+- **Fallback order:** generated library → bundled library → `needs_tools` (with the game left byte-for-byte untouched).
+- **`--emit-stub PATH`** dumps the same C the runtime would compile, and the build now fails loudly if the prebuilt library does not compile or does not land in the bundle — the runtime fallback can never hide a broken build.
+
+### ما الجديد في 1.5.3
+
+- **المكتبة البديلة صارت تجي جوّ البرنامج.** `build_licensetools.sh` بيبني `libsteam_api.dylib` وقت البناء كـ fat `arm64 + x86_64`، بيوقّعه ad-hoc، وبيحطّه تحت `vendor/stub`. على ماك بدون `clang` البرنامج بينسخ المكتبة الجاهزة بدل ما يبلّغ عن أداة ناقصة، فالتعديل بينزل وما في داعي تنزّل Xcode.
+- **النسخة الجاهزة أساس بس.** بتصدّر مجموعة رموز ستيم المدمجة (user, apps, friends, utils, remote storage, stats, matchmaking, networking, UGC, input, screenshots). ولمن يكون `nm` و`clang` موجودين، البرنامج بيضل يبني مكتبة مخصصة لكل لعبة بتصدّر **بالضبط** الرموز اللي اللعبة بتستوردها، وهي الصيغة الأقوى.
+- **ترتيب الرجوع:** مكتبة مولّدة → مكتبة مرفقة → `needs_tools` (واللعبة بتضل بدون أي تغيير بايت واحد).
+- **`--emit-stub PATH`** بيطلّع نفس الـ C اللي البرنامج بيبنيه وقت التشغيل، والبناء صار يفشل بوضوح إذا المكتبة الجاهزة ما انبنيت أو ما وصلت للباندل — يعني الرجوع وقت التشغيل ما بيقدر يخبّي بناء مكسور.
+
 ### What changed in 1.5.2
 
 - **The stand-in library now keeps saves on disk.** `FileWrite` / `FileRead` / `FileExists` / `FileDelete` / `GetFileSize` / `GetQuota` used to return a bare zero, which is why games threw a cloud error on exit: they tried to write a save, got "failed", and reported it. They now read and write real files under `~/Library/Application Support/LicenseTools/<appid>/remote/`, so saves persist and the error stops.
