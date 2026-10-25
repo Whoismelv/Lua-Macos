@@ -94,6 +94,16 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time) and `pycryptodome` for the AES fast path. steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
 
+### What changed in 1.6.1
+
+- **The frozen build now runs the offline tests cleanly.** The "refuses to run from source" check forced the bundle lookup to return nothing instead of inheriting whatever the running process happened to be, so `--selftest` inside `LicenseTools.app` no longer reaches the network and no longer fails during the packaging step.
+- **Package step unchanged otherwise**, so a mac user still gets the same dmg with the same behaviour.
+
+### ما الجديد في 1.6.1
+
+- **النسخة المجمّعة صارت تعدّي الاختبارات بلا شبكة.** فحص "يرفض العمل من المصدر" بقى بيجبر البحث عن الباندل يرجّع فراغ بدل ما يورّث مسار النسخة الشغّالة، فـ `--selftest` جوّه `LicenseTools.app` ما بقى يلمس الشبكة وما بقى يفشل وقت التجميع.
+- **خطوة التجميع ما اتغيرت**، فالمستخدم بيوصله نفس الـ dmg بنفس السلوك.
+
 ### What changed in 1.6.0
 
 - **The app updates itself.** Header chip and `Maintenance → Update this app` check `releases/latest` on GitHub, download the dmg, verify the byte count, mount it read-only, copy the new `.app` out, confirm it is the same bundle (`CFBundleIdentifier`), then hand the swap to a detached `/bin/sh` that waits for the running pid to die, `mv`s the old bundle to `.old`, `ditto`s the new one in, strips the quarantine flag, and `open`s it. If the copy fails it puts the old bundle back and opens that instead. No deleting, no dragging, no admin.

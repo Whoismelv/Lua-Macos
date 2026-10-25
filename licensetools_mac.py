@@ -46,7 +46,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 APP_REPO = "Whoismelv/Lua-Macos"
 APP_ASSET_NAMES = ("LicenseTools.dmg", "LuaToolsMac.dmg")
 STEAMCMD_URLS = {
@@ -1620,7 +1620,10 @@ def selftest():
           same.get("ok") is True and same.get("newer") is False, json.dumps(same))
     globals()["http_get"] = real_http
 
+    real_bundle = _app_bundle_path
+    globals()["_app_bundle_path"] = lambda: None
     from_source = app_update_apply()
+    globals()["_app_bundle_path"] = real_bundle
     check("self update refuses to run from source",
           from_source.get("ok") is False and "source" in str(from_source.get("error")),
           json.dumps(from_source))
