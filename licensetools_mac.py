@@ -2025,9 +2025,13 @@ def selftest():
               " exe=" + sys.executable +
               " file=" + str(Path(__file__).resolve()))
         frozen_pay = macsteam_payload()
-        check("the frozen app can read the payload it ships",
-              frozen_pay["present"] and frozen_pay["signatures"] >= 1,
-              json.dumps(frozen_pay))
+        frozen_ok = bool(frozen_pay["present"]) and frozen_pay["signatures"] >= 1
+        check("the frozen app can read the payload it ships"
+              + ("" if frozen_ok else
+                 " [root=%s dylib=%s bytes=%s json=%s]"
+                 % (frozen_pay["root"], frozen_pay["dylib"],
+                    frozen_pay["bytes"], frozen_pay["signatures"])),
+              frozen_ok, json.dumps(frozen_pay))
 
     with tempfile.TemporaryDirectory() as td:
         bundle = Path(td) / "Fake.app" / "Contents"
@@ -4701,6 +4705,42 @@ def macsteam_payload():
             "version": version, "signatures": len(sigs), "builds": builds}
 
 
+def cmd_payload(a):
+    """What this process can see of its own loader payload - offline, no Steam."""
+    info = macsteam_payload()
+    frozen = bool(getattr(sys, "frozen", False))
+    layout = {
+        "frozen": frozen,
+        "platform": sys.platform,
+        "meipass": getattr(sys, "_MEIPASS", ""),
+        "executable": sys.executable,
+        "file": str(Path(__file__).resolve()),
+        "cwd": os.getcwd(),
+    }
+    roots = []
+    for cand in [Path(layout["meipass"]) if layout["meipass"] else None,
+                 Path(layout["file"]).parent,
+                 Path(layout["executable"]).resolve().parent]:
+        if cand is None:
+            continue
+        for rel in ("vendor/macsteam", "../Resources/vendor/macsteam",
+                    "../vendor/macsteam"):
+            d = (cand / rel).resolve()
+            if d in [r[0] for r in roots]:
+                continue
+            dylib = d / "macsteam.dylib"
+            roots.append((d, {
+                "exists": d.is_dir(),
+                "dylib": dylib.is_file(),
+                "bytes": dylib.stat().st_size if dylib.is_file() else 0,
+                "json": len(list(d.rglob("*.json"))) if d.is_dir() else 0,
+            }))
+    print(json.dumps({"payload": info, "layout": layout,
+                      "roots": [{"path": str(p), **meta} for p, meta in roots]},
+                     indent=2, ensure_ascii=False))
+    return 0
+
+
 def loader_report():
     ctx = SteamCtx()
     root = ctx.root()
@@ -6603,6 +6643,7 @@ def build_argparser():
                     help="write the stand-in library source to PATH and exit")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("detect").set_defaults(fn=cmd_detect)
+    sub.add_parser("payload").set_defaults(fn=cmd_payload)
     sub.add_parser("list").set_defaults(fn=cmd_list)
     sub.add_parser("library").set_defaults(fn=cmd_library)
     sub.add_parser("restart").set_defaults(fn=cmd_restart)
