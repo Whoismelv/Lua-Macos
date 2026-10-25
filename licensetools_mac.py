@@ -46,7 +46,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.9.3"
 APP_REPO = "Whoismelv/Lua-Macos"
 APP_ASSET_NAMES = ("LicenseTools.dmg", "LuaToolsMac.dmg")
 STEAMCMD_URLS = {
@@ -2038,7 +2038,14 @@ def selftest():
         deep = bundle / "Resources" / "vendor" / "macsteam"
         deep.mkdir(parents=True)
         (deep / "macsteam.dylib").write_bytes(b"\xcf\xfa\xed\xfe" + b"\0" * 60000)
-        (bundle / "Frameworks").mkdir()
+        split = bundle / "Frameworks" / "vendor" / "macsteam"
+        split.mkdir(parents=True)
+        (split / "macsteam.dylib").write_bytes(b"\xcf\xfa\xed\xfe" + b"\0" * 60000)
+        if sig_dir is not None:
+            first_sig = next(iter(sorted(sig_dir.glob("*.json"))), None)
+            if first_sig is not None:
+                (deep / "signatures" / "macos.arm64").mkdir(parents=True)
+                shutil.copy2(first_sig, deep / "signatures" / "macos.arm64" / first_sig.name)
         (bundle / "MacOS").mkdir()
         had = hasattr(sys, "_MEIPASS")
         old = getattr(sys, "_MEIPASS", None)
@@ -2051,7 +2058,9 @@ def selftest():
         else:
             del sys._MEIPASS
         check("the loader is found in a frozen Contents/Resources layout",
-              found == deep, str(found))
+              found == deep.resolve(), str(found))
+        check("a dylib-only Frameworks copy does not hide the signatures",
+              split != found, str(found))
 
     with tempfile.TemporaryDirectory() as td:
         fake = Path(td) / "vendor" / "macsteam"
@@ -2063,10 +2072,12 @@ def selftest():
         if src_sig is not None:
             shutil.copy2(src_sig, fake / "signatures" / "macos.arm64" / src_sig.name)
         real_bundled, real_http = bundled_macsteam, http_get
+        real_sig_roots = bundled_sig_roots
         real_inject = macsteam_inject
         real_platform = sys.platform
         sys.platform = "darwin"
         globals()["bundled_macsteam"] = lambda: fake
+        globals()["bundled_sig_roots"] = lambda: [fake]
         globals()["macsteam_inject"] = lambda d, r: {
             "ok": True, "dylib": str(d), "signatures": 1, "config_dir": "sim"}
 
@@ -2100,6 +2111,7 @@ def selftest():
               ref.get("ok") is False and "network" in str(ref.get("error")),
               json.dumps(ref))
         globals()["bundled_macsteam"], globals()["http_get"] = real_bundled, real_http
+        globals()["bundled_sig_roots"] = real_sig_roots
         sys.platform = real_platform
 
     check("gui has the cloud buttons",
@@ -4646,11 +4658,10 @@ def _loader_dylib_ok(d):
 _BUNDLED_CACHE = []
 
 
-def bundled_macsteam():
-    """Locate the loader the app carries. Frozen bundles move vendor/ around,
-    so every plausible root is tried before giving up."""
-    if _BUNDLED_CACHE:
-        return _BUNDLED_CACHE[0]
+def _loader_roots():
+    """Every place the packager may have put vendor/macsteam. A macOS .app
+    splits the dylib (Contents/Frameworks) from the signature json
+    (Contents/Resources), so the caller has to look in more than one folder."""
     here = Path(__file__).resolve().parent
     exe = Path(sys.executable).resolve().parent
     cands = []
@@ -4659,23 +4670,65 @@ def bundled_macsteam():
         b = Path(base)
         cands += [b / "vendor" / "macsteam",
                   b.parent / "Resources" / "vendor" / "macsteam",
-                  b.parent / "MacOS" / "vendor" / "macsteam"]
+                  b.parent / "MacOS" / "vendor" / "macsteam",
+                  b.parent / "Frameworks" / "vendor" / "macsteam"]
     cands += [here / "vendor" / "macsteam",
               here.parent / "Resources" / "vendor" / "macsteam",
+              here.parent / "Frameworks" / "vendor" / "macsteam",
               exe / "vendor" / "macsteam",
               exe.parent / "Resources" / "vendor" / "macsteam"]
+    out = []
     for r in cands:
-        if _loader_dylib_ok(r / "macsteam.dylib"):
-            _BUNDLED_CACHE.append(r)
-            return r
-    for parent in [Path(sys.executable).resolve()] + list(Path(sys.executable).resolve().parents):
-        if parent.name == "Contents" and parent.is_dir():
-            hits = [p for p in parent.rglob("macsteam.dylib") if _loader_dylib_ok(p)]
-            if hits:
-                _BUNDLED_CACHE.append(hits[0].parent)
-                return hits[0].parent
-            break
-    return None
+        try:
+            r = r.resolve()
+        except OSError:
+            continue
+        if r not in out:
+            out.append(r)
+    if not any(_loader_dylib_ok(r / "macsteam.dylib") for r in out):
+        try:
+            chain = [Path(sys.executable).resolve()] + list(Path(sys.executable).resolve().parents)
+        except OSError:
+            chain = []
+        for parent in chain:
+            if parent.name == "Contents" and parent.is_dir():
+                for hit in parent.rglob("macsteam.dylib"):
+                    if _loader_dylib_ok(hit) and hit.parent not in out:
+                        out.append(hit.parent)
+                break
+    return out
+
+
+def _root_json(r):
+    try:
+        return [p for p in r.rglob("*.json") if p.is_file()]
+    except OSError:
+        return []
+
+
+def bundled_macsteam():
+    """The loader folder. A root that also holds the signatures wins, so the
+    returned path can be handed straight to the injector."""
+    if _BUNDLED_CACHE:
+        return _BUNDLED_CACHE[0]
+    roots = [r for r in _loader_roots() if _loader_dylib_ok(r / "macsteam.dylib")]
+    if not roots:
+        return None
+    best = next((r for r in roots if _root_json(r)), roots[0])
+    _BUNDLED_CACHE.append(best)
+    return best
+
+
+def bundled_sig_roots():
+    """Every folder inside the app that actually holds signature json."""
+    out = []
+    chosen = bundled_macsteam()
+    for r in ([chosen] if chosen is not None else []) + _loader_roots():
+        if r is None or r in out:
+            continue
+        if _root_json(r):
+            out.append(r)
+    return out
 
 
 def macsteam_payload():
@@ -4689,7 +4742,14 @@ def macsteam_payload():
         raw = dylib.read_bytes()
     except OSError:
         raw = b""
-    sigs = [p for p in root.rglob("*.json") if p.is_file()]
+    sigs = []
+    seen = set()
+    for sig_root in bundled_sig_roots():
+        for p in _root_json(sig_root):
+            if p.name in seen:
+                continue
+            seen.add(p.name)
+            sigs.append(p)
     builds = sorted({p.stem for p in sigs if p.stem.isdigit()}, key=int)
     version = ""
     for side in (root / "macsteam.dylib.version", root / "version.txt"):
@@ -5198,7 +5258,7 @@ def loader_install_macsteam(allow_network=True):
         if sys.platform != "darwin":
             res["next"] = "bundled payload present (injection happens on macOS)"
             return res
-        inj = macsteam_inject(dylib, [bundled])
+        inj = macsteam_inject(dylib, bundled_sig_roots() or [bundled])
         for key in ("ok", "error", "hint", "dylib", "signatures", "config_dir"):
             if inj.get(key) is not None:
                 res[key] = inj[key]

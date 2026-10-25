@@ -94,8 +94,9 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time) and `pycryptodome` for the AES fast path. steamcmd is fetched on first use into `~/.licensetools/tools/`; the loader is not fetched at all — it is compiled into the app.
 
-### What changed in 1.9.2
+### What changed in 1.9.3
 
+- **The payload is read from two folders when the packager splits it.** PyInstaller puts the dylib in `Contents/Frameworks/vendor/macsteam` and the signature json in `Contents/Resources/vendor/macsteam`, so the first root that had a dylib won and reported `signatures: 0`. The lookup now prefers a root that holds both, and signature scanning walks every candidate folder inside the app, so the count and the injector see the same json.
 - **A frozen build proves the payload is really inside it.** The selftest gains two checks that only run when `sys.frozen` is set: the lookup must find a loader inside the bundle, and the payload reader must come back with a dylib and at least one signature file. A dmg that lost its payload now fails its own build instead of shipping.
 - **The live fetch smoke is advisory, not a gate.** Talking to Steam from a CI runner is the flakiest thing in the pipeline — anonymous CDN throttling, a moved asset, a runner with no route. The step retries three times and then reports a `::warning::` with the reason, so a bad network day cannot mark a good build red. The real gate is the frozen selftest plus the bundle assertions.
 - **The loader ships inside the app.** `build_licensetools.sh` now compiles `macsteam.dylib` from the vendored upstream source at `vendor/macsteam-src/` on the macOS runner and puts it in `Contents/Resources/vendor/macsteam/`, next to three signature databases. Pressing Fetch injects that copy — the loader path makes zero network calls, so a fresh mac does not need GitHub to reach a working client. The dmg is what puts it there; an app that took the ~250 KB patch keeps its loader working — from the copy inside its own bundle when it has one, from the old fetch path when it does not — and switches to the offline payload on the next dmg.
@@ -107,8 +108,9 @@ Bundled: DepotDownloader (vendored at build time) and `pycryptodome` for the AES
 - **CI names the stage that broke.** `LT_STAGE=loader bash build_licensetools.sh` builds the payload and stops, so the workflow shows the loader build and the app build as separate steps; the selftest now pins `sys.platform` while it exercises the darwin branch, so the bundled path is tested the same way on every host.
 - **Source stays in the repo.** `vendor/macsteam-src/` is the AGPL-3.0 upstream, trimmed to what builds the dylib, and `vendor/macsteam/signatures/macos.arm64/` holds the signature data — the part that actually goes stale when Valve ships a new client.
 
-### ما الجديد في 1.9.2
+### ما الجديد في 1.9.3
 
+- **الـ payload بيتقري من مجلدين لما التغليف يفرّقهما.** PyInstaller بيحطّ الـ dylib في `Contents/Frameworks/vendor/macsteam` وملفات التوقيع في `Contents/Resources/vendor/macsteam`، فأول جذر فيه dylib كان بيكسب ويطلّع `signatures: 0`. دلوقتي البحث بيفضّل الجذر اللي فيه الاتنين، ومسح التوقيعات بيمشي على كل المجلدات المحتملة جوّه التطبيق، فالعدّ والحقن بيشوفوا نفس الملفات.
 - **البناء المجمّد بيثبت إن الـ payload فعلاً جوّاه.** الـ selftest بقى فيه فحصين بيشتغلوا بس لما `sys.frozen` يكون مفعّل: البحث لازم يلاقي loader جوّه الباندل، وقارئ الـ payload لازم يرجّع dylib ولا ملف توقيع واحد على الأقل. أي dmg ضيّع الـ payload بقى بيفشل في بناء نفسه بدل ما يتشحن.
 - **فحص التنزيل الحقيقي استشاري، مش بوابة.** الكلام مع ستيم من رَنَّر CI هو أكثر حاجة بتتقطع في الخط — CDN بيرفض المجهول، أصل اتغيّر، رَنَّر مقطوع. الخطوة بتعيد ثلاث مرات وبعدها بتطلّع `::warning::` بالسبب، فمشكلة شبكة مش هتحوّل بناء سليم لأحمر. البوابة الحقيقية هي الـ selftest المجمّد وتأكيدات الباندل.
 - **الـ loader بقى جوّه البرنامج.** `build_licensetools.sh` بيبني `macsteam.dylib` من السورس المرفق في `vendor/macsteam-src/` على رَنَّر الماك، وبيحطّه في `Contents/Resources/vendor/macsteam/` جنب ثلاث قواعد توقيعات. زر Fetch بيحقن النسخة دي — مسار الـ loader ما بيعملش ولا نداء شبكة، فجهاز ماك جديد مش محتاج GitHub عشان يشتغل. الـ dmg هو اللي بيوصّلها جوّه؛ التطبيق اللي خد الـ patch (حوالي 250 كيلو) بيكمّل شغّال — من النسخة اللي جوّه باندله لو موجودة، ومن مسار التنزيل القديم لو مش موجودة — وبيتحوّل للأوفلاين مع أول dmg جديد.
