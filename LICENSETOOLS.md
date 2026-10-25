@@ -94,6 +94,20 @@ python3 licensetools_mac.py --selftest
 
 Bundled: DepotDownloader (vendored at build time) and `pycryptodome` for the AES fast path. steamcmd and the loader are fetched on first use into `~/.licensetools/tools/`.
 
+### What changed in 1.8.0
+
+- **The cloud switch is now written in the right order.** 1.7.0 wrote the config and then restarted Steam, so Steam quit with its old copy of both stores still in memory and wrote it straight back over the change. The button now closes Steam first, writes, verifies the value on disk, then starts Steam. Nothing else in 1.7.0 changes.
+- **"Update this app" ships a patch, not a dmg.** The 50 MB dmg is mostly the embedded Python runtime, which almost never changes. What changes is the one program file, so the updater now fetches `licensetools_mac.py` from the release tag (about 250 KB instead of 56 MB), checks that it compiles, checks that the version inside it matches the release, stages it, starts it once to be sure it comes up, and reopens the app on it. Only the first hop from an older build still needs the dmg.
+- **A bad patch cannot brick the app.** Every boot that hands over to a staged file leaves a marker; if that run dies, the next start retires the file to `licensetools_core.py.bad` and runs the built-in copy. A staged file that fails its one-time smoke run is removed at install time and the dmg path is used instead.
+- **`cloud <appid>` on the command line** uses the same close-write-reopen sequence.
+
+### ما الجديد في 1.8.0
+
+- **كتابة مفتاح الكلاود بقت بالترتيب الصح.** نسخة 1.7.0 كانت بتكتب الملف وبعدين بتعمل restart لـ Steam — فـ Steam كان بيقفل وهو لسه حامل النسخة القديمة في الذاكرة، ويكتبها فوق التعديل. الزر دلوقتي بيقفل Steam الأول، بيكتب، بيتأكد من القيمة على الديسك، وبعدين بيفتح Steam تاني. مفيش حاجة تانية اتغيرت من 1.7.0.
+- **زر "Update this app" بينزّل patch مش dmg.** الـ dmg الـ 50 ميجا معظمه بايثون مدمج ومش بيتغير. اللي بيتغير هو ملف البرنامج، فالتحديث بقى بينزّل `licensetools_mac.py` من الـ tag (حوالي 250 كيلو بدل 56 ميجا)، بيتأكد إنه بيترجم، إن رقم النسخة جواه مطابق للـ release، بيحطه، بيشغّله مرة يتأكد إنه بيقوم، وبيفتح البرنامج عليه. أول قفزة من نسخة قديمة بس هي اللي لسه محتاجة الـ dmg.
+- **patch بايظ مش بيوقف البرنامج.** كل تشغيل بيسلّم لملف متساب بيسيب علامة؛ لو التشغيل ده مات، التشغيل اللي بعده بيعتزل الملف لـ `licensetools_core.py.bad` ويشتغل بالنسخة المدمجة. والملف اللي بيفشل في تجربة التشغيل بيتشال وقت التنزيل والـ dmg بيستخدم بدله.
+- **`cloud <appid>` في الكوماند لاين** بقى بيمشي على نفس تسلسل القفل-الكتابة-الفتح.
+
 ### What changed in 1.7.0
 
 - **"Fix Steam Cloud sync" in Maintenance.** The `Unable to Sync` dialog is Steam's own cloud pass, and it can never finish for an app the signed-in account does not own, so it sits in front of the game every launch. The new button writes the per-app switch Steam keeps for the Properties window — `Software/Valve/Steam/apps/<appid>/cloudenabled` — into every account's `sharedconfig.vdf` and `localconfig.vdf`, then restarts Steam so it re-reads them. Saves stay on disk and the game runs normally.

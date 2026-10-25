@@ -46,7 +46,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 APP_REPO = "Whoismelv/Lua-Macos"
 APP_ASSET_NAMES = ("LicenseTools.dmg", "LuaToolsMac.dmg")
 STEAMCMD_URLS = {
@@ -142,6 +142,204 @@ def _app_bundle_path():
         if p.suffix == ".app" and p.is_dir():
             return p
     return None
+
+
+# ---------- patch channel ----------
+# The dmg is 50 MB of python runtime that almost never changes. What does change
+# is this one file, so the updater can ship the file on its own: the frozen app
+# becomes a launcher and runs the newest copy of this module from disk. A full
+# dmg swap stays as the fallback for the first hop and for anything structural.
+
+CORE_DIR = CACHE_DIR / "core"
+CORE_FILE = CORE_DIR / "licensetools_core.py"
+CORE_BAD = CORE_DIR / "licensetools_core.py.bad"
+CORE_MARK = CORE_DIR / ".booting"
+CORE_ENV = "LICENSETOOLS_CORE"
+CORE_MIN_BYTES = 40 * 1024
+CORE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def core_version(path=None):
+    """APP_VERSION as written inside a core file, without running it."""
+    try:
+        head = Path(path or CORE_FILE).read_text(encoding="utf-8", errors="replace")[:20000]
+    except OSError:
+        return ""
+    m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', head, re.M)
+    return m.group(1) if m else ""
+
+
+def core_disable():
+    """Retire a core file that did not come up, keeping it for inspection."""
+    try:
+        if CORE_FILE.is_file():
+            os.replace(CORE_FILE, CORE_BAD)
+    except OSError:
+        pass
+    try:
+        CORE_MARK.unlink()
+    except OSError:
+        pass
+
+
+def core_ready():
+    """True when a newer core file is staged and the last one did not fail."""
+    if os.environ.get(CORE_ENV):
+        return False
+    if not CORE_FILE.is_file():
+        return False
+    if CORE_MARK.exists():
+        core_disable()
+        return False
+    return _vtuple(core_version()) > _vtuple(APP_VERSION)
+
+
+def core_launch():
+    """Hand this process over to the staged core file. True when it took over."""
+    if not core_ready():
+        return False
+    try:
+        src = CORE_FILE.read_text(encoding="utf-8")
+        code = compile(src, str(CORE_FILE), "exec")
+    except (OSError, SyntaxError, ValueError):
+        core_disable()
+        return False
+    try:
+        CORE_DIR.mkdir(parents=True, exist_ok=True)
+        CORE_MARK.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        return False
+    import threading
+
+    def _clear():
+        try:
+            CORE_MARK.unlink()
+        except OSError:
+            pass
+
+    threading.Timer(2.5, _clear).daemon = True
+    timer = threading.Timer(2.5, _clear)
+    timer.daemon = True
+    timer.start()
+    os.environ[CORE_ENV] = "1"
+    sys.argv[0] = str(CORE_FILE)
+    scope = {"__name__": "__main__", "__file__": str(CORE_FILE),
+             "__package__": None, "__doc__": None, "__builtins__": __builtins__}
+    try:
+        exec(code, scope)
+    except SystemExit:
+        raise
+    except BaseException:
+        core_disable()
+        return False
+    return True
+
+
+def core_source_url(tag):
+    return (f"https://raw.githubusercontent.com/{APP_REPO}/"
+            f"refs/tags/v{tag}/licensetools_mac.py")
+
+
+def core_install(source, expect_version=""):
+    """Validate a candidate core file and stage it in place of the old one."""
+    raw = source if isinstance(source, bytes) else str(source).encode("utf-8")
+    if not (CORE_MIN_BYTES <= len(raw) <= CORE_MAX_BYTES):
+        return {"ok": False, "error": f"patch is {len(raw)} byte(s) - not this app"}
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return {"ok": False, "error": f"patch is not utf-8: {exc}"}
+    if "licensetools" not in text[:4000].lower():
+        return {"ok": False, "error": "patch does not look like this app"}
+    try:
+        compile(text, "licensetools_core.py", "exec")
+    except SyntaxError as exc:
+        return {"ok": False, "error": f"patch does not compile: {exc}"}
+    version = core_version_text(text)
+    if not version:
+        return {"ok": False, "error": "patch carries no version"}
+    if expect_version and version != expect_version:
+        return {"ok": False,
+                "error": f"patch says {version}, release says {expect_version}"}
+    try:
+        CORE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CORE_FILE.with_suffix(".tmp")
+        tmp.write_bytes(raw)
+        os.replace(tmp, CORE_FILE)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "version": version, "bytes": len(raw), "path": str(CORE_FILE)}
+
+
+def core_version_text(text):
+    m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', text or "", re.M)
+    return m.group(1) if m else ""
+
+
+def core_smoke(version, timeout=90):
+    """Run the staged core once, the way the bundle will, and read its version."""
+    env = {k: v for k, v in os.environ.items() if k != CORE_ENV}
+    try:
+        res = subprocess.run([sys.executable, "--version"], capture_output=True,
+                             timeout=timeout, env=env)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    out = (getattr(res, "stdout", b"") or b"").decode("utf-8", "replace").strip()
+    err = (getattr(res, "stderr", b"") or b"").decode("utf-8", "replace").strip()
+    if version and version in out:
+        return {"ok": True, "output": out}
+    return {"ok": False, "output": out, "stderr": err[-400:],
+            "error": f"the patched build did not report {version}"}
+
+
+def app_update_core(progress=None, info=None):
+    """Ship the one file that changed instead of the whole 50 MB dmg."""
+    say = progress or (lambda m: None)
+    info = info or app_update_check()
+    if not info.get("ok"):
+        return info
+    if not info.get("newer"):
+        return {"ok": True, "up_to_date": True, "current": info["current"],
+                "latest": info["latest"], "page": info.get("page")}
+    tag = info["latest"]
+    say(f"fetching the {tag} patch")
+    try:
+        raw = http_get(core_source_url(tag), timeout=90)
+    except Exception as exc:
+        return {"ok": False, "channel": "core", "error": str(exc),
+                "current": info["current"], "latest": tag}
+    res = core_install(raw, expect_version=tag)
+    res["channel"] = "core"
+    res["latest"] = tag
+    res["current"] = info["current"]
+    if not res.get("ok"):
+        return res
+    say(f"patch {tag} staged ({res['bytes'] // 1024} KB)")
+    if getattr(sys, "frozen", False):
+        say("starting the patched build once to be sure it comes up")
+        smoke = core_smoke(res["version"])
+        if not smoke.get("ok"):
+            core_disable()
+            return {"ok": False, "channel": "core", "current": info["current"],
+                    "latest": tag, "smoke": smoke,
+                    "error": (smoke.get("error") or "the patch did not start")
+                             + " - use the full update"}
+    res["patched"] = True
+    res["needs_restart"] = _app_bundle_path() is not None
+    return res
+
+
+def _relaunch_bundle(delay=1.2):
+    dest = _app_bundle_path()
+    if dest is None:
+        return {"ok": False, "error": "not running from a bundle"}
+    try:
+        subprocess.Popen(["open", "-n", str(dest)])
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    threading = __import__("threading")
+    threading.Thread(target=_exit_soon, args=(delay,), daemon=True).start()
+    return {"ok": True, "relaunching": True}
 
 
 def app_update_check(timeout=30):
@@ -265,6 +463,14 @@ def app_update_apply(progress=None):
     if not info.get("newer"):
         return {"ok": True, "up_to_date": True, "current": info["current"],
                 "latest": info["latest"], "page": info.get("page")}
+    patch = app_update_core(progress, info)
+    if patch.get("ok") and patch.get("patched"):
+        say("reopening the app on the new version")
+        patch["relaunching"] = bool(_relaunch_bundle().get("ok"))
+        patch["from"] = info["current"]
+        patch["to"] = patch.get("version") or info["latest"]
+        return patch
+    say("the patch channel did not work - falling back to the full dmg")
     asset = info.get("asset")
     if not asset:
         return {"ok": False, "error": "the latest release has no dmg",
@@ -1746,13 +1952,64 @@ def selftest():
         globals()["userdata_dirs"] = real_userdata
         _CLOUD_SAVE_DIRS[413150] = real_save_dirs
 
+    with tempfile.TemporaryDirectory() as td:
+        order = []
+        real_q, real_l, real_c, real_s = steam_quit, steam_launch, cloud_set, cloud_status
+        globals()["steam_quit"] = lambda *a, **k: (order.append("quit"),
+                                                  {"ok": True, "was_running": True,
+                                                   "method": "test"})[1]
+        globals()["steam_launch"] = lambda *a, **k: (order.append("launch"),
+                                                    {"ok": True, "launched": True})[1]
+        globals()["cloud_set"] = lambda aid, on, **k: (order.append("write"),
+                                                      {"ok": True, "files": [], "created": [],
+                                                       "errors": [], "changed": 1})[1]
+        globals()["cloud_status"] = lambda aid: {"ok": True, "appid": str(aid),
+                                                 "accounts": [{"account": "1",
+                                                               "enabled": False}]}
+        applied = cloud_apply(413150, False)
+        globals()["steam_quit"], globals()["steam_launch"] = real_q, real_l
+        globals()["cloud_set"], globals()["cloud_status"] = real_c, real_s
+        check("cloud closes steam before writing", order == ["quit", "write", "launch"],
+              json.dumps(order))
+        check("cloud reports the write as verified", applied.get("verified") is True,
+              json.dumps(applied))
+
+        core_tmp = Path(td) / "core"
+        real_core = (CORE_DIR, CORE_FILE, CORE_BAD, CORE_MARK)
+        globals()["CORE_DIR"] = core_tmp
+        globals()["CORE_FILE"] = core_tmp / "licensetools_core.py"
+        globals()["CORE_BAD"] = core_tmp / "licensetools_core.py.bad"
+        globals()["CORE_MARK"] = core_tmp / ".booting"
+        good = ('#!/usr/bin/env python3\n'
+                '"""licensetools patch fixture"""\n'
+                'APP_VERSION = "9.0.0"\n'
+                + "# padding to clear the size floor\n" * 2000)
+        bad_size = core_install(b"tiny")
+        check("patch rejects a tiny payload", bad_size.get("ok") is False)
+        bad_syntax = core_install(good.replace('APP_VERSION = "9.0.0"',
+                                               'APP_VERSION = "9.0.0"\nif True'))
+        check("patch rejects something that does not compile",
+              bad_syntax.get("ok") is False, json.dumps(bad_syntax))
+        wrong_ver = core_install(good, expect_version="8.0.0")
+        check("patch rejects a version mismatch", wrong_ver.get("ok") is False,
+              json.dumps(wrong_ver))
+        ok_patch = core_install(good, expect_version="9.0.0")
+        check("patch installs", ok_patch.get("ok") is True, json.dumps(ok_patch))
+        check("patch lands on disk", CORE_FILE.is_file())
+        check("patch is smaller than the dmg",
+              CORE_FILE.stat().st_size < 8 * 1024 * 1024, CORE_FILE.stat().st_size)
+        CORE_MARK.write_text("dead", encoding="utf-8")
+        check("a core that did not come up is retired", core_ready() is False)
+        check("the retired core is kept for inspection", CORE_BAD.is_file())
+        globals()["CORE_DIR"], globals()["CORE_FILE"] = real_core[0], real_core[1]
+        globals()["CORE_BAD"], globals()["CORE_MARK"] = real_core[2], real_core[3]
+
     check("gui has the cloud buttons",
           'id="b-m-cloudoff"' in GUI_HTML and 'id="b-m-cloudon"' in GUI_HTML)
     check("gui calls the cloud entry points",
           'call("cloud_off"' in GUI_HTML and 'call("cloud_on"' in GUI_HTML)
     check("gui disables the cloud buttons while busy",
           '"#b-m-cloudoff","#b-m-cloudon"' in GUI_HTML)
-
     print(json.dumps({"ok": not failed, "checks": checks,
                       "failed": failed}, indent=2))
     if failed:
@@ -3204,6 +3461,56 @@ def cloud_set(appid, enabled, make_dirs=True):
     return {"ok": not errors, "appid": aid, "enabled": bool(enabled),
             "files": files, "created": created, "errors": errors,
             "changed": sum(1 for f in files if f.get("changed"))}
+
+
+def cloud_apply(appid, enabled, progress=None):
+    """Close Steam, write the switch, then start Steam so it reads it.
+
+    Order matters more than anything else here. Steam holds these stores in
+    memory and rewrites both files when it quits, so writing while it is up
+    loses the change the moment it exits.
+    """
+    say = progress or (lambda m: None)
+    quit_info = steam_quit()
+    if not quit_info.get("ok"):
+        return {"ok": False, "appid": str(appid), "quit": quit_info,
+                "error": (quit_info.get("error")
+                          or "Steam is still running - quit it and try again")}
+    say("steam is closed - writing the switch")
+    res = cloud_set(appid, enabled, make_dirs=not enabled)
+    res["quit"] = quit_info
+    if not res.get("ok"):
+        say("the switch did not land - starting Steam back up")
+        res["launch"] = steam_launch()
+        return res
+    st = cloud_status(appid)
+    res["status"] = st
+    res["verified"] = all(a.get("enabled") is bool(enabled) for a in st.get("accounts") or [])
+    say("starting Steam so it reads the new value")
+    res["launch"] = steam_launch()
+    return res
+
+
+def log_cloud(res, log=None):
+    """Narrate a cloud_apply result into the app log."""
+    add = log or (lambda m: LOGS.add(m))
+    for item in res.get("files") or []:
+        add(("set " if item.get("changed") else "already set - ") + item["path"])
+    for item in res.get("created") or []:
+        add("created save folder " + item)
+    for item in res.get("errors") or []:
+        add("cloud switch failed on " + str(item.get("path")) + ": "
+            + str(item.get("error")))
+    if not res.get("ok") and res.get("error"):
+        add("cloud: " + str(res["error"]))
+    quit_info = res.get("quit") or {}
+    if quit_info.get("was_running"):
+        add("closed Steam (" + str(quit_info.get("method")) + ") so it could not "
+            "write the old value back")
+    launch = res.get("launch") or {}
+    if launch.get("launched"):
+        add("started Steam again")
+    return res
 
 def write_pending_appmanifest(appid, name, installdir, buildid, rows, total, download):
     sa = steam_apps_dir()
@@ -4980,9 +5287,9 @@ def cmd_app_update(a):
 def cmd_cloud(a):
     aid = _appid(a.appid)
     if a.on:
-        res = cloud_set(aid, True, make_dirs=False)
+        res = cloud_apply(aid, True, progress=lambda m: print(m, file=sys.stderr))
     elif a.off:
-        res = cloud_set(aid, False)
+        res = cloud_apply(aid, False, progress=lambda m: print(m, file=sys.stderr))
     else:
         res = cloud_status(aid)
     print(json.dumps(res, indent=2, ensure_ascii=False))
@@ -5374,17 +5681,12 @@ class Api:
         if not aid.isdigit():
             return {"ok": False, "error": "appid must be numeric"}
         LOGS.add(f"turning Steam Cloud off for {aid}")
-        res = cloud_set(int(aid), False)
-        for item in res.get("files") or []:
-            LOGS.add(("set " if item.get("changed") else "already set - ") + item["path"])
-        for item in res.get("created") or []:
-            LOGS.add("created save folder " + item)
-        for item in res.get("errors") or []:
-            LOGS.add("cloud switch failed on " + str(item.get("path")) + ": "
-                     + str(item.get("error")))
+        res = cloud_apply(int(aid), False, progress=lambda m: LOGS.add(m))
+        log_cloud(res)
         if res.get("ok"):
             LOGS.add("Steam Cloud is off for this app - the \"Unable to Sync\" dialog is gone")
-            LOGS.add("restart Steam so it re-reads the config")
+            if not res.get("verified"):
+                LOGS.add("warning: the value did not read back - check the log above")
         return res
 
     def cloud_on(self, appid):
@@ -5392,12 +5694,8 @@ class Api:
         if not aid.isdigit():
             return {"ok": False, "error": "appid must be numeric"}
         LOGS.add(f"turning Steam Cloud back on for {aid}")
-        res = cloud_set(int(aid), True, make_dirs=False)
-        for item in res.get("files") or []:
-            LOGS.add(("set " if item.get("changed") else "already set - ") + item["path"])
-        for item in res.get("errors") or []:
-            LOGS.add("cloud switch failed on " + str(item.get("path")) + ": "
-                     + str(item.get("error")))
+        res = cloud_apply(int(aid), True, progress=lambda m: LOGS.add(m))
+        log_cloud(res)
         return res
 
     def repair(self, appid):
@@ -5990,23 +6288,21 @@ $("#b-m-drmoff").onclick=async()=>{
 };
 $("#b-m-cloudoff").onclick=async()=>{
   const id=maintId();if(!id)return;
-  busy(true);say("turning Steam Cloud off for "+id+"...");
+  busy(true);say("closing steam, flipping the cloud switch for "+id+", starting steam again...");
   try{
     const r=await call("cloud_off",id);
     if(!r.ok)return say("cloud fix failed: "+((r.errors||[]).map(e=>e.path+": "+e.error).join(" | ")||r.error||""));
-    say("Steam Cloud is off for "+id+" - restarting steam so it re-reads the config");
-    try{await call("restart")}catch(_){}
-    say("done - launch the game again, the sync dialog is gone");
+    say("Steam Cloud is off for "+id+" - steam is back up and the sync dialog is gone");
   }catch(e){say("cloud fix failed: "+e)}
   busy(false);
 };
 $("#b-m-cloudon").onclick=async()=>{
   const id=maintId();if(!id)return;
-  busy(true);say("putting Steam Cloud back for "+id+"...");
+  busy(true);say("closing steam, putting the cloud switch back for "+id+"...");
   try{
     const r=await call("cloud_on",id);
     if(!r.ok)return say("cloud restore failed: "+((r.errors||[]).map(e=>e.path+": "+e.error).join(" | ")||r.error||""));
-    say("Steam Cloud back on for "+id+" - restart steam to apply it");
+    say("Steam Cloud back on for "+id+" - steam is back up");
   }catch(e){say("cloud restore failed: "+e)}
   busy(false);
 };
@@ -6232,6 +6528,8 @@ def main():
             pass
     ap = build_argparser()
     args = ap.parse_args()
+    if not args.selftest and not args.emit_stub and core_launch():
+        return
     if args.selftest:
         sys.exit(selftest())
     if args.emit_stub:
