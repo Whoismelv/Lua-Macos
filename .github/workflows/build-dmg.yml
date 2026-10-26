@@ -8,6 +8,7 @@ on:
 jobs:
   dmg:
     runs-on: macos-14
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,19 +21,24 @@ jobs:
           df -h /
       - name: build app + dmg
         run: bash build_macos.sh
-      - name: prune disk
-        run: |
-          rm -rf build dmg-stage* dist/*.app build-lic .build-venv "$HOME/.cache/pip"
-          df -h /
       - name: build the loader payload
         run: LT_STAGE=loader bash build_licensetools.sh
       - name: build licensetools dmg
         run: bash build_licensetools.sh
+      - name: prune disk
+        run: |
+          rm -rf build dmg-stage* dist/*.app build-lic .build-venv "$HOME/.cache/pip"
+          ls -lh dist/
+          df -h /
       - uses: actions/upload-artifact@v4
         with:
           name: LuaToolsMac-dmg
           path: dist/LuaToolsMac.dmg
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
           name: LicenseTools-dmg
           path: dist/LicenseTools.dmg
+          if-no-files-found: error
+          retention-days: 14

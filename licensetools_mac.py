@@ -1,15 +1,15 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # language: python3.9+, file: licensetools_mac.py, runtime: stdlib-only (pywebview>=5.0 for gui)
 # Steam license kit for macOS: probe public appinfo, write stplug-in lua, pin manifests.
 # Mac paths first, Windows fallback kept so the same file runs on the bench.
 import argparse
 import concurrent.futures
-import gzip
 import hashlib
 import io
 import json
 import lzma
 import os
+import platform
 import plistlib
 import re
 import shlex
@@ -46,7 +46,7 @@ LOADED_PATH = CACHE_DIR / "loaded.json"
 STEM = "stplug-in"
 TOML_NAME = "opensteamtool.toml"
 UA = "licensetools-mac"
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.9.4"
 APP_REPO = "Whoismelv/Lua-Macos"
 APP_ASSET_NAMES = ("LicenseTools.dmg", "LuaToolsMac.dmg")
 STEAMCMD_URLS = {
@@ -55,7 +55,10 @@ STEAMCMD_URLS = {
     "win32": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip",
 }
 APPID_FILE_RE = re.compile(r"^\s*(\d+)")
-ACF_RE = re.compile(r'"(\w+)"\s+"([^"]*)"')
+# Valve's keyvalues strings may contain \" and \\ - the old pattern stopped at the
+# first quote, so a game named  Foo "Bar"  truncated its own name and left the
+# rest of the line to be parsed as a stray key.
+ACF_RE = re.compile(r'"((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)"')
 
 # ---------- settings / state ----------
 
@@ -155,6 +158,7 @@ CORE_FILE = CORE_DIR / "licensetools_core.py"
 CORE_BAD = CORE_DIR / "licensetools_core.py.bad"
 CORE_MARK = CORE_DIR / ".booting"
 CORE_ENV = "LICENSETOOLS_CORE"
+CORE_RUN = "LICENSETOOLS_CORE_RUN"
 CORE_MIN_BYTES = 40 * 1024
 CORE_MAX_BYTES = 8 * 1024 * 1024
 
@@ -217,7 +221,6 @@ def core_launch():
         except OSError:
             pass
 
-    threading.Timer(2.5, _clear).daemon = True
     timer = threading.Timer(2.5, _clear)
     timer.daemon = True
     timer.start()
@@ -277,18 +280,28 @@ def core_version_text(text):
 
 
 def core_smoke(version, timeout=90):
-    """Run the staged core once, the way the bundle will, and read its version."""
+    """Run the staged core once, the way the bundle will, and read its version.
+
+    It used to invoke `python --version`, which only ever prints the interpreter
+    version, so this check could not pass and the patch channel was dead code.
+    The child is the same binary as this process - frozen or not - with
+    CORE_RUN set, which makes it exec the staged file before anything else.
+    """
+    if not CORE_FILE.is_file():
+        return {"ok": False, "error": "no staged core file to test"}
     env = {k: v for k, v in os.environ.items() if k != CORE_ENV}
+    env[CORE_RUN] = str(CORE_FILE)
     try:
         res = subprocess.run([sys.executable, "--version"], capture_output=True,
-                             timeout=timeout, env=env)
+                             timeout=timeout, env=env, cwd=str(CORE_DIR))
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     out = (getattr(res, "stdout", b"") or b"").decode("utf-8", "replace").strip()
     err = (getattr(res, "stderr", b"") or b"").decode("utf-8", "replace").strip()
-    if version and version in out:
-        return {"ok": True, "output": out}
-    return {"ok": False, "output": out, "stderr": err[-400:],
+    if version and version in out and getattr(res, "returncode", 1) == 0:
+        return {"ok": True, "output": out[:400]}
+    return {"ok": False, "output": out[:400], "stderr": err[-400:],
+            "returncode": getattr(res, "returncode", None),
             "error": f"the patched build did not report {version}"}
 
 
@@ -1180,6 +1193,13 @@ _DEPOT_DB = {"data": None, "stamp": 0.0, "path": None, "source": "",
              "error": "", "bytes": 0}
 
 def _ssl_contexts():
+    """Verified contexts only.
+
+    An unverified fallback used to sit at the end of this list. It turned a
+    certificate error into a silent downgrade, and the same helper downloads
+    depot manifests and depot keys, so a network attacker could hand us a
+    manifest of their own. A missing CA is reported, never bypassed.
+    """
     out = []
     try:
         import certifi
@@ -1190,13 +1210,25 @@ def _ssl_contexts():
         out.append(ssl.create_default_context())
     except Exception:
         pass
-    try:
-        out.append(ssl._create_unverified_context())
-    except Exception:
-        pass
     return out
 
-def _http_bytes(url, timeout=180, accept="application/vnd.github.raw, application/json, */*"):
+_HTTP_MAX = 96 * 1024 * 1024
+
+
+def _gunzip_capped(blob, limit):
+    """Decompress gzip with a hard ceiling instead of trusting the header."""
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = d.decompress(blob, limit + 1)
+    if len(out) > limit or d.unconsumed_tail:
+        raise ValueError("gzip payload over %d bytes" % limit)
+    out += d.flush()
+    if len(out) > limit:
+        raise ValueError("gzip payload over %d bytes" % limit)
+    return out
+
+
+def _http_bytes(url, timeout=180, accept="application/vnd.github.raw, application/json, */*",
+                max_bytes=_HTTP_MAX):
     base = {"User-Agent": f"licensetools/{APP_VERSION}", "Accept": accept}
     last = ""
     for encoding in ("gzip", "identity"):
@@ -1205,9 +1237,21 @@ def _http_bytes(url, timeout=180, accept="application/vnd.github.raw, applicatio
             try:
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-                    raw = r.read()
+                    declared = r.headers.get("Content-Length")
+                    if declared and declared.isdigit() and int(declared) > max_bytes:
+                        raise ValueError("reply announces %s bytes, cap is %d"
+                                         % (declared, max_bytes))
+                    buf = bytearray()
+                    while True:
+                        block = r.read(65536)
+                        if not block:
+                            break
+                        buf += block
+                        if len(buf) > max_bytes:
+                            raise ValueError("reply over %d bytes" % max_bytes)
+                    raw = bytes(buf)
                     if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
-                        raw = gzip.decompress(raw)
+                        raw = _gunzip_capped(raw, max_bytes)
                     return raw, ""
             except Exception as exc:
                 last = f"{type(exc).__name__}: {exc}"
@@ -1485,7 +1529,7 @@ def parse_acf(path: Path):
     out = {}
     try:
         for k, v in ACF_RE.findall(path.read_text(encoding="utf-8", errors="replace")):
-            out.setdefault(k, v)
+            out.setdefault(_kv_unescape(k), _kv_unescape(v))
     except Exception:
         pass
     return out
@@ -1761,6 +1805,16 @@ def selftest():
     except Exception as exc:
         back = b"<" + str(exc).encode() + b">"
     check("vzip frame decode", back == payload, f"{len(back)} bytes back")
+    _co = zlib.compressobj(9, zlib.DEFLATED, 31)
+    gz_bomb = _co.compress(b"x" * 4096) + _co.flush()
+    try:
+        _gunzip_capped(gz_bomb, 1024)
+        over = False
+    except ValueError:
+        over = True
+    check("gzip guard stops a payload over the cap", over)
+    check("gzip guard lets a payload under the cap through",
+          _gunzip_capped(gz_bomb, 1 << 20) == b"x" * 4096)
     check("cdn host list", bool(cdn_hosts()))
     check("manifest path flatten",
           _safe_rel("Contents\\MacOS\\StardewValley") == "Contents/MacOS/StardewValley")
@@ -2114,6 +2168,248 @@ def selftest():
         globals()["bundled_sig_roots"] = real_sig_roots
         sys.platform = real_platform
 
+    def _thin(cpu, bits=64):
+        magic = b"\xcf\xfa\xed\xfe" if bits == 64 else b"\xce\xfa\xed\xfe"
+        return (magic + cpu.to_bytes(4, "little") + b"\x00" * 4
+                + (2).to_bytes(4, "little") + b"\x00" * 12)
+
+    def _fat(images):
+        n = len(images)
+        out = bytearray(b"\xca\xfe\xba\xbe" + n.to_bytes(4, "big"))
+        head = 8 + 20 * n
+        off = head + 0x40
+        offsets = []
+        for _ in range(n):
+            offsets.append(off)
+            off += 0x40
+        for i in range(n):
+            out += (7).to_bytes(4, "big") + (3).to_bytes(4, "big")
+            out += offsets[i].to_bytes(4, "big") + (0x40).to_bytes(4, "big")
+            out += (4).to_bytes(4, "big")
+        out += b"\x00" * (offsets[0] - len(out))
+        for i, img in enumerate(images):
+            if len(out) < offsets[i]:
+                out += b"\x00" * (offsets[i] - len(out))
+            out += img + b"\x00" * (0x40 - len(img))
+        return bytes(out)
+
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+        thin = tdir / "thin"
+        thin.write_bytes(_thin(0x0100000c))
+        info = macho_info(thin)
+        check("macho reads an arm64 header",
+              info["ok"] and info["arches"] == ["arm64"] and info["kind"] == "execute",
+              json.dumps(info))
+        fat = tdir / "fat"
+        fat.write_bytes(_fat([_thin(0x0100000c), _thin(0x01000007)]))
+        finfo = macho_info(fat)
+        check("macho reads a fat header",
+              finfo["ok"] and finfo["arches"] == ["arm64", "x86_64"] and finfo["fat"],
+              json.dumps(finfo))
+        (tdir / "empty").write_bytes(b"not a binary at all")
+        check("macho rejects a text file", macho_info(tdir / "empty")["ok"] is False)
+
+        arm = {"platform": "darwin", "machine": "arm64", "rosetta": True}
+        no_ros = {"platform": "darwin", "machine": "arm64", "rosetta": False}
+        intel = {"platform": "darwin", "machine": "x86_64", "rosetta": True}
+        check("arch verdict native", arch_verdict(["arm64"], [64], arm)[0] == "native")
+        check("arch verdict rosetta",
+              arch_verdict(["x86_64"], [64], arm)[0] == "rosetta")
+        check("arch verdict needs rosetta",
+              arch_verdict(["x86_64"], [64], no_ros)[0] == "needs-rosetta")
+        check("arch verdict other cpu",
+              arch_verdict(["arm64"], [64], intel)[0] == "other-cpu")
+        check("arch verdict 32-bit",
+              arch_verdict(["i386"], [32], intel)[0] == "unsupported")
+        check("arch verdict nothing",
+              arch_verdict([], [], arm)[0] == "unknown")
+
+        check("exec flag counts", _wants_exec(_FLAG_EXEC, "a/b/c") is True)
+        check("custom exec flag counts", _wants_exec(_FLAG_CUSTOM_EXEC, "a") is True)
+        check("bundle binary counts without a flag",
+              _wants_exec(0, "UNDERTALE.app/Contents/MacOS/UNDERTALE") is True)
+        check("a plain file does not count", _wants_exec(0, "data/level1.bin") is False)
+        check("a framework binary counts",
+              _wants_exec(0, "X.framework/Versions/A/Contents/MacOS/X") is True)
+
+        sym = tdir / "sym"
+        strtab = b"_SteamAPI_Init\x00_SteamAPI_Shutdown\x00"
+        nlist = (0).to_bytes(4, "little") + b"\x01\x00\x00\x00" + b"\x00" * 8
+        nlist2 = (15).to_bytes(4, "little") + b"\x01\x00\x00\x00" + b"\x00" * 8
+        hdr = (b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\x00" * 4
+               + (6).to_bytes(4, "little") + (1).to_bytes(4, "little")
+               + (24).to_bytes(4, "little") + b"\x00" * 8)
+        symoff = len(hdr) + 24
+        stroff = symoff + 32
+        cmd = ((2).to_bytes(4, "little") + (24).to_bytes(4, "little")
+               + symoff.to_bytes(4, "little") + (2).to_bytes(4, "little")
+               + stroff.to_bytes(4, "little") + len(strtab).to_bytes(4, "little"))
+        sym.write_bytes(hdr + cmd + nlist + nlist2 + strtab)
+        got = macho_undefined_symbols(sym)
+        check("symbol table walk finds the steam imports",
+              got == ["SteamAPI_Init", "SteamAPI_Shutdown"], json.dumps(got))
+
+        acf = tdir / "appmanifest_1.acf"
+        acf.write_text('"AppState"\n{\n\t"appid"\t\t"1"\n'
+                       '\t"StateFlags"\t\t"2"\n'
+                       '\t"installdir"\t\t"Game"\n'
+                       '\t"InstalledDepots"\n\t{\n'
+                       '\t\t"11"\n\t\t{\n\t\t\t"manifest"\t\t"222"\n'
+                       '\t\t\t"size"\t\t"4096"\n\t\t}\n'
+                       '\t\t"12"\n\t\t{\n\t\t\t"manifest"\t\t"333"\n'
+                       '\t\t\t"size"\t\t"7"\n\t\t}\n\t}\n'
+                       '\t"MountedDepots"\n\t{\n\t\t"11"\t\t"222"\n\t}\n}\n',
+                       encoding="utf-8")
+        deps = appmanifest_depots(acf)
+        check("acf depot list parses",
+              deps == {11: {"manifest": "222", "size": 4096},
+                       12: {"manifest": "333", "size": 7}}, json.dumps(deps))
+        text = acf.read_text(encoding="utf-8")
+        out = _acf_set_field(text, "StateFlags", "4")
+        check("acf field rewrite", out is not None and '"StateFlags"\t\t"4"' in out)
+        check("acf field rewrite keeps the depots",
+              '"manifest"\t\t"222"' in (out or ""))
+        check("acf field rewrite refuses an absent key",
+              _acf_set_field(text, "Nope", "1") is None)
+
+        # Valve KeyValues escapes \ and " inside strings. The old reader stopped
+        # at the first quote, so a game called  Foo "Bar"  lost half its name and
+        # the rest of the line came back as a stray key.
+        fancy = 'Foo "Bar" \\ Baz'
+        quoted = _vdf_quote(fancy)
+        check("vdf quote escapes quotes and backslashes",
+              quoted == 'Foo \\"Bar\\" \\\\ Baz', quoted)
+        check("vdf quote round trips", _kv_unescape(quoted) == fancy, _kv_unescape(quoted))
+        named = tdir / "appmanifest_2.acf"
+        named.write_text('"AppState"\n{\n\t"name"\t\t"' + quoted + '"\n'
+                         '\t"installdir"\t\t"Foo"\n}\n', encoding="utf-8")
+        parsed = parse_acf(named)
+        check("acf keeps a name that contains quotes",
+              parsed.get("name") == fancy, json.dumps(parsed))
+        check("acf still finds the next field after a quoted name",
+              parsed.get("installdir") == "Foo", json.dumps(parsed))
+        blk = ('"AppState"\n{\n\t"name"\t\t"a \\"quoted\\" { brace }"\n'
+               '\t"nested"\n\t{\n\t\t"k"\t\t"v"\n\t}\n}\n')
+        sub = _vdf_subblock(blk, "nested")
+        check("vdf subblock survives a quoted brace",
+              '"k"' in sub and '"v"' in sub, repr(sub))
+        escaped_field = _acf_set_field('"installdir"\t\t"a \\"b\\" c"\n',
+                                       "installdir", fancy)
+        check("acf field rewrite rewrites a whole escaped value",
+              escaped_field == '"installdir"\t\t"' + quoted + '"\n', repr(escaped_field))
+
+        lib = tdir / "library" / "steamapps"
+        lib.mkdir(parents=True)
+        check("library override is honoured",
+              Path(steam_apps_dir(lib)).resolve() == lib.resolve())
+        ok_rec = write_appmanifest(7, fancy, "Game", 4411,
+                                   [{"depot": 11, "manifest": "222", "size": 4096}],
+                                   4096, sa=lib)
+        check("appmanifest lands in the library that was passed",
+              ok_rec.get("ok") and Path(ok_rec.get("library", "")).resolve()
+              == lib.resolve(), json.dumps(ok_rec))
+        rec_path = lib / "appmanifest_7.acf"
+        rec_text = rec_path.read_text(encoding="utf-8") if rec_path.is_file() else ""
+        check("appmanifest keeps the quoted name",
+              parse_acf(rec_path).get("name") == fancy, json.dumps(parse_acf(rec_path)))
+        for key in ("StagingSize", "LastOwner", "UpdateResult", "BytesToDownload",
+                    "BytesDownloaded", "BytesToStage", "BytesStaged", "TargetBuildID",
+                    "AutoUpdateBehavior", "AllowOtherDownloadsWhileRunning",
+                    "ScheduledAutoUpdate", "MountedDepots", "SharedDepots",
+                    "UserConfig", "MountedConfig"):
+            check("appmanifest carries " + key, '"' + key + '"' in rec_text, key)
+        check("appmanifest records the depot manifest",
+              '"installdir"\t\t"Game"' in rec_text and '"222"' in rec_text)
+        check("appmanifest refuses a non numeric buildid",
+              write_appmanifest(8, "x", "Game", "nope", [], 0,
+                                sa=lib).get("ok") is False)
+        check("appmanifest refuses a traversal installdir",
+              write_appmanifest(8, "x", "../escape", 4411, [], 0,
+                                sa=lib).get("ok") is False)
+        check("appmanifest refuses an absolute installdir",
+              write_appmanifest(8, "x", "/etc", 4411, [], 0,
+                                sa=lib).get("ok") is False)
+        check("appmanifest refuses a non numeric manifest",
+              write_appmanifest(8, "x", "Game", 4411,
+                                [{"depot": 11, "manifest": "abc"}], 0,
+                                sa=lib).get("ok") is False)
+        pend = write_pending_appmanifest(
+            9, "x", "Game", 4411, [{"depot": 11, "manifest": "222", "size": 4096}],
+            4096, 4096, sa=lib)
+        check("pending record lands in the same library",
+              pend.get("ok") and (lib / "appmanifest_9.acf").is_file(),
+              json.dumps(pend))
+        check("pending record is staged, not installed",
+              '"StateFlags"\t\t"2"' in (lib / "appmanifest_9.acf").read_text(
+                  encoding="utf-8"))
+
+        victim = tdir / "victim"
+        victim.mkdir()
+        (victim / "keep.txt").write_text("keep", encoding="utf-8")
+        escape_acf = lib / "appmanifest_12.acf"
+        escape_acf.write_text('"AppState"\n{\n\t"appid"\t\t"12"\n'
+                              '\t"installdir"\t\t"../../victim"\n}\n', encoding="utf-8")
+        real_find, real_cfg = globals()["find_app_acf"], globals()["macsteam_config_remove"]
+        globals()["find_app_acf"] = lambda _a: escape_acf
+        globals()["macsteam_config_remove"] = lambda _a: {"ok": True}
+        try:
+            un = uninstall_game(12)
+        finally:
+            globals()["find_app_acf"] = real_find
+            globals()["macsteam_config_remove"] = real_cfg
+        check("uninstall refuses a traversal installdir",
+              un.get("ok") is True and (victim / "keep.txt").is_file(), json.dumps(un))
+
+        common = tdir / "common"
+        (common / "The Game").mkdir(parents=True)
+        got, name, how = _resolve_install_dir(tdir, "the game", "")
+        check("installdir resolves a folder that exists",
+              got is not None and how in ("exact", "case") and Path(got).is_dir(),
+              f"{got} {how}")
+        got, name, how = _resolve_install_dir(tdir, "missing", "")
+        check("installdir miss reports nothing", got is None and how == "", str(got))
+
+        target = common / "The Game"
+        (target / "readme.txt").write_bytes(b"hello")
+        entry = {"name": "readme.txt", "size": 5, "flags": 0,
+                 "sha": hashlib.sha1(b"hello").digest(), "link": "", "chunks": []}
+        check("verify accepts a matching file",
+              _verify_entry(target / "readme.txt", entry, False)[0] == "ok")
+        (target / "readme.txt").write_bytes(b"hellx")
+        check("verify catches a wrong byte",
+              _verify_entry(target / "readme.txt", entry, False)[0] == "bad")
+        (target / "readme.txt").unlink()
+        check("verify catches a missing file",
+              _verify_entry(target / "readme.txt", entry, False)[0] == "missing")
+        dentry = {"name": "sub", "size": 0, "flags": _FLAG_DIR,
+                  "sha": b"", "link": "", "chunks": []}
+        (target / "sub").mkdir()
+        check("verify accepts a folder",
+              _verify_entry(target / "sub", dentry, False)[0] == "dir")
+        lentry = {"name": "alias", "size": 0, "flags": _FLAG_SYMLINK,
+                  "sha": b"", "link": "readme.txt", "chunks": []}
+        try:
+            os.symlink("readme.txt", target / "alias")
+            linked = True
+        except (OSError, NotImplementedError):
+            linked = False
+        if linked:
+            check("verify accepts a link",
+                  _verify_entry(target / "alias", lentry, False)[0] == "link")
+            bad_link = dict(lentry, link="other")
+            check("verify catches a wrong link target",
+                  _verify_entry(target / "alias", bad_link, False)[0] == "bad")
+    check("gui has the doctor button", 'id="b-m-doctor"' in GUI_HTML)
+    check("gui has the verify button", 'id="b-m-verify"' in GUI_HTML)
+    check("gui calls the doctor entry point", 'call("doctor"' in GUI_HTML)
+    check("gui calls the verify entry point", 'call("verify"' in GUI_HTML)
+    check("gui disables the doctor button while busy",
+          '"#b-m-doctor"' in GUI_HTML and '"#b-m-verify"' in GUI_HTML)
+    check("cli exposes doctor",
+          callable(getattr(build_argparser().parse_args(["doctor", "1"]), "fn", None)))
+    check("cli exposes verify",
+          callable(getattr(build_argparser().parse_args(["verify", "1"]), "fn", None)))
     check("gui has the cloud buttons",
           'id="b-m-cloudoff"' in GUI_HTML and 'id="b-m-cloudon"' in GUI_HTML)
     check("gui calls the cloud entry points",
@@ -2300,16 +2596,35 @@ def fetch_game(appid, branch="public", rows=None, want_os="mac", shared=True,
 
 # ---------- install downloaded content into the steam library ----------
 
-def steam_apps_dir():
+def steam_apps_dir(preferred=None):
+    """The steamapps folder. A caller that already resolved a library passes it.
+
+    Every writer used to call this with no argument and land in the *first*
+    library, which is not always the library the files went into. That mismatch
+    is what makes Steam show "Install" over a complete download.
+    """
+    if preferred is not None:
+        sa = Path(preferred)
+        try:
+            sa.mkdir(parents=True, exist_ok=True)
+            return sa
+        except OSError:
+            return None
     for r in library_roots():
         sa = r / "steamapps"
-        if sa.is_dir():
-            return sa
+        try:
+            if sa.is_dir():
+                return sa
+        except OSError:
+            continue
     root = SteamCtx().root()
     if root is None:
         return None
     sa = root / "steamapps"
-    sa.mkdir(parents=True, exist_ok=True)
+    try:
+        sa.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
     return sa
 
 def all_steamapps_dirs():
@@ -2338,7 +2653,14 @@ def find_app_acf(appid):
     return None
 
 def clean_installdir(value):
-    rel = _safe_rel(value)
+    raw = str(value or "").strip()
+    # An acf installdir is always a bare folder name under steamapps/common.
+    # A leading separator or a drive letter means the record is not one we
+    # wrote, and turning "/etc" into "etc" would silently point at something
+    # else, so it is refused instead of rewritten.
+    if raw.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", raw):
+        return None
+    rel = _safe_rel(raw)
     if not rel or "/" in rel or rel in (".", ".."):
         return None
     return rel
@@ -2347,11 +2669,26 @@ def read_appmanifest(appid):
     f = find_app_acf(appid)
     return parse_acf(f) if f is not None else None
 
-def write_appmanifest(appid, name, installdir, buildid, depots, size_on_disk=0):
-    sa = steam_apps_dir()
+def write_appmanifest(appid, name, installdir, buildid, depots, size_on_disk=0, sa=None):
+    sa = steam_apps_dir(sa)
     if sa is None:
         return {"ok": False, "error": "steam library not found"}
+    clean = clean_installdir(installdir)
+    if clean is None:
+        return {"ok": False, "error": "unusable installdir: %r" % (installdir,)}
+    installdir = clean
+    if not str(buildid or "").strip().isdigit():
+        return {"ok": False, "error": "buildid must be numeric, got %r" % (buildid,)}
     now = int(time.time())
+    size_on_disk = max(0, int(size_on_disk or 0))
+    rows = []
+    for d in depots:
+        depot = str(int(d["depot"]))
+        gid = str(d["manifest"] or "").strip()
+        if not gid.isdigit():
+            return {"ok": False, "error": "depot %s has a non numeric manifest %r"
+                    % (depot, gid)}
+        rows.append((depot, gid, max(0, int(d.get("size") or 0))))
     lines = ['"AppState"', "{"]
     lines += [f'\t"appid"\t\t"{int(appid)}"',
               '\t"Universe"\t\t"1"',
@@ -2360,32 +2697,46 @@ def write_appmanifest(appid, name, installdir, buildid, depots, size_on_disk=0):
               f'\t"installdir"\t\t"{_vdf_quote(installdir)}"',
               f'\t"LastUpdated"\t\t"{now}"',
               '\t"LastPlayed"\t\t"0"',
-              f'\t"SizeOnDisk"\t\t"{int(size_on_disk)}"',
-              f'\t"buildid"\t\t"{buildid}"']
+              f'\t"SizeOnDisk"\t\t"{size_on_disk}"',
+              '\t"StagingSize"\t\t"0"',
+              f'\t"buildid"\t\t"{int(buildid)}"',
+              f'\t"LastOwner"\t\t"{_vdf_quote(current_steamid())}"',
+              '\t"UpdateResult"\t\t"0"',
+              '\t"BytesToDownload"\t\t"0"',
+              '\t"BytesDownloaded"\t\t"0"',
+              '\t"BytesToStage"\t\t"0"',
+              '\t"BytesStaged"\t\t"0"',
+              f'\t"TargetBuildID"\t\t"{int(buildid)}"',
+              '\t"AutoUpdateBehavior"\t\t"0"',
+              '\t"AllowOtherDownloadsWhileRunning"\t\t"0"',
+              '\t"ScheduledAutoUpdate"\t\t"0"']
     lines.append('\t"InstalledDepots"')
     lines.append("\t{")
-    for d in depots:
-        lines += [f'\t\t"{d["depot"]}"', "\t\t{",
-                  f'\t\t\t"manifest"\t\t"{d["manifest"]}"',
-                  f'\t\t\t"size"\t\t"{int(d.get("size") or 0)}"', "\t\t}"]
+    for depot, gid, size in rows:
+        lines += [f'\t\t"{depot}"', "\t\t{",
+                  f'\t\t\t"manifest"\t\t"{gid}"',
+                  f'\t\t\t"size"\t\t"{size}"', "\t\t}"]
     lines.append("\t}")
     lines.append('\t"MountedDepots"')
     lines.append("\t{")
-    for d in depots:
-        lines.append(f'\t\t"{d["depot"]}"\t\t"{d["manifest"]}"')
+    for depot, gid, _size in rows:
+        lines.append(f'\t\t"{depot}"\t\t"{gid}"')
     lines.append("\t}")
-    lines.append('\t"SharedDepots"')
-    lines.append("\t{")
-    lines.append("\t}")
-    lines.append("}")
+    lines += ['\t"SharedDepots"', "\t{", "\t}",
+              '\t"UserConfig"', "\t{", "\t}",
+              '\t"MountedConfig"', "\t{", "\t}", "}"]
     path = sa / f"appmanifest_{int(appid)}.acf"
-    tmp = path.with_suffix(".acf.tmp")
+    tmp = path.with_name(path.name + ".tmp")
     try:
         tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
         tmp.replace(path)
     except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
         return {"ok": False, "error": str(exc)}
-    return {"ok": True, "file": str(path)}
+    return {"ok": True, "file": str(path), "library": str(sa)}
 
 MANIFEST_REPOS = (
     "Fairyvmos/bruh-hub",
@@ -2400,8 +2751,8 @@ MANIFEST_REPOS = (
 MANIFEST_MAGIC = b"\xd0\x17\xf6\x71"
 _MANIFEST_HINT = {"repo": "", "appid": ""}
 
-def depotcache_dir():
-    sa = steam_apps_dir()
+def depotcache_dir(sa=None):
+    sa = steam_apps_dir(sa)
     if sa is None:
         return None
     d = sa / "depotcache"
@@ -2493,8 +2844,8 @@ def manifest_info(path):
         pass
     return {"ok": files > 0, "files": files, "bytes": total}
 
-def fetch_manifest(appid, depot, gid, progress=None):
-    cache = depotcache_dir()
+def fetch_manifest(appid, depot, gid, progress=None, sa=None):
+    cache = depotcache_dir(sa)
     if cache is None:
         return None, gid, "steam library not found"
     dest = cache / f"{int(depot)}_{gid}.manifest"
@@ -2554,12 +2905,12 @@ def fetch_manifest(appid, depot, gid, progress=None):
             return dest, alt, ""
     return None, gid, " | ".join(errors[-2:]) or "no mirror carried this manifest"
 
-def stage_manifests(appid, rows, progress=None):
+def stage_manifests(appid, rows, progress=None, sa=None):
     staged, missing, errors = [], [], []
     for r in rows:
         depot = int(r["depot"])
         gid = str(r.get("manifest") or "")
-        path, used_gid, err = fetch_manifest(appid, depot, gid or "0", progress)
+        path, used_gid, err = fetch_manifest(appid, depot, gid or "0", progress, sa=sa)
         if path is None:
             missing.append(depot)
             errors.append(f"{depot}: {err}")
@@ -2592,8 +2943,15 @@ _FALLBACK_CDN = (
     "steampipe.steamcontent.com",
 )
 _CDN_HOSTS = []
+# EDepotFileFlag, SteamKit2 Base/Generated/SteamLanguage.cs
+_FLAG_ENCRYPTED = 4
+_FLAG_READONLY = 8
+_FLAG_HIDDEN = 16
+_FLAG_EXEC = 32
 _FLAG_DIR = 64
-_FLAG_SYMLINK = 256
+_FLAG_CUSTOM_EXEC = 128
+_FLAG_INSTALL_SCRIPT = 256
+_FLAG_SYMLINK = 512
 
 def _make_sbox():
     sbox = [0] * 256
@@ -2834,6 +3192,8 @@ def _vzip_decompress(buf):
     if buf[:3] != b"VZa" or buf[-2:] != b"zv":
         raise ValueError("not a vzip frame")
     crc, size = struct.unpack("<II", buf[-10:-2])
+    if size > 256 * 1024 * 1024:
+        raise ValueError("vzip declares an impossible size %d" % size)
     props = buf[7:12]
     head = props[0]
     lc = head % 9
@@ -2856,6 +3216,8 @@ def _vzstd_decompress(buf):
     if buf[:4] != b"VSZa" or buf[-3:] != b"zsv":
         raise ValueError("not a vzstd frame")
     size = struct.unpack("<i", buf[-11:-7])[0]
+    if size < 0 or size > 256 * 1024 * 1024:
+        raise ValueError("vzstd declares an impossible size %d" % size)
     payload = buf[8:-15]
     try:
         import zstandard
@@ -2884,12 +3246,18 @@ def _vzstd_decompress(buf):
     except Exception as exc:
         raise ValueError(f"zstd payload needs libzstd ({exc})")
 
-def _zip_decompress(buf):
+def _zip_decompress(buf, limit=256 * 1024 * 1024):
     with zipfile.ZipFile(io.BytesIO(buf)) as zf:
         names = zf.namelist()
         if not names:
             raise ValueError("empty zip chunk")
-        return zf.read(names[0])
+        info = zf.getinfo(names[0])
+        if info.file_size > limit:
+            raise ValueError("zip chunk declares %d bytes" % info.file_size)
+        out = zf.read(names[0])
+        if len(out) > limit:
+            raise ValueError("zip chunk over %d bytes" % limit)
+        return out
 
 def chunk_plaintext(blob, key, expect=None):
     if len(blob) < 32:
@@ -3084,7 +3452,8 @@ def fetch_chunk(depot, chunk_id, expect_len, cache, hosts=None):
     errors = []
     for host in _host_order(hosts):
         url = f"https://{host}/depot/{int(depot)}/chunk/{sha}"
-        blob, err = _http_bytes(url, timeout=120, accept="*/*")
+        cap = (int(expect_len) + 65536) if expect_len else _HTTP_MAX
+        blob, err = _http_bytes(url, timeout=120, accept="*/*", max_bytes=cap)
         if err:
             errors.append(f"{host.split('.')[0]}: {err}")
             continue
@@ -3128,6 +3497,26 @@ def _sha1_file(path, block=1 << 20):
         return ""
     return h.hexdigest()
 
+
+def _wants_exec(flags, rel):
+    """A mac bundle binary has to run, whatever the manifest says."""
+    if flags & (_FLAG_EXEC | _FLAG_CUSTOM_EXEC):
+        return True
+    parts = str(rel or "").replace("\\", "/").split("/")
+    return len(parts) >= 3 and parts[-2] == "MacOS" and parts[-3] == "Contents"
+
+
+def _set_exec(path, flags, rel):
+    if not _wants_exec(flags, rel):
+        return False
+    try:
+        if Path(path).stat().st_mode & 0o111 == 0o111:
+            return False
+        os.chmod(path, 0o755)
+        return True
+    except OSError:
+        return False
+
 def download_depot(depot, manifest_path, target_root, key, progress=None,
                    workers=6, verify_existing=True):
     parsed = parse_manifest(manifest_path)
@@ -3150,36 +3539,58 @@ def download_depot(depot, manifest_path, target_root, key, progress=None,
     hosts = cdn_hosts()
     todo = []
     skipped = 0
+    links = 0
+    dirs = 0
+    refused = []
     for entry in parsed["files"]:
-        rel = _safe_rel(entry["name"])
-        if rel is None:
+        name = str(entry["name"] or "")
+        rel = _safe_rel(name)
+        if rel is None or "\x00" in name:
+            refused.append(name or "<empty>")
             continue
         dest = root / rel
-        if entry["flags"] & _FLAG_DIR:
+        flags = int(entry["flags"] or 0)
+        if not _contained(root, dest):
+            refused.append(name)
+            continue
+        if flags & _FLAG_DIR:
             try:
                 dest.mkdir(parents=True, exist_ok=True)
+                dirs += 1
             except OSError:
                 pass
             continue
-        if entry["flags"] & _FLAG_SYMLINK:
+        if flags & _FLAG_SYMLINK:
             link = str(entry.get("link") or "").replace("\\", "/")
             if not link or link.startswith("/") or ".." in link.split("/"):
+                refused.append(f"{name} -> {link or '?'}")
                 continue
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
+                current = os.readlink(dest) if dest.is_symlink() else None
+                if current == link:
+                    skipped += 1
+                    continue
                 if dest.is_symlink() or dest.exists():
+                    if dest.is_dir() and not dest.is_symlink():
+                        refused.append(f"{name}: a real folder is in the way")
+                        continue
                     dest.unlink()
                 os.symlink(link, dest)
+                links += 1
+            except OSError as exc:
+                refused.append(f"{name}: {exc}")
+            continue
+        want_sha = entry["sha"].hex() if entry["sha"] else ""
+        if verify_existing and not dest.is_symlink() and dest.is_file():
+            try:
+                st = dest.stat()
+                if st.st_size == entry["size"] and (not want_sha or _sha1_file(dest) == want_sha):
+                    skipped += 1
+                    _set_exec(dest, flags, rel)
+                    continue
             except OSError:
                 pass
-            continue
-        if not _contained(root, dest.parent):
-            continue
-        if verify_existing and dest.is_file() and dest.stat().st_size == entry["size"]:
-            want = entry["sha"].hex() if entry["sha"] else ""
-            if not want or _sha1_file(dest) == want:
-                skipped += 1
-                continue
         todo.append((entry, dest))
     unique = {}
     for entry, _dest in todo:
@@ -3190,10 +3601,12 @@ def download_depot(depot, manifest_path, target_root, key, progress=None,
     if progress:
         progress(f"depot {int(depot)}: {parsed['count']} files, "
                  f"{parsed['bytes'] // (1024 * 1024)} MB, "
-                 f"{total} chunk(s) to pull, {skipped} file(s) already good")
+                 f"{total} chunk(s) to pull, {skipped} file(s) already good, "
+                 f"{links} link(s), {dirs} folder(s)")
     if not total and not todo:
         return {"ok": True, "depot": int(depot), "files": 0,
-                "bytes": 0, "skipped": skipped, "chunks": 0}
+                "bytes": 0, "skipped": skipped, "chunks": 0,
+                "links": links, "dirs": dirs, "refused": refused[:5]}
     done = {"n": 0, "bytes": 0}
     lock = threading.Lock()
     failures = []
@@ -3219,20 +3632,17 @@ def download_depot(depot, manifest_path, target_root, key, progress=None,
                 "error": f"{len(failures)} chunk(s) failed",
                 "detail": failures[:3]}
     written = 0
-    hashed = 0
+    verified = 0
     mismatch = []
+    bad_chunks = set()
     for entry, dest in todo:
-        if not _contained(root, dest.parent):
-            return {"ok": False, "depot": int(depot),
-                    "error": f"{entry['name']}: path escapes the install folder"}
+        rel = _safe_rel(entry["name"]) or ""
+        tmp = dest.with_name(dest.name + ".lt-part")
+        want = entry["sha"].hex() if entry["sha"] else ""
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        digest = hashlib.sha1()
-        try:
-            with dest.open("wb") as fh:
-                for ch in sorted(entry["chunks"], key=lambda c: c["off"]):
+            with open(tmp, "wb") as fh:
+                for ch in sorted(entry["chunks"], key=lambda c: c.get("off", 0)):
                     src = cache / ch["id"].hex() if cache is not None else None
                     raw = src.read_bytes() if src is not None and src.is_file() else None
                     if raw is None:
@@ -3242,29 +3652,36 @@ def download_depot(depot, manifest_path, target_root, key, progress=None,
                     data = chunk_plaintext(raw, key, ch["ulen"])
                     fh.seek(ch["off"])
                     fh.write(data)
-                    digest.update(data)
                 fh.truncate(entry["size"])
+            if want and _sha1_file(tmp) != want:
+                mismatch.append(entry["name"])
+                bad_chunks.update(ch["id"] for ch in entry["chunks"] if ch["id"])
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                continue
+            _set_exec(tmp, int(entry["flags"] or 0), rel)
+            os.replace(tmp, dest)
         except (OSError, ValueError) as exc:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
             return {"ok": False, "depot": int(depot),
                     "error": f"{entry['name']}: {exc}"}
         written += 1
-        got = digest.hexdigest()
-        if not entry["sha"] or entry["size"] == 0:
-            hashed += 1
-        elif got == entry["sha"].hex():
-            hashed += 1
-        else:
-            mismatch.append(entry["name"])
-        rel = _safe_rel(entry["name"]) or ""
-        if rel.startswith("Contents/MacOS/"):
-            try:
-                if _contained(root, dest):
-                    os.chmod(dest, 0o755)
-            except OSError:
-                pass
+        if want:
+            verified += 1
+    for cid in bad_chunks:
+        try:
+            if cache is not None:
+                (cache / cid.hex()).unlink()
+        except OSError:
+            pass
     if progress:
         progress(f"depot {int(depot)}: {written} file(s) written, "
-                 f"{hashed} hash-verified")
+                 f"{verified} hash-verified, {links} link(s), {dirs} folder(s)")
     if mismatch:
         return {"ok": False, "depot": int(depot),
                 "error": f"{len(mismatch)} file(s) failed the sha1 check",
@@ -3272,21 +3689,30 @@ def download_depot(depot, manifest_path, target_root, key, progress=None,
     return {"ok": True, "depot": int(depot), "files": written,
             "skipped": skipped, "chunks": total,
             "bytes": sum(int(e["size"]) for e, _d in todo),
-            "verified": hashed}
+            "links": links, "dirs": dirs, "refused": refused[:5],
+            "verified": verified}
 
 def download_app(appid, rows, target_root, progress=None, keys=None,
-                 verify_existing=True):
+                 verify_existing=True, sa=None):
     keys = keys or {}
     total = {"files": 0, "bytes": 0, "skipped": 0}
     done = []
+    cache = depotcache_dir(sa)
+    if cache is None:
+        return {"ok": False, "stage": "manifest",
+                "error": "the steam library has no depotcache folder"}
     pruned = _prune_chunks(keep_depot=int(rows[0]["depot"]) if rows else None)
     if pruned and progress:
         progress(f"chunk cache trimmed - {pruned} old chunk(s) removed")
     for r in rows:
         depot = int(r["depot"])
+        gid = str(r["manifest"] or "").strip()
+        if not gid.isdigit():
+            return {"ok": False, "stage": "manifest", "depot": depot,
+                    "error": "depot %d has no usable manifest id (%r)" % (depot, gid)}
         key = keys.get(depot) or keys.get(str(depot)) or ""
-        path = depotcache_dir() / f"{depot}_{r['manifest']}.manifest" if depotcache_dir() else None
-        if path is None or not path.is_file():
+        path = cache / f"{depot}_{gid}.manifest"
+        if not path.is_file():
             return {"ok": False, "stage": "manifest", "depot": depot,
                     "error": f"manifest for depot {depot} is not on disk"}
         res = download_depot(depot, path, target_root, key, progress,
@@ -3298,6 +3724,237 @@ def download_app(appid, rows, target_root, progress=None, keys=None,
         total["skipped"] += res.get("skipped", 0)
         done.append(depot)
     return {"ok": True, "depots": done, **total}
+
+def _vdf_subblock(text, key):
+    """The body of one "key" { ... } block, braces balanced by hand.
+
+    Quoted strings are skipped whole and escaped quotes inside them do not end
+    the string, so a brace that lives in a name can never unbalance the walk.
+    """
+    m = re.search(r'"' + re.escape(key) + r'"\s*\{', text)
+    if m is None:
+        return ""
+    start = m.end()
+    depth = 1
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            else:
+                return ""
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i]
+        i += 1
+    return ""
+
+
+def appmanifest_depots(path):
+    """depot -> {manifest, size} from the InstalledDepots list of an acf."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    block = _vdf_subblock(text, "InstalledDepots") or _vdf_subblock(text, "MountedDepots")
+    out = {}
+    for m in re.finditer(r'"(\d+)"\s*\{\s*"manifest"\s*"(\d+)"'
+                         r'(?:\s*"size"\s*"(\d+)")?', block):
+        out[int(m.group(1))] = {"manifest": m.group(2),
+                                "size": int(m.group(3) or 0)}
+    if out:
+        return out
+    for m in re.finditer(r'"(\d+)"\s*"(\d{8,})"', block):
+        out.setdefault(int(m.group(1)), {"manifest": m.group(2), "size": 0})
+    return out
+
+
+def _verify_entry(dest, entry, repair):
+    """(state, rel) for one manifest entry against the disk."""
+    flags = int(entry["flags"] or 0)
+    if flags & _FLAG_DIR:
+        return ("dir" if dest.is_dir() else "missing"), ""
+    if flags & _FLAG_SYMLINK:
+        link = str(entry.get("link") or "")
+        try:
+            if dest.is_symlink():
+                return ("link" if os.readlink(dest) == link else "bad"), link
+        except OSError:
+            pass
+        return ("missing" if not dest.exists() and not dest.is_symlink() else "bad"), link
+    try:
+        if dest.is_symlink() or not dest.is_file():
+            return "missing", ""
+        size = dest.stat().st_size
+    except OSError:
+        return "missing", ""
+    if size != int(entry["size"]):
+        return "bad", "%d != %d bytes" % (size, int(entry["size"]))
+    want = entry["sha"].hex() if entry["sha"] else ""
+    if want and _sha1_file(dest) != want:
+        return "bad", "sha1 mismatch"
+    return "ok", ""
+
+
+def verify_app(appid, repair=True, progress=None, keys=None, limit=40):
+    """Walk every installed depot against the disk, the way Steam validates.
+
+    Nothing is trusted from the record: each entry is compared by type, size
+    and whole-file sha1. Anything short or wrong is rebuilt from the manifest
+    chunks that are still on the CDN, and only for that depot.
+    """
+    aid = int(appid)
+    say = progress or (lambda _m: None)
+    rep = {"ok": False, "appid": str(aid), "repair": bool(repair), "dir": "",
+           "depots": [], "missing": [], "bad": [], "extra": 0, "clean": False,
+           "checked": 0, "bytes": 0, "repaired": 0, "refused": []}
+    acf_file = find_app_acf(aid)
+    if acf_file is None:
+        rep["error"] = "no appmanifest_%d.acf in any library" % aid
+        return rep
+    acf = parse_acf(acf_file)
+    declared = acf.get("installdir", "")
+    target, _rel, _how = _resolve_install_dir(acf_file.parent, declared, acf.get("name", ""))
+    if target is None:
+        for other in all_steamapps_dirs():
+            t, _r, _h = _resolve_install_dir(other, declared, acf.get("name", ""))
+            if t is not None:
+                target = t
+                break
+    if target is None:
+        rep["error"] = "installdir %r is not on disk" % declared
+        return rep
+    rep["dir"] = str(target)
+    wanted = appmanifest_depots(acf_file)
+    if not wanted:
+        rep["error"] = "the record lists no depots - reinstall it through the app"
+        return rep
+    if keys is None:
+        keys = {}
+        try:
+            keys.update(depot_key_db() or {})
+        except Exception:
+            pass
+        try:
+            for d, k in local_depot_keys(list(wanted)).items():
+                keys.setdefault(d, k)
+        except Exception:
+            pass
+    say("verify: %d depot(s) in the record, walking the files" % len(wanted))
+    known = set()
+    for depot in sorted(wanted):
+        gid = wanted[depot]["manifest"]
+        cache = depotcache_dir()
+        mpath = cache / ("%d_%s.manifest" % (depot, gid)) if cache else None
+        if mpath is None or not mpath.is_file():
+            mpath, used, err = fetch_manifest(aid, depot, gid, progress)
+            if mpath is None:
+                rep["depots"].append({"depot": depot, "manifest": gid, "ok": False,
+                                      "error": err or "manifest not available"})
+                continue
+            gid = used or gid
+        parsed = parse_manifest(mpath)
+        if not parsed.get("ok"):
+            rep["depots"].append({"depot": depot, "manifest": gid, "ok": False,
+                                  "error": parsed.get("error", "manifest unreadable")})
+            continue
+        key = keys.get(depot) or keys.get(str(depot)) or ""
+        row = {"depot": depot, "manifest": gid, "files": 0, "ok": True,
+               "missing": 0, "bad": 0, "links": 0, "dirs": 0, "skipped": 0,
+               "repaired": 0, "error": "", "bytes": 0}
+        broken = []
+        seen = 0
+        for entry in parsed["files"]:
+            rel = _safe_rel(entry["name"])
+            if rel is None:
+                rep["refused"].append(str(entry["name"] or "")[:80])
+                continue
+            dest = target / rel
+            row["files"] += 1
+            known.add(rel.lower())
+            state, note = _verify_entry(dest, entry, repair)
+            if state == "ok":
+                row["skipped"] += 1
+                rep["checked"] += 1
+                row["bytes"] += int(entry["size"])
+                if repair:
+                    _set_exec(dest, int(entry["flags"] or 0), rel)
+            elif state == "link":
+                row["links"] += 1
+                rep["checked"] += 1
+            elif state == "dir":
+                row["dirs"] += 1
+                rep["checked"] += 1
+            else:
+                row[("missing" if state == "missing" else "bad")] += 1
+                broken.append(entry)
+                if len(rep["missing" if state == "missing" else "bad"]) < limit:
+                    rep["missing" if state == "missing" else "bad"].append(
+                        rel + ((" " + note) if note else ""))
+            seen += 1
+            if seen % 500 == 0:
+                say("verify depot %d: %d/%d entries, %d to rebuild"
+                    % (depot, seen, parsed["count"], len(broken)))
+        if broken and repair:
+            if not key:
+                row["error"] = "no depot key for %d - cannot rebuild it" % depot
+                row["ok"] = False
+            else:
+                say("verify depot %d: rebuilding %d file(s)" % (depot, len(broken)))
+                res = download_depot(depot, mpath, target, key, progress,
+                                     verify_existing=True)
+                row["repaired"] = int(res.get("files") or 0)
+                rep["repaired"] += row["repaired"]
+                if not res.get("ok"):
+                    row["error"] = str(res.get("error") or "rebuild failed")
+                    row["ok"] = False
+                else:
+                    left = 0
+                    for entry in broken:
+                        rel = _safe_rel(entry["name"]) or ""
+                        state, _n = _verify_entry(target / rel, entry, False)
+                        if state not in ("ok", "link", "dir"):
+                            left += 1
+                            if len(rep["refused"]) < limit:
+                                rep["refused"].append("still bad: " + rel)
+                    if left:
+                        row["error"] = "%d file(s) still wrong after the rebuild" % left
+                        row["ok"] = False
+        elif broken:
+            row["ok"] = False
+        rep["depots"].append(row)
+    try:
+        for p in target.rglob("*"):
+            if not p.is_file() or p.is_symlink():
+                continue
+            if p.name.endswith(".lt-part") or p.name == STUB_APPID_FILE:
+                continue
+            rel = p.relative_to(target).as_posix().lower()
+            if rel not in known:
+                rep["extra"] += 1
+    except (OSError, ValueError):
+        pass
+    rep["clean"] = (bool(rep["depots"])
+                    and all(d.get("ok") for d in rep["depots"])
+                    and not rep["missing"] and not rep["bad"])
+    rep["ok"] = True
+    say("verify: %d file(s) match, %d missing, %d wrong, %d rebuilt"
+        % (rep["checked"], len(rep["missing"]), len(rep["bad"]), rep["repaired"]))
+    return rep
+
 
 def current_steamid():
     root = SteamCtx().root()
@@ -3622,13 +4279,29 @@ def log_cloud(res, log=None):
         add("started Steam again")
     return res
 
-def write_pending_appmanifest(appid, name, installdir, buildid, rows, total, download):
-    sa = steam_apps_dir()
+def write_pending_appmanifest(appid, name, installdir, buildid, rows, total, download,
+                              sa=None):
+    sa = steam_apps_dir(sa)
     if sa is None:
         return {"ok": False, "error": "steam library not found"}
+    clean = clean_installdir(installdir)
+    if clean is None:
+        return {"ok": False, "error": "unusable installdir: %r" % (installdir,)}
+    installdir = clean
+    gid = str(buildid or "").strip()
+    if not gid.isdigit():
+        return {"ok": False, "error": "buildid must be numeric, got %r" % (buildid,)}
     now = int(time.time())
-    total = int(total or 0)
-    download = int(download or total or 0)
+    total = max(0, int(total or 0))
+    download = max(0, int(download or total or 0))
+    staged_rows = []
+    for d in rows:
+        depot = str(int(d["depot"]))
+        man = str(d.get("manifest") or "").strip()
+        if not man.isdigit():
+            return {"ok": False, "error": "depot %s has a non numeric manifest %r"
+                    % (depot, man)}
+        staged_rows.append((depot, man, max(0, int(d.get("size") or 0))))
     lines = ['"AppState"', "{"]
     lines += [f'\t"appid"\t\t"{int(appid)}"',
               '\t"Universe"\t\t"1"',
@@ -3639,33 +4312,36 @@ def write_pending_appmanifest(appid, name, installdir, buildid, rows, total, dow
               '\t"LastPlayed"\t\t"0"',
               '\t"SizeOnDisk"\t\t"0"',
               '\t"StagingSize"\t\t"0"',
-              f'\t"buildid"\t\t"{buildid}"',
-              f'\t"LastOwner"\t\t"{current_steamid()}"',
+              f'\t"buildid"\t\t"{int(gid)}"',
+              f'\t"LastOwner"\t\t"{_vdf_quote(current_steamid())}"',
               '\t"UpdateResult"\t\t"0"',
               f'\t"BytesToDownload"\t\t"{download}"',
               '\t"BytesDownloaded"\t\t"0"',
               f'\t"BytesToStage"\t\t"{total}"',
               '\t"BytesStaged"\t\t"0"',
-              f'\t"TargetBuildID"\t\t"{buildid}"',
+              f'\t"TargetBuildID"\t\t"{int(gid)}"',
               '\t"AutoUpdateBehavior"\t\t"0"',
               '\t"AllowOtherDownloadsWhileRunning"\t\t"0"',
               '\t"ScheduledAutoUpdate"\t\t"0"',
               '\t"InstalledDepots"', "\t{"]
-    for d in rows:
-        lines += [f'\t\t"{int(d["depot"])}"', "\t\t{",
-                  f'\t\t\t"manifest"\t\t"{d["manifest"]}"',
-                  f'\t\t\t"size"\t\t"{int(d.get("size") or 0)}"', "\t\t}"]
+    for depot, man, size in staged_rows:
+        lines += [f'\t\t"{depot}"', "\t\t{",
+                  f'\t\t\t"manifest"\t\t"{man}"',
+                  f'\t\t\t"size"\t\t"{size}"', "\t\t}"]
+    lines += ["\t}", '\t"MountedDepots"', "\t{"]
+    for depot, man, _size in staged_rows:
+        lines.append(f'\t\t"{depot}"\t\t"{man}"')
     lines += ["\t}", '\t"SharedDepots"', "\t{", "\t}",
               '\t"UserConfig"', "\t{", "\t}",
               '\t"MountedConfig"', "\t{", "\t}", "}"]
     path = sa / f"appmanifest_{int(appid)}.acf"
     try:
-        tmp = path.with_suffix(".acf.tmp")
+        tmp = path.with_name(path.name + ".pending")
         tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
         tmp.replace(path)
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
-    return {"ok": True, "file": str(path)}
+    return {"ok": True, "file": str(path), "library": str(sa)}
 
 def install_to_library(appid, branch="public", want_os="mac", user="", password="",
                        progress=None, update=False, skip_drm=False):
@@ -3702,7 +4378,7 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
                 "config": cfg}
     if progress:
         progress("staging depot manifests so Steam never asks the CM for them")
-    staged = stage_manifests(aid, rows, progress)
+    staged = stage_manifests(aid, rows, progress, sa=sa)
     if staged["missing"]:
         msg = ", ".join(str(d) for d in staged["missing"])
         if progress:
@@ -3713,11 +4389,6 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
     total = sum(int(r["size"]) for r in rows if str(r.get("size", "")).isdigit())
     download_size = sum(int(r["download"]) for r in rows
                         if str(r.get("download", "")).isdigit())
-    pending = write_pending_appmanifest(aid, probe.get("name"), installdir,
-                                        probe.get("buildid", ""), rows,
-                                        total, download_size)
-    if progress:
-        progress("queued the library entry")
     if progress:
         progress("closing steam first so it cannot overwrite the new library record")
     quit_info = steam_quit()
@@ -3725,14 +4396,24 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
         progress("steam: " + ("closed" if quit_info.get("ok")
                               else "still open - " + str(quit_info.get("error"))))
     if not quit_info.get("ok"):
-        _drop_pending(pending)
         return {"ok": False, "stage": "steam", "target": str(target),
                 "error": "Steam would not close, so the library record would be lost",
                 "hint": "quit Steam from the menu bar, then press Download files again",
                 "steam": quit_info}
+    pending = write_pending_appmanifest(aid, probe.get("name"), installdir,
+                                        probe.get("buildid", ""), rows,
+                                        total, download_size, sa=sa)
+    if not pending.get("ok"):
+        steam_launch()
+        return {"ok": False, "stage": "library", "target": str(target),
+                "error": "could not queue the library entry: "
+                         + str(pending.get("error"))}
+    if progress:
+        progress("queued the library entry in " + str(pending.get("library") or sa))
     if progress:
         progress("pulling the depots from the Steam CDN myself - no account needed")
-    res = download_app(aid, rows, target, progress, keys=keys, verify_existing=True)
+    res = download_app(aid, rows, target, progress, keys=keys,
+                       verify_existing=True, sa=sa)
     if not res.get("ok"):
         _drop_pending(pending)
         steam_launch()
@@ -3752,7 +4433,7 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
                 "error": "depot download wrote no files",
                 "hint": "press Download files again"}
     acf = write_appmanifest(aid, probe.get("name"), installdir,
-                            probe.get("buildid", ""), rows, size)
+                            probe.get("buildid", ""), rows, size, sa=sa)
     if progress:
         progress(f"installed {size // (1024 * 1024)} MB into {target}")
         progress("library entry: " + str(acf.get("file") or acf.get("error")))
@@ -3771,6 +4452,22 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
             else:
                 progress("drm layer: " + str(drm.get("error") or "unavailable"))
     launch_info = steam_launch()
+    doctor = {"ok": False, "skipped": True}
+    if sys.platform == "darwin":
+        if progress:
+            progress("checking what macOS needs before the game can start...")
+        doctor = heal_game(aid, fix=True, progress=progress,
+                           hint=probe.get("installdir") or probe.get("name") or "")
+        if progress:
+            if doctor.get("issues"):
+                progress("launch doctor: " + "; ".join(doctor["issues"]))
+            elif doctor.get("launchable"):
+                progress("launch doctor: library record, permissions and "
+                         "signature all line up")
+            for b in doctor.get("bundles") or []:
+                if b.get("arches"):
+                    progress("  " + Path(b["path"]).name + ": "
+                             + "+".join(b["arches"]) + " - " + str(b.get("note") or ""))
     if progress:
         progress("steam: " + ("opened - check your library" if launch_info.get("ok")
                               else "could not open - " + str(launch_info.get("error"))))
@@ -3778,7 +4475,7 @@ def install_to_library(appid, branch="public", want_os="mac", user="", password=
             "dir": str(target), "installdir": installdir, "files_bytes": size,
             "depots": depots, "keys": len(keys),
             "files": res.get("files", 0), "skipped": res.get("skipped", 0),
-            "manifests": staged, "config": cfg, "drm": drm,
+            "manifests": staged, "config": cfg, "drm": drm, "doctor": doctor,
             "steam": {"quit": quit_info, "launch": launch_info},
             "manifest": acf.get("file"), "error": acf.get("error")}
 
@@ -4227,17 +4924,16 @@ def _bundle_executable(bundle):
 
 
 def _undefined_steam_symbols(binary):
-    res = _run_quiet(["nm", "-u", str(binary)], timeout=120)
-    if res is None or res.returncode != 0:
-        return []
     found = set()
-    for line in res.stdout.splitlines():
-        bits = line.split()
-        if not bits:
-            continue
-        sym = bits[-1]
-        if sym.startswith("_Steam"):
-            found.add(sym[1:])
+    if binary is not None:
+        res = _run_quiet(["nm", "-u", str(binary)], timeout=120)
+        if res is not None and res.returncode == 0:
+            for line in res.stdout.splitlines():
+                bits = line.split()
+                if bits and bits[-1].startswith("_Steam"):
+                    found.add(bits[-1][1:])
+        if not found:
+            found.update(macho_undefined_symbols(binary))
     return sorted(found)
 
 
@@ -4520,6 +5216,496 @@ def repair_install_state(appid):
             "manifests": restaged.get("staged", []),
             "manifests_missing": restaged.get("missing", [])}
 
+# ---------- launch doctor ----------
+# Steam starts a mac game by exec'ing the binary inside Contents/MacOS. It
+# reports OS Error 256 when that exec never happens: the library record points
+# somewhere else, the file lost its execute bit, quarantine is still set, the
+# signature does not cover the tree, or the image cannot run on this cpu.
+
+_STATE_FULLY_INSTALLED = 4
+_MACHO_THIN = {
+    b"\xfe\xed\xfa\xce": ("big", 32), b"\xce\xfa\xed\xfe": ("little", 32),
+    b"\xfe\xed\xfa\xcf": ("big", 64), b"\xcf\xfa\xed\xfe": ("little", 64),
+}
+_MACHO_FAT = {b"\xca\xfe\xba\xbe": 20, b"\xca\xfe\xba\xbf": 32}
+_CPU_NAMES = {7: "i386", 0x01000007: "x86_64",
+              12: "arm", 0x0100000c: "arm64",
+              18: "ppc", 0x01000012: "ppc64"}
+_MACHO_KINDS = {1: "object", 2: "execute", 6: "dylib", 7: "dyld", 8: "bundle"}
+LC_SYMTAB = 2
+
+
+def _num(buf, off, width, endian="big"):
+    chunk = buf[off:off + width]
+    if len(chunk) != width:
+        return None
+    return int.from_bytes(chunk, endian)
+
+
+def _macho_slices(head):
+    """(offset, endian, bits) for every image inside a Mach-O file."""
+    magic = head[:4]
+    if magic in _MACHO_THIN:
+        endian, bits = _MACHO_THIN[magic]
+        return [(0, endian, bits)]
+    step = _MACHO_FAT.get(magic)
+    if step is None:
+        return []
+    count = _num(head, 4, 4)
+    if not count or count > 32:
+        return []
+    out = []
+    for i in range(count):
+        body = _num(head, 8 + i * step + 8, 8 if step == 32 else 4)
+        if body is None:
+            break
+        probe = head[body:body + 4]
+        if probe in _MACHO_THIN:
+            endian, bits = _MACHO_THIN[probe]
+            out.append((body, endian, bits))
+    return out
+
+
+def macho_info(path):
+    """Architectures and image kind, read out of the header only."""
+    out = {"ok": False, "path": str(path), "arches": [], "bits": [],
+           "kind": "", "fat": False, "error": ""}
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+            slices = _macho_slices(head)
+            if not slices:
+                out["error"] = "not a mach-o image"
+                return out
+            out["fat"] = len(slices) > 1
+            for off, endian, bits in slices:
+                fh.seek(off)
+                hdr = fh.read(32)
+                if len(hdr) < 28:
+                    continue
+                cpu = _num(hdr, 4, 4, endian)
+                kind = _num(hdr, 12, 4, endian)
+                arch = _CPU_NAMES.get(cpu)
+                if arch is None:
+                    continue
+                out["arches"].append(arch)
+                out["bits"].append(bits)
+                if not out["kind"] and kind is not None:
+                    out["kind"] = _MACHO_KINDS.get(kind, str(kind))
+    except OSError as exc:
+        out["error"] = str(exc)
+        return out
+    out["ok"] = bool(out["arches"])
+    if not out["ok"]:
+        out["error"] = out["error"] or "no known cpu type"
+    return out
+
+
+def macho_undefined_symbols(path):
+    """External undefined symbols, walked out of LC_SYMTAB by hand.
+
+    nm only exists once the command line tools are installed, so the symbol
+    table is read directly: a stub is only complete if every import is known.
+    """
+    names = set()
+    try:
+        fh = open(path, "rb")
+    except OSError:
+        return []
+    with fh:
+        head = fh.read(4096)
+        for off, endian, bits in _macho_slices(head):
+            try:
+                fh.seek(off)
+                hdr = fh.read(32)
+                ncmds = _num(hdr, 16, 4, endian)
+                size = _num(hdr, 20, 4, endian)
+                if not ncmds or not size or size > 4 << 20:
+                    continue
+                cmds = fh.read(size)
+                pos = 0
+                for _ in range(ncmds):
+                    cmd = _num(cmds, pos, 4, endian)
+                    csize = _num(cmds, pos + 4, 4, endian)
+                    if cmd is None or csize is None or csize < 8:
+                        break
+                    if cmd == LC_SYMTAB and pos + 24 <= len(cmds):
+                        symoff = _num(cmds, pos + 8, 4, endian)
+                        nsyms = _num(cmds, pos + 12, 4, endian)
+                        stroff = _num(cmds, pos + 16, 4, endian)
+                        strsize = _num(cmds, pos + 20, 4, endian)
+                        if all((symoff, nsyms, stroff, strsize)) and nsyms <= 200000:
+                            stride = 16 if bits == 64 else 12
+                            fh.seek(off + symoff)
+                            table = fh.read(nsyms * stride)
+                            fh.seek(off + stroff)
+                            pool = fh.read(strsize)
+                            for i in range(len(table) // stride):
+                                row = table[i * stride:(i + 1) * stride]
+                                n_type = row[4]
+                                if not n_type & 0x01 or n_type & 0x0e:
+                                    continue
+                                idx = _num(row, 0, 4, endian)
+                                if idx is None or idx >= len(pool):
+                                    continue
+                                stop = pool.find(b"\x00", idx)
+                                raw = pool[idx:stop if stop >= 0 else len(pool)]
+                                name = raw.decode("ascii", "replace").lstrip("_")
+                                if name.startswith("Steam"):
+                                    names.add(name)
+                    pos += csize
+            except (OSError, ValueError):
+                continue
+    return sorted(names)
+
+
+def host_mac():
+    """What this machine is allowed to execute: os, silicon, Rosetta."""
+    machine = platform.machine() or ""
+    info = {"platform": sys.platform, "machine": machine, "version": "",
+            "apple_silicon": machine == "arm64", "rosetta": None}
+    if sys.platform == "darwin":
+        info["version"] = platform.mac_ver()[0]
+        if info["apple_silicon"]:
+            info["rosetta"] = any(p.exists() for p in (
+                Path("/Library/Apple/usr/libexec/oah/libRosettaRuntime"),
+                Path("/usr/libexec/rosetta/oahd")))
+        else:
+            info["rosetta"] = True
+    return info
+
+
+def arch_verdict(arches, bits, host=None):
+    """(state, sentence) for one image against this mac."""
+    host = host or host_mac()
+    machine = (host.get("machine") or "").replace("amd64", "x86_64")
+    if not arches:
+        return "unknown", "no mach header to read"
+    if bits and not any(b == 64 for b in bits):
+        return "unsupported", "32-bit only - macOS 10.15 and newer refuse to start it"
+    if machine in arches:
+        return "native", "runs on this mac"
+    if "arm64" in arches and machine == "x86_64":
+        return "other-cpu", "arm64 only - needs an Apple Silicon mac"
+    if "x86_64" in arches and machine == "arm64":
+        if host.get("rosetta"):
+            return "rosetta", "x86_64 image - runs through Rosetta"
+        return "needs-rosetta", "x86_64 image and Rosetta is not installed"
+    return "unknown", "unrecognised cpu list: " + ", ".join(arches)
+
+
+def _acf_set_field(text, key, value):
+    """Rewrite one quoted value in an acf, keeping the rest of the file.
+
+    Matches whole escaped strings so a value that itself contains \" cannot
+    end the match early, and re-escapes the new value the way Valve expects.
+    """
+    if not isinstance(text, str) or not isinstance(key, str):
+        return None
+    pat = re.compile(r'("' + re.escape(key) + r'"\s+)"(?:[^"\\]|\\.)*"')
+    encoded = _vdf_quote(value)
+    if not pat.search(text):
+        return None
+    return pat.sub(lambda m: m.group(1) + '"' + encoded + '"', text, count=1)
+
+
+def _resolve_install_dir(sa, installdir, hint=""):
+    """(path, real name, how) for the folder the acf points at."""
+    common = sa / "common"
+    cands = []
+    for raw in (installdir, hint):
+        rel = clean_installdir(raw or "")
+        if rel and rel not in cands:
+            cands.append(rel)
+    for rel in cands:
+        try:
+            if (common / rel).is_dir():
+                return common / rel, rel, "exact"
+        except OSError:
+            continue
+    try:
+        entries = {e.name.lower(): e for e in common.iterdir() if e.is_dir()}
+    except OSError:
+        entries = {}
+    for rel in cands:
+        hit = entries.get(rel.lower())
+        if hit is not None:
+            return hit, hit.name, "case"
+    return None, (cands[0] if cands else ""), ""
+
+
+def _has_quarantine(path):
+    res = _run_quiet(["xattr", "-p", "com.apple.quarantine", str(path)], timeout=20)
+    return res is not None and res.returncode == 0
+
+
+def _signature_ok(path):
+    if sys.platform != "darwin":
+        return True
+    res = _run_quiet(["codesign", "--verify", "--deep", "--strict", str(path)],
+                     timeout=180)
+    return res is not None and res.returncode == 0
+
+
+def _sign_deep(bundle, work):
+    """Inner images first - a bundle only verifies when every nested one does."""
+    root = Path(bundle)
+    inner = []
+    if root.is_dir():
+        for p in sorted(root.rglob("*"), key=lambda q: len(str(q)), reverse=True):
+            try:
+                if not p.is_file() or p.suffix.lower() in (
+                        ".plist", ".txt", ".json", ".png", ".icns", ".nib", ".car"):
+                    continue
+                if not macho_info(p)["ok"]:
+                    continue
+            except OSError:
+                continue
+            inner.append(p)
+    exe = _bundle_executable(root)
+    out = []
+    for p in inner:
+        if exe is not None and p == exe:
+            continue
+        out.append({"path": str(p), **_resign(p, work)})
+    if exe is not None:
+        out.append({"path": str(exe), **_resign(exe, work)})
+    out.append({"path": str(root), **_resign(root, work)})
+    return out
+
+
+def heal_game(appid, fix=True, progress=None, hint=""):
+    """Make a downloaded game start. No network, Steam can stay closed."""
+    aid = int(appid)
+    say = progress or (lambda _m: None)
+    rep = {"ok": False, "appid": str(aid), "fix": bool(fix), "actions": [],
+           "issues": [], "warnings": [], "bundles": [], "target": "",
+           "installdir": "", "files": 0, "launchable": False, "host": host_mac()}
+
+    def act(msg):
+        rep["actions"].append(msg if fix else "would " + msg)
+        say(("launch doctor: " if fix else "launch doctor (dry run): ") + msg)
+
+    acf_file = find_app_acf(aid)
+    if acf_file is None:
+        rep["issues"].append("no appmanifest_%d.acf in any library" % aid)
+        rep["error"] = "the game has no library entry yet"
+        return rep
+    sa = acf_file.parent
+    try:
+        raw = acf_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        rep["issues"].append("appmanifest unreadable: " + str(exc))
+        return rep
+    acf = parse_acf(acf_file)
+    declared = acf.get("installdir", "")
+    rep["installdir"] = declared
+
+    target, rel, how = _resolve_install_dir(sa, declared, hint)
+    if target is None:
+        for other in all_steamapps_dirs():
+            try:
+                if other.resolve() == sa.resolve():
+                    continue
+            except OSError:
+                continue
+            target, rel, how = _resolve_install_dir(other, declared, hint)
+            if target is not None:
+                sa, how = other, "library"
+                break
+    if target is None:
+        rep["issues"].append("no folder under common/ matches installdir %r" % declared)
+        return rep
+    rep["target"] = str(target)
+    rep["installdir"] = target.name
+
+    acf_path = acf_file
+    if how == "library":
+        acf_path = sa / acf_file.name
+        act("library entry moved beside the files: " + str(sa))
+
+    files = 0
+    for p in target.rglob("*"):
+        try:
+            if p.is_file():
+                files += 1
+        except OSError:
+            continue
+    rep["files"] = files
+    if files == 0:
+        rep["issues"].append("the install folder is empty")
+        return rep
+
+    work = Path.home() / ".licensetools" / "doctor" / str(aid)
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        work = Path(tempfile.gettempdir()) / ("licensetools-doctor-" + str(aid))
+        work.mkdir(parents=True, exist_ok=True)
+
+    bundles = []
+    for bundle in _app_bundles(target):
+        exe = _bundle_executable(bundle)
+        info = {"path": str(bundle), "exe": str(exe) if exe else "",
+                "arches": [], "bits": [], "kind": "", "verdict": "missing",
+                "note": "no executable inside"}
+        if exe is not None:
+            mi = macho_info(exe)
+            verdict, note = arch_verdict(mi["arches"], mi["bits"], rep["host"])
+            info.update(arches=mi["arches"], bits=mi["bits"], kind=mi["kind"],
+                        verdict=verdict, note=note)
+            if verdict in ("unsupported", "other-cpu", "needs-rosetta"):
+                rep["issues"].append(bundle.name + ": " + note)
+            elif verdict == "unknown":
+                rep["warnings"].append(bundle.name + ": " + note)
+        else:
+            rep["issues"].append(bundle.name + ": no executable inside the bundle")
+        bundles.append(info)
+    rep["bundles"] = bundles
+
+    main_exe = Path(bundles[0]["exe"]) if bundles and bundles[0]["exe"] else None
+    if not bundles:
+        main_exe = _game_binary(target)
+        if main_exe is None:
+            rep["issues"].append("no .app bundle and no executable under the install folder")
+        else:
+            mi = macho_info(main_exe)
+            verdict, note = arch_verdict(mi["arches"], mi["bits"], rep["host"])
+            rep["bundles"] = [{"path": str(main_exe.parent), "exe": str(main_exe),
+                               "arches": mi["arches"], "bits": mi["bits"],
+                               "kind": mi["kind"], "verdict": verdict,
+                               "note": note}]
+            if verdict in ("unsupported", "other-cpu", "needs-rosetta"):
+                rep["issues"].append(note)
+            elif verdict == "unknown":
+                rep["warnings"].append(note)
+
+    # steam_appid.txt lives inside Contents/MacOS, so it has to exist before the
+    # bundle is sealed. Writing it afterwards invalidated every signature the
+    # doctor had just repaired, which is why the next launch failed again.
+    for d in _appid_file_dirs(target, main_exe):
+        f = d / STUB_APPID_FILE
+        try:
+            have = f.read_text(encoding="utf-8", errors="replace").strip() \
+                if f.is_file() else None
+            if have == str(aid):
+                continue
+            act("steam_appid.txt written in " + str(d))
+            if fix:
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(str(aid), encoding="utf-8")
+        except OSError as exc:
+            rep["warnings"].append("could not write %s: %s" % (f, exc))
+
+    text = raw
+    if declared != target.name:
+        updated = _acf_set_field(text, "installdir", target.name)
+        if updated is not None and updated != text:
+            text = updated
+            act("installdir %r -> %r" % (declared, target.name))
+        else:
+            rep["warnings"].append("appmanifest has no installdir field to rewrite")
+    if str(acf.get("StateFlags", "")) != str(_STATE_FULLY_INSTALLED):
+        updated = _acf_set_field(text, "StateFlags", str(_STATE_FULLY_INSTALLED))
+        if updated is not None and updated != text:
+            text = updated
+            act("StateFlags %s -> %d (fully installed)"
+                % (acf.get("StateFlags", "?"), _STATE_FULLY_INSTALLED))
+        else:
+            rep["warnings"].append("appmanifest has no StateFlags field to rewrite")
+    if fix and text != raw:
+        try:
+            tmp = acf_path.with_name(acf_path.name + ".doc")
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(acf_path)
+            if acf_path != acf_file:
+                acf_file.unlink()
+        except OSError as exc:
+            rep["issues"].append("appmanifest could not be written: " + str(exc))
+            return rep
+
+    lost_exec = []
+    for p in target.rglob("*"):
+        try:
+            if not p.is_file():
+                continue
+            mode = p.stat().st_mode
+        except OSError:
+            continue
+        if mode & 0o111:
+            continue
+        in_macos = p.parent.name == "MacOS" and p.parent.parent.name == "Contents"
+        if not in_macos:
+            if p.suffix.lower() not in ("", ".dylib", ".so"):
+                continue
+            try:
+                if p.stat().st_size < 64:
+                    continue
+            except OSError:
+                continue
+            if not macho_info(p)["ok"]:
+                continue
+        lost_exec.append(p)
+    if lost_exec:
+        act("%d image(s) are missing the execute bit" % len(lost_exec))
+        if fix:
+            for p in lost_exec:
+                try:
+                    os.chmod(p, 0o755)
+                except OSError as exc:
+                    rep["warnings"].append("chmod failed for %s: %s" % (p, exc))
+
+    quarantined = [p for p in [target] + [Path(b["path"]) for b in bundles]
+                   if _has_quarantine(p)]
+    if quarantined:
+        act("quarantine attribute found on %d item(s)" % len(quarantined))
+        if fix and sys.platform == "darwin":
+            res = _run_quiet(["xattr", "-dr", "com.apple.quarantine", str(target)],
+                             timeout=600)
+            if res is None or res.returncode != 0:
+                rep["warnings"].append("xattr could not clear the quarantine flag")
+
+    sign_targets = [Path(b["path"]) for b in bundles if b.get("exe")]
+    if not sign_targets and main_exe is not None:
+        sign_targets = [main_exe]
+    broken = [p for p in sign_targets if not _signature_ok(p)]
+    if broken:
+        act("signature does not verify on " + ", ".join(p.name for p in broken))
+        if fix and sys.platform == "darwin":
+            for p in broken:
+                signed = _sign_deep(p, work)
+                bad = [s for s in signed if not s.get("ok")]
+                if bad:
+                    rep["warnings"].append("codesign failed for " + p.name + ": "
+                                           + str(bad[0].get("error")))
+                else:
+                    act("ad-hoc signed " + p.name + " (" + str(len(signed))
+                        + " image(s))")
+
+    rep["launchable"] = not rep["issues"]
+    rep["ok"] = True
+    rep["steam_url"] = "steam://rungameid/%d" % aid
+    rep["open"] = ["open", "-a", str(bundles[0]["path"])] if bundles and bundles[0].get("exe") else []
+    return rep
+
+
+def install_rosetta(progress=None):
+    say = progress or (lambda _m: None)
+    if sys.platform != "darwin":
+        return {"ok": False, "error": "macOS only"}
+    if host_mac().get("rosetta"):
+        return {"ok": True, "already": True}
+    say("installing Rosetta - this can take a few minutes")
+    try:
+        res = subprocess.run(["softwareupdate", "--install-rosetta",
+                              "--agree-to-license"],
+                             capture_output=True, text=True, timeout=3600)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": res.returncode == 0, "already": False,
+            "output": (res.stdout or res.stderr or "").strip()[-400:]}
+
+
 def steam_install_url(appid):
     if sys.platform != "darwin":
         return {"ok": False, "error": "macOS only"}
@@ -4558,7 +5744,8 @@ def open_steam_folder(which="steamapps"):
 
 def uninstall_game(appid, delete_files=True):
     aid = int(appid)
-    sa = steam_apps_dir()
+    acf_file = find_app_acf(aid)
+    sa = acf_file.parent if acf_file is not None else steam_apps_dir()
     if sa is None:
         return {"ok": False, "error": "steam library not found"}
     acf = read_appmanifest(aid) or {}
@@ -4572,14 +5759,40 @@ def uninstall_game(appid, delete_files=True):
         except OSError as exc:
             return {"ok": False, "error": f"could not delete install record: {exc}"}
     if delete_files and installdir:
-        game_dir = sa / "common" / installdir
-        if game_dir.is_dir():
-            shutil.rmtree(game_dir, ignore_errors=True)
-            removed.append(str(game_dir))
+        rel = clean_installdir(installdir)
+        if rel is None:
+            pass
+        else:
+            common = sa / "common"
+            game_dir = common / rel
+            ok_path = _contained(common, game_dir)
+            try:
+                if ok_path and game_dir.is_dir() and game_dir.name not in ("common", ""):
+                    resolved = game_dir.resolve()
+                    home = Path.home().resolve()
+                    if resolved != home and resolved.parent != common.resolve().parent:
+                        shutil.rmtree(resolved, ignore_errors=True)
+                        removed.append(str(game_dir))
+            except OSError:
+                pass
     staging = sa / "downloading" / str(aid)
-    if staging.is_dir():
-        shutil.rmtree(staging, ignore_errors=True)
-        removed.append(str(staging))
+    try:
+        if staging.is_dir() and _contained(sa / "downloading", staging):
+            shutil.rmtree(staging, ignore_errors=True)
+            removed.append(str(staging))
+    except OSError:
+        pass
+    root = SteamCtx().root()
+    if root is not None:
+        for cache in (root / "userdata").glob(f"*/config/librarycache/{aid}.json"):
+            try:
+                cache.unlink()
+                removed.append(str(cache))
+            except OSError:
+                pass
+    cfg = macsteam_config_remove(aid)
+    return {"ok": True, "appid": str(aid), "installdir": installdir,
+            "removed": removed, "config": cfg}
     root = SteamCtx().root()
     if root is not None:
         for cache in (root / "userdata").glob(f"*/config/librarycache/{aid}.json"):
@@ -5456,6 +6669,22 @@ def cmd_install(a):
     aid = _appid(a.appid) if a.appid else None
     print(json.dumps(install_local(a.file, aid, a.branch), indent=2, ensure_ascii=False))
 
+def cmd_doctor(a):
+    res = heal_game(_appid(a.appid), fix=not a.dry_run,
+                    progress=lambda m: print(m, file=sys.stderr),
+                    hint=a.installdir or "")
+    if a.rosetta:
+        res["rosetta"] = install_rosetta(
+            progress=lambda m: print(m, file=sys.stderr))
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("ok") else 1
+
+def cmd_verify(a):
+    res = verify_app(_appid(a.appid), repair=not a.no_repair,
+                     progress=lambda m: print(m, file=sys.stderr))
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("ok") and (res.get("clean") or a.no_repair) else 1
+
 def cmd_import_lua(a):
     res = import_lua_file(a.file)
     print(json.dumps(res, indent=2, ensure_ascii=False))
@@ -5760,13 +6989,17 @@ class Api:
         return {"ok": True, "appid": aid, "steps": steps,
                 "hint": "game should appear in your library now"}
 
-    def install(self, appid, user="", password="", update=False):
+    def install(self, appid, user="", password="", update=False,
+                branch="public", want_os="mac"):
         aid = str(appid or "").strip()
         if not aid.isdigit():
             return {"ok": False, "error": "appid must be numeric"}
+        branch = (branch or "public").strip() or "public"
+        want_os = (want_os or "mac").strip() or "mac"
         if not _FETCH_LOCK.acquire(blocking=False):
             return {"ok": False, "error": "a download is already running"}
         mode = bool(update)
+        FETCH_RESULT["install"] = None
 
         def worker():
             try:
@@ -5775,7 +7008,8 @@ class Api:
                 rep = repair_install_state(int(aid))
                 if rep.get("stale_removed"):
                     LOGS.add("cleared a stale install record with no files")
-                res = install_to_library(int(aid), "public", "mac", progress=lambda m: LOGS.add(str(m)),
+                res = install_to_library(int(aid), branch, want_os,
+                                         progress=lambda m: LOGS.add(str(m)),
                                          update=mode)
                 if res.get("ok"):
                     LOGS.add(f"install {aid} done - {res.get('files', 0)} file(s), "
@@ -5809,8 +7043,8 @@ class Api:
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True, "queued": True, "appid": aid, "update": mode}
 
-    def update(self, appid):
-        return self.install(appid, "", "", True)
+    def update(self, appid, branch="public", want_os="mac"):
+        return self.install(appid, "", "", True, branch, want_os)
 
     def install_status(self):
         return FETCH_RESULT.get("install") or {"ok": None, "running": _FETCH_LOCK.locked()}
@@ -5969,6 +7203,26 @@ class Api:
             return {"ok": False, "error": "appid must be numeric"}
         res = repair_install_state(int(aid))
         LOGS.add("repair " + aid + ": " + json.dumps(res)[:240])
+        return res
+
+    def doctor(self, appid, dry_run=False):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        res = heal_game(int(aid), fix=not dry_run, progress=lambda m: LOGS.add(str(m)))
+        LOGS.add("doctor " + aid + ": " + json.dumps(
+            {"issues": res.get("issues"), "actions": res.get("actions")})[:400])
+        return res
+
+    def verify(self, appid, repair=True):
+        aid = str(appid or "").strip()
+        if not aid.isdigit():
+            return {"ok": False, "error": "appid must be numeric"}
+        res = verify_app(int(aid), repair=bool(repair),
+                         progress=lambda m: LOGS.add(str(m)))
+        LOGS.add("verify " + aid + ": " + json.dumps(
+            {"checked": res.get("checked"), "missing": res.get("missing")[:3],
+             "bad": res.get("bad")[:3], "repaired": res.get("repaired")})[:400])
         return res
 
     def manifests(self, appid, os_name="mac"):
@@ -6229,6 +7483,8 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
 <section id="t-maint">
   <div class="toolbar">
     <input id="m-appid" placeholder="appid" style="width:120px">
+    <button id="b-m-doctor" class="pri">Check launch</button>
+    <button id="b-m-verify" class="pri">Verify files</button>
     <button id="b-m-repair">Repair install record</button>
     <button id="b-m-del">Delete game</button>
     <button id="b-m-open">Open Steam folder</button>
@@ -6265,9 +7521,9 @@ label.chk{display:flex;gap:6px;align-items:center;color:var(--dim)}
 <script>
 let api=null,logIdx=0;
 const $=s=>document.querySelector(s);
-const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const say=t=>{$("#status").textContent=t};
-function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-lua","#b-ldref","#b-ldmac","#b-ldst","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths","#b-m-manifests","#b-m-update","#b-m-drm","#b-m-drmoff","#b-m-cloudoff","#b-m-cloudon","#b-app-update","#h-new"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
+function busy(on){["#b-probe","#b-grant","#b-install","#b-search","#b-restart","#b-fetch","#b-lua","#b-ldref","#b-ldmac","#b-ldst","#b-m-doctor","#b-m-verify","#b-m-repair","#b-m-del","#b-m-open","#b-m-common","#b-m-unloader","#b-m-paths","#b-m-manifests","#b-m-update","#b-m-keys","#b-m-drm","#b-m-drmoff","#b-m-cloudoff","#b-m-cloudon","#b-app-update","#h-new"].forEach(s=>{const el=$(s);if(el)el.disabled=on})}
 async function call(fn,...args){if(!api)throw new Error("bridge not ready");return api[fn](...args)}
 document.querySelectorAll("button.tab").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("button.tab").forEach(x=>x.classList.toggle("pri",x===b));
@@ -6338,7 +7594,7 @@ async function doInstall(){
   }
   busy(true);
   try{
-    const r=await call("install",id);
+    const r=await call("install",id,"","",false,$("#branch").value||"public",$("#os").value||"mac");
     if(!r.ok)return say("download failed to start: "+(r.error||""));
     say("pulling "+id+" from the Steam CDN - progress in the log...");
     await watchInstall();
@@ -6401,7 +7657,7 @@ async function doSearch(){
   try{
     const hits=await call("search",term);
     $("#hits").innerHTML=hits.map(h=>
-      `<button class="rowbtn pick" data-id="${h.appid}">${esc(h.name)} - ${h.appid}</button>`).join("")
+      `<button class="rowbtn pick" data-id="${esc(h.appid)}">${esc(h.name)} - ${esc(h.appid)}</button>`).join("")
       ||"no hits";
     document.querySelectorAll(".pick").forEach(b=>b.onclick=()=>{
       $("#appid").value=b.dataset.id;$("#hits").textContent="";
@@ -6523,7 +7779,7 @@ $("#b-m-update").onclick=async()=>{
   if(!/^\d+$/.test(id))return say("appid must be numeric");
   busy(true);say("checking "+id+" - only changed files get re-pulled...");
   try{
-    const r=await call("update",id);
+    const r=await call("update",id,$("#branch").value||"public",$("#os").value||"mac");
     if(!r.ok)return say("update failed to start: "+(r.error||""));
     await watchInstall();
   }catch(e){say("update failed: "+e)}
@@ -6545,6 +7801,7 @@ $("#b-m-keys").onclick=async()=>{
 };
 $("#b-m-drm").onclick=async()=>{
   const id=maintId();if(!id)return;
+  if(!confirm("Replace the Steam library inside game "+id+" with a stand-in? The original is kept as .orig and can be restored."))return;
   busy(true);say("matching the steam library in "+id+" against what the game imports...");
   try{
     const r=await call("drm_patch",id);
@@ -6566,6 +7823,7 @@ $("#b-m-drmoff").onclick=async()=>{
 };
 $("#b-m-cloudoff").onclick=async()=>{
   const id=maintId();if(!id)return;
+  if(!confirm("Steam closes now to flip the cloud switch for "+id+", then reopens. Continue?"))return;
   busy(true);say("closing steam, flipping the cloud switch for "+id+", starting steam again...");
   try{
     const r=await call("cloud_off",id);
@@ -6589,6 +7847,37 @@ function maintId(){
   if(!/^\d+$/.test(raw)){say("type the appid first");return null}
   return raw;
 }
+$("#b-m-doctor").onclick=async()=>{
+  const id=maintId();if(!id)return;
+  busy(true);
+  try{
+    const r=await call("doctor",id);
+    if(!r.ok){say("check failed: "+(r.error||"unknown"));}
+    else{
+      const acts=(r.actions||[]).length;
+      const issues=(r.issues||[]);
+      const arch=(r.bundles||[]).map(b=>`${(b.path||"").split("/").pop()}: ${(b.arches||[]).join("+")||"?"} - ${b.note||""}`);
+      let msg=r.launchable?`${id} is ready - ${acts} fix(es), ${r.files} files`:`${id} needs a look: ${issues.join("; ")}`;
+      if(arch.length)msg+=" | "+arch.join(" | ");
+      say(msg);
+    }
+  }catch(e){say("check failed: "+e)}
+  busy(false);
+};
+$("#b-m-verify").onclick=async()=>{
+  const id=maintId();if(!id)return;
+  busy(true);
+  try{
+    const r=await call("verify",id,true);
+    if(!r.ok)say("verify failed: "+(r.error||"unknown"));
+    else if(r.clean)say(`verify ${id}: all ${r.checked} files match the manifest${r.repaired?` (${r.repaired} rebuilt)`:""}${r.extra?`, ${r.extra} extra file(s) left alone`:""}`);
+    else{
+      const bad=[...(r.missing||[]),...(r.bad||[])].slice(0,4).join(", ");
+      say(`verify ${id}: ${r.checked} good, ${(r.missing||[]).length} missing, ${(r.bad||[]).length} wrong, ${r.repaired} rebuilt${bad?` - ${bad}`:""}`);
+    }
+  }catch(e){say("verify failed: "+e)}
+  busy(false);
+};
 $("#b-m-repair").onclick=async()=>{
   const id=maintId();if(!id)return;
   try{
@@ -6652,7 +7941,19 @@ async function pollLogs(){
     }
   }catch(e){}
 }
-function ready(){api=window.pywebview.api;boot();setInterval(pollLogs,1200);pollLogs()}
+function ready(){api=window.pywebview.api;guardButtons();boot();setInterval(pollLogs,1200);pollLogs()}
+function guardButtons(){
+  document.querySelectorAll("button[id^='b-']").forEach(el=>{
+    const fn=el.onclick;
+    if(typeof fn!=="function")return;
+    el.onclick=async function(){
+      try{return await fn.apply(this,arguments)}
+      catch(e){say("failed: "+e)}
+      finally{busy(false)}
+    };
+  });
+  window.addEventListener("unhandledrejection",()=>busy(false));
+}
 window.addEventListener("pywebviewready",ready);
 if(window.pywebview&&window.pywebview.api)ready();
 </script></body></html>"""
@@ -6669,7 +7970,7 @@ def run_gui():
     webview.create_window(
         "LicenseTools", str(index), js_api=Api(),
         width=1180, height=800, min_size=(1040, 700),
-        background_color="#08090B", text_select=False, confirm_close=False)
+        background_color="#08090B", text_select=True, confirm_close=False)
     webview.start(debug=os.environ.get("LICETOOLS_DEBUG") == "1")
 
 def _provision_quiet():
@@ -6746,6 +8047,22 @@ def build_argparser():
     p.add_argument("--branch", default="public")
     p.set_defaults(fn=cmd_install)
 
+    p = sub.add_parser("doctor", help="make an installed game actually start")
+    p.add_argument("appid")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="report what would change, write nothing")
+    p.add_argument("--installdir", default="",
+                   help="folder name to look for when the record has none")
+    p.add_argument("--rosetta", action="store_true",
+                   help="install Rosetta when the game is x86_64 only")
+    p.set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("verify", help="compare the install against the depot manifests")
+    p.add_argument("appid")
+    p.add_argument("--no-repair", dest="no_repair", action="store_true",
+                   help="report only, download nothing")
+    p.set_defaults(fn=cmd_verify)
+
     p = sub.add_parser("import-lua",
                        help="install a .lua and copy its depot keys into the loader config")
     p.add_argument("file")
@@ -6805,6 +8122,20 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+    run_path = os.environ.pop(CORE_RUN, "")
+    if run_path:
+        try:
+            src = Path(run_path).read_text(encoding="utf-8")
+            code = compile(src, run_path, "exec")
+        except (OSError, SyntaxError, ValueError) as exc:
+            print("core run failed: %s" % exc, file=sys.stderr)
+            sys.exit(1)
+        scope = {"__name__": "__main__", "__file__": run_path,
+                 "__package__": None, "__doc__": None, "__builtins__": __builtins__}
+        sys.argv[0] = run_path
+        os.environ[CORE_ENV] = "1"
+        exec(code, scope)
+        return
     ap = build_argparser()
     args = ap.parse_args()
     if not args.selftest and not args.emit_stub and core_launch():

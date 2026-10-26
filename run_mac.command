@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Double-click to run LuaTools Mac straight from source.
 # Creates a local venv with pywebview on first run, then opens the window.
+set -euo pipefail
 cd "$(dirname "$0")"
-PY="$(command -v python3 || command -v python)"
+PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
   osascript -e 'display dialog "Python 3 is required. Install it from python.org or run: brew install python@3.12" buttons {"OK"}'
   exit 1

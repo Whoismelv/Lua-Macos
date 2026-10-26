@@ -8,9 +8,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  release:
+  build:
     runs-on: macos-14
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,21 +26,63 @@ jobs:
           df -h /
           rm -rf "$HOME/.cache/pip" "$HOME/Library/Caches/pip" "$HOME/.npm"
           df -h /
+      - name: version gate
+        run: |
+          set -euo pipefail
+          APP_VER="$(sed -n 's/^APP_VERSION = "\([^"]*\)".*/\1/p' licensetools_mac.py | head -n1)"
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          echo "app=$APP_VER tag=$TAG_VER"
+          if [ -n "${GITHUB_REF_NAME:-}" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "$APP_VER" != "$TAG_VER" ]; then
+            echo "::error::APP_VERSION $APP_VER does not match tag $TAG_VER"
+            exit 1
+          fi
       - name: build app + dmg
         run: bash build_macos.sh
-      - name: prune disk
-        run: |
-          rm -rf build dmg-stage* dist/*.app build-lic .build-venv "$HOME/.cache/pip"
-          df -h /
       - name: build the loader payload
         run: LT_STAGE=loader bash build_licensetools.sh
       - name: build licensetools dmg
         run: bash build_licensetools.sh
+      - name: prune disk
+        run: |
+          rm -rf build dmg-stage* dist/*.app build-lic .build-venv "$HOME/.cache/pip"
+          ls -lh dist/
+          df -h /
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dmg
+          path: |
+            dist/LuaToolsMac.dmg
+            dist/LicenseTools.dmg
+          if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    needs: build
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dmg
+          path: dist
+      - name: sizes
+        run: |
+          set -euo pipefail
+          for f in dist/LuaToolsMac.dmg dist/LicenseTools.dmg; do
+            [ -s "$f" ] || { echo "::error::$f missing or empty"; exit 1; }
+            bytes=$(wc -c < "$f" | tr -d ' ')
+            echo "$f $bytes bytes"
+            if [ "$bytes" -lt 5000000 ]; then
+              echo "::error::$f is only $bytes bytes"
+              exit 1
+            fi
+          done
       - name: publish
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/LuaToolsMac.dmg
             dist/LicenseTools.dmg
+          fail_on_unmatched_files: true
           generate_release_notes: true
           name: LuaTools Mac ${{ github.ref_name }}

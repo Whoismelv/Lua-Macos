@@ -8,6 +8,7 @@ on:
 jobs:
   smoke:
     runs-on: macos-14
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -63,14 +64,14 @@ jobs:
             echo "--- fetch attempt $attempt ---"
             if python3 licensetools_mac.py fetch 480 --os mac --out /tmp/lic-games \
                  > /tmp/lic-fetch.json 2>&1 \
-               && [ -n "$(find /tmp/lic-games -type f 2>/dev/null | head -1)" ]; then
+               && [ -n "$(find /tmp/lic-games -type f -print -quit 2>/dev/null)" ]; then
               ok=1
               break
             fi
             head -c 1500 /tmp/lic-fetch.json; echo
             sleep 15
           done
-          find /tmp/lic-games -type f 2>/dev/null | head -20 || true
+          find /tmp/lic-games -type f 2>/dev/null | awk 'NR<=20' || true
           if [ "$ok" = "1" ]; then
             echo "live fetch ok: $(find /tmp/lic-games -type f | wc -l | tr -d ' ') file(s)"
             exit 0
@@ -132,15 +133,15 @@ jobs:
             echo "## mac-smoke"
             echo '```'
             uname -a; python3 -VV
-            echo "--- help"; python3 luatools_mac.py --help | head -5
+            echo "--- help"; python3 luatools_mac.py --help 2>&1 | awk 'NR<=5'
             echo "--- detect"; python3 luatools_mac.py detect
-            echo "--- library"; python3 luatools_mac.py library | head -12
+            echo "--- library"; python3 luatools_mac.py library 2>&1 | awk 'NR<=12'
             echo "--- install-dd"; python3 luatools_mac.py install-dd
             echo "--- brew steamcmd"; brew install --cask steamcmd
             echo "--- probe 620"; python3 luatools_mac.py probe 620 --out /tmp/depots.csv || echo "probe returned non-zero"
             echo "--- depots"; cat /tmp/depots.csv 2>/dev/null || echo "no depot csv"
             echo "--- fetch 480"; python3 luatools_mac.py fetch-game 480 auto --out /tmp/games
-            echo "--- files"; find /tmp/games -type f | head -20
+            echo "--- files"; find /tmp/games -type f 2>/dev/null | awk 'NR<=20'
             echo "--- gui import"; python3 -c "import importlib.util as u; s=u.spec_from_file_location('g','luatools_mac_gui.py'); m=u.module_from_spec(s); s.loader.exec_module(m); print('gui ok')"
             echo "--- gui window"; python3 luatools_mac_gui.py --selftest; echo "gui_exit=$?"
             echo '```'
@@ -148,10 +149,10 @@ jobs:
           {
             echo "## mac-smoke results"
             echo '```'
-            grep -E "vdf parser ok|gui ok|gui_exit|Downloaded [0-9]+ bytes|,mac," /tmp/smoke.log | head -20
+            grep -E "vdf parser ok|gui ok|gui_exit|Downloaded [0-9]+ bytes|,mac," /tmp/smoke.log | awk 'NR<=20'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ -n "$(find /tmp/games -type f 2>/dev/null | head -1)" ]; then
+          if [ -n "$(find /tmp/games -type f -print -quit 2>/dev/null)" ]; then
             echo "legacy fetch-game produced files"
           else
             echo "::warning::legacy fetch-game produced no files this run (diagnostic only - the licensetools fetch smoke above is the gate)"

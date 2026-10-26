@@ -29,7 +29,7 @@ fi
 # shellcheck disable=SC1091
 source .build-venv/bin/activate
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet pyinstaller "pywebview>=5.0" certifi pycryptodome zstandard
+python -m pip install --quiet "pyinstaller==6.11.1" "pywebview>=5.0" certifi pycryptodome zstandard
 fi
 
 if [ "$STAGE" != "loader" ]; then
@@ -72,11 +72,18 @@ else
   echo "payload: source missing - falling back to the upstream release"
   rm -f "$MS_DYLIB"
   mkdir -p vendor/macsteam/signatures/macos.arm64
-  MS_URL="$(curl -fsSL --retry 3 --max-time 60 \
-    -H 'Accept: application/vnd.github+json' \
-    -H 'User-Agent: licensetools' \
-    https://api.github.com/repos/crghofficial/macsteam/releases/latest 2>/dev/null \
-    | sed -n 's/.*"browser_download_url": *"\([^"]*\.dmg\)".*/\1/p' | head -n1)"
+  MS_JSON="/tmp/macsteam-rel.json"
+  MS_URL=""
+  if curl -fsSL --retry 3 --max-time 60 \
+     -H 'Accept: application/vnd.github+json' \
+     -H 'User-Agent: licensetools' \
+     -o "$MS_JSON" \
+     https://api.github.com/repos/crghofficial/macsteam/releases/latest 2>/dev/null; then
+    # sed alone, no head: head closes the pipe early, curl takes SIGPIPE 141,
+    # and pipefail turns that into a dead build.
+    MS_URL="$(sed -n 's/.*"browser_download_url": *"\([^"]*\.dmg\)".*/\1/p' "$MS_JSON" | sed -n '1p')"
+  fi
+  rm -f "$MS_JSON"
   if [ -n "$MS_URL" ]; then
     MS_TMP="/tmp/macsteam-lic.dmg"
     MS_MNT="$(mktemp -d /tmp/msmnt.XXXXXX)"
@@ -102,8 +109,13 @@ fi
 echo "signatures: $MS_SIGS file(s)"
 lipo -info "$MS_DYLIB" 2>/dev/null || true
 
-MS_VER="$(sed -n 's/.*MACSTEAM_VERSION[[:space:]]*"\([^"]*\)".*/\1/p' \
-  vendor/macsteam-src/src/version.h 2>/dev/null | head -n1)"
+MS_VER="$("$PY" - <<'EOF' 2>/dev/null || true
+import re, pathlib
+p = pathlib.Path("vendor/macsteam-src/src/version.h")
+m = re.search(r'MACSTEAM_VERSION\s+"([^"]+)"', p.read_text())
+print(m.group(1) if m else "")
+EOF
+)"
 if [ -n "$MS_VER" ]; then
   printf '%s\n' "$MS_VER" > vendor/macsteam/macsteam.dylib.version
   echo "payload version: $MS_VER"
@@ -117,7 +129,7 @@ echo "== vendor: stand-in library (prebuilt, so no clang is needed on the user's
 rm -rf vendor/stub && mkdir -p vendor/stub
 touch vendor/stub/.keep
 if command -v clang >/dev/null 2>&1; then
-  python licensetools_mac.py --emit-stub vendor/stub/steam_stub.c >/dev/null
+  "$PY" licensetools_mac.py --emit-stub vendor/stub/steam_stub.c >/dev/null
   if clang -dynamiclib -O2 -fvisibility=hidden \
       -install_name "@rpath/libsteam_api.dylib" \
       -arch arm64 -arch x86_64 \
@@ -139,7 +151,7 @@ if [ "$STAGE" = "loader" ]; then
 fi
 
 echo "== offline selftest =="
-python licensetools_mac.py --selftest
+"$PY" licensetools_mac.py --selftest
 
 echo "== clean =="
 rm -rf build-lic dist-lic "$BUNDLE.spec"
@@ -160,6 +172,7 @@ else
 fi
 
 echo "== pyinstaller =="
+# bash 3.2 + set -u: "${KEYDB_ARG[@]}" on an empty array aborts the build.
 pyinstaller \
   --noconfirm --clean --windowed \
   --name "$BUNDLE" \
@@ -167,7 +180,7 @@ pyinstaller \
   --add-data "vendor/dd:vendor/dd" \
   --add-data "vendor/macsteam:vendor/macsteam" \
   --add-data "vendor/stub:vendor/stub" \
-  "${KEYDB_ARG[@]}" \
+  ${KEYDB_ARG[@]+"${KEYDB_ARG[@]}"} \
   --collect-data certifi \
   --hidden-import webview.platforms.cocoa \
   --hidden-import Crypto.Cipher.AES \
